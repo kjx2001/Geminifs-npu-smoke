@@ -9,7 +9,7 @@
 #define MB 1024 * 1024ll
 int main(int argc, char **argv) {
     
-    int64_t nr_file = 500;
+    int64_t nr_file = 1024;
     int64_t file_size = 32 * MB; // 64 * 4 = 256kb
     int device_id = 0;
     std::string mount_path = "/mnt/tardis";
@@ -25,7 +25,8 @@ int main(int argc, char **argv) {
         std::cout << "init success" << std::endl;
     }
 
-    int64_t num_tokens = 16;
+
+    int64_t tokens_perblock = 16;
     int64_t num_layers = 32;
     int64_t num_kv_heads = 32;
     int64_t head_size = 128;
@@ -34,14 +35,14 @@ int main(int argc, char **argv) {
 
     int64_t nr_layers = 32;
 
-    int64_t shape_size = num_tokens * 8 * 128;
+    int64_t shape_size = tokens_perblock * 8 * 128;
 
     std::vector<torch::Tensor> key_caches;
     std::vector<torch::Tensor> value_caches;
 
     for (int i = 0; i < num_layers; i++){
         key_caches.push_back(torch::rand(
-            {max_num_block, num_tokens, num_kv_heads, head_size}, // 512kb
+            {max_num_block, tokens_perblock, num_kv_heads, head_size}, // 512kb
         torch::TensorOptions()
             .dtype(torch::kFloat16)
             .device(torch::kCUDA, device_id)
@@ -51,7 +52,7 @@ int main(int argc, char **argv) {
 
     for (int i = 0; i < num_layers; i++){
         value_caches.push_back(torch::rand(
-            {max_num_block, num_tokens, num_kv_heads, head_size}, // 512kb
+            {max_num_block, tokens_perblock, num_kv_heads, head_size}, // 512kb
         torch::TensorOptions()
             .dtype(torch::kFloat16)
             .device(torch::kCUDA, device_id)
@@ -76,14 +77,14 @@ int main(int argc, char **argv) {
 
     for (int i = 0; i < num_layers; i++){
         key_cache_reads.push_back(torch::zeros(
-            {max_num_block, num_tokens, num_kv_heads, head_size}, // 512kb
+            {max_num_block, tokens_perblock, num_kv_heads, head_size}, // 512kb
         torch::TensorOptions()
             .dtype(torch::kFloat16)
             .device(torch::kCUDA, device_id)
             .pinned_memory(false)
         ));
         value_cache_reads.push_back(torch::zeros(
-            {max_num_block, num_tokens, num_kv_heads, head_size}, // 512kb
+            {max_num_block, tokens_perblock, num_kv_heads, head_size}, // 512kb
         torch::TensorOptions()
             .dtype(torch::kFloat16)           
             .device(torch::kCUDA, device_id)
