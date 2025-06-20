@@ -1,0 +1,214 @@
+#include <cstddef>
+#include <cstdio>
+#include <cstdlib>
+#include <errno.h>
+#include <stdio.h>
+#include <assert.h>
+#include <string.h>
+#include <string>
+#include <unistd.h>
+#include <fcntl.h>
+#include <stdlib.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/mman.h>
+#include <sys/ioctl.h>
+#include <linux/fiemap.h>
+#include <linux/fs.h>
+#include <iostream>
+#include <cuda_runtime.h>
+#include "json.h"
+#include "geminifs_helper.h"
+
+#include <fstream>  
+#include "ioctl.h"
+
+using json = nlohmann::json;
+
+// 计算两个PCI设备的距离
+static inline int ioctl_get_pci_distance(const char *snvme_control_path, struct pci_device_addr_pair * pci_addr_pair) {
+    int snvme_c_fd;
+    int err;
+    snvme_c_fd = open(snvme_control_path, O_RDWR | O_NONBLOCK);
+    if (snvme_c_fd < 0){
+        throw std::runtime_error("Failed to open control descriptor");
+        return EFAULT;
+    }
+    err = ioctl(snvme_c_fd, SNVM_CACULATE_PCIDISTANCE, pci_addr_pair);
+    close(snvme_c_fd);
+    return err;
+}
+
+static std::string pci_bdf_to_string(const PCI_BDF& bdf) {
+    char buffer[13];
+    snprintf(buffer, sizeof(buffer), "%04x:%02x:%02x.%x", 
+             bdf.domain, bdf.bus, bdf.device, bdf.function);
+    return std::string(buffer, sizeof(buffer));
+}
+
+// 计算两个PCI设备的距离
+int calculate_pci_distance(const PCI_BDF& bdf1, const PCI_BDF& bdf2) {
+
+    struct pci_device_addr_pair pci_addr_pair;
+    int distance = -1;
+    pci_addr_pair.pairs[0] = {
+        .domain = bdf1.domain,
+        .bus = bdf1.bus,
+        .slot = bdf1.device,
+        .func = bdf1.function
+    };
+
+    pci_addr_pair.pairs[1] = {
+        .domain = bdf2.domain,
+        .bus = bdf2.bus,
+        .slot = bdf2.device,
+        .func = bdf2.function
+    };
+
+    distance = ioctl_get_pci_distance("/dev/snvm_control", &pci_addr_pair);
+
+    return distance;
+}
+
+std::vector<std::string> split(const std::string& s, char delimiter) {
+    std::vector<std::string> tokens;
+    std::string token;
+    std::istringstream tokenStream(s);
+    while (std::getline(tokenStream, token, delimiter)) {
+        if (!token.empty()) tokens.push_back(token);
+    }
+    return tokens;
+}
+
+static inline SystemConfig parse_json(const std::string& filepath) {
+    
+    std::ifstream file(filepath);
+    if (!file.is_open()) {
+        throw std::runtime_error("Failed to open JSON file: " + filepath);
+    }
+    json j;
+    file >> j;
+    SystemConfig cfg;
+    // 基础参数
+    cfg.root_path = j["root_path"].get<std::string>();
+    cfg.cluster_gpus = j["cluster_gpus"].get<unsigned>();
+    cfg.cluster_disks = j["cluster_disks"].get<unsigned>();
+    // GPU编号解析
+    const std::string gpu_str = j["gpus_num"].get<std::string>();
+    for (const auto& id_str : split(gpu_str, ',')) {
+        if (id_str.find("cuda") == 0) {
+            cfg.gpu_ids.push_back(static_cast<unsigned>(
+                std::stoul(id_str.substr(4))));
+        } else {
+            throw std::runtime_error("Invalid GPU format: " + id_str);
+        }
+    }
+    // GPU PCI地址解析
+    for (auto id : cfg.gpu_ids) {
+        char pciBusId[256];
+        if (cudaDeviceGetPCIBusId(pciBusId, 256, id) != cudaSuccess) {
+            std::cerr << "Failed to get PCI Bus ID" << std::endl;
+            return cfg;
+        }
+        // 解析PCI地址
+        std::string pci_str(pciBusId);
+        size_t colon1 = pci_str.find(':');
+        size_t colon2 = pci_str.find(':', colon1 + 1);
+        // size_t dot = pci_str.find('.');
+        
+        if (colon2 != std::string::npos) {
+            cfg.gpu_pci_addresses.emplace_back(pci_str);
+        } else {
+            throw std::runtime_error("Invalid PCI format: " + pci_str);
+        }
+    }
+    // PCI地址解析
+    const std::string pci_str = j["disks_pci_addr"].get<std::string>();
+    for (const auto& pci : split(pci_str, ',')) {
+        cfg.nvme_pci_addresses.emplace_back(pci);
+    }
+    return cfg;
+}
+
+system_overview parseSystemOverview(const std::string& filepath)
+{
+    system_overview sys;
+    SystemConfig cfg = parse_json(filepath);
+    sys.cfg = cfg;
+    // 打印验证
+    std::cout << "根路径: " << cfg.root_path << "\n"
+              << "集群GPU数量: " << cfg.cluster_gpus << "\n"
+              << "集群磁盘数量: " << cfg.cluster_disks << "\n"
+              << "GPU编号: ";
+    for (auto id : cfg.gpu_ids) std::cout << id << " ";
+    
+    std::cout << "\n NVMe PCI地址:\n";
+    for (const auto& pci : cfg.nvme_pci_addresses) {
+        printf("%04x:%02x:%02x.%x\n", 
+               pci.domain, pci.bus, pci.device, pci.function);
+    }
+    std::cout << "\n GPU PCI地址:\n";
+    for (const auto& pci : cfg.gpu_pci_addresses) {
+        printf("%04x:%02x:%02x.%x\n", 
+               pci.domain, pci.bus, pci.device, pci.function);
+    }
+    
+    // 用于跟踪已分配的 NVMe 设备
+    std::vector<bool> nvme_assigned(cfg.nvme_pci_addresses.size(), false);
+
+    for (size_t i = 0; i < cfg.cluster_gpus; i++)
+    {
+        geminifs_ctrl_params params;
+        params.cudaDevice = cfg.gpu_ids[i];
+        params.mount_path = cfg.root_path;
+        params.snvme_control_path = "/dev/snvm_control";
+        params.ns_id = 1;
+        params.queueDepth = 1024;
+        params.numQueues = 64;
+        
+        const PCI_BDF& gpu_bdf = cfg.gpu_pci_addresses[i];
+        // 查找与当前 GPU 在同一 PCIe switch 下的 NVMe 设备
+        for (size_t j = 0; j < cfg.nvme_pci_addresses.size(); j++) {
+            if (!nvme_assigned[j]) {
+                const PCI_BDF& nvme_bdf = cfg.nvme_pci_addresses[j];
+
+                // 计算 PCI 距离
+                int distance = calculate_pci_distance(gpu_bdf, nvme_bdf);
+                
+                if (distance == 4) {
+                    params.pci_addr.push_back(pci_bdf_to_string(nvme_bdf));
+                    nvme_assigned[j] = true;
+                }
+            }
+        } 
+        sys.overview.push_back(params);
+    }
+    // 将剩余未分配的 NVMe 设备加入到 remote_disks
+    for (size_t j = 0; j < cfg.nvme_pci_addresses.size(); j++) {
+        if (!nvme_assigned[j]) {
+            sys.remote_disks.push_back(cfg.nvme_pci_addresses[j]);
+        }
+    }
+    return sys;
+}
+
+void printSystemOverview(const system_overview& sys) {
+    std::cout << "系统概览:" << std::endl;
+
+    // 打印 overview 中的 geminifs_ctrl_params
+    for (const auto& ctrl : sys.overview) {
+        std::cout << "GPU ID: " << ctrl.cudaDevice << std::endl;
+        std::cout << "PCI 地址: ";
+        for (const auto& addr : ctrl.pci_addr) {
+            std::cout << addr << " ";
+        }
+        std::cout << std::endl;
+    }
+
+    // 打印 remote_disks 中的 PCI BDF
+    std::cout << "未分配的 NVMe PCI 地址 (remote_disks):" << std::endl;
+    std::cout << "remote ssd size is " << sys.remote_disks.size() << std::endl;
+    for (const auto& bdf : sys.remote_disks) {
+        std::cout << pci_bdf_to_string(bdf) << std::endl;
+    }
+}

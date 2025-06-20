@@ -1,0 +1,13 @@
+# Build directory
+build/
+build/*
+
+# Third-party packages directory
+third_pkgs/
+third_pkgs/*
+
+# IDE specific files
+.vscode/
+.idea/
+*.swp
+*~

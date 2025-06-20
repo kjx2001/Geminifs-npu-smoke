@@ -1,0 +1,754 @@
+#include <cassert>
+#include <cerrno>
+#include <cstddef>
+
+#include "buffer.h"
+#include "geminifs.h"
+#include "include/utils.cuh"
+#include "nvm_error.h"
+#include "nvm_types.h"
+
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cuda_device_runtime_api.h>
+#include <cuda_runtime_api.h>
+#include <filesystem>
+#include <memory>
+#include <stddef.h>
+#include <stdint.h>
+#include <string>
+#include <sys/types.h> 
+#include <sys/stat.h>
+#include <time.h>
+#include <unistd.h>
+#include <ctrl.h>
+#include <vector>
+#include "cuda.h"
+#include "cuda_runtime.h"
+#include "file.cuh"
+#include "utils.cuh"
+#include <torch/library.h>
+// #include <torch/extension.h>
+#include <torch/all.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <ATen/ATen.h>          // 包含 device_of 和其他张量工具
+
+#define ROUND_UP(x, align)(((uint64_t) (x) + ((uint64_t)align - 1)) & ~((uint64_t)align - 1))
+using ControllerPtr = std::shared_ptr<Controller>;
+static std::vector<ControllerPtr> ctrls;
+static GPUPoolId pool_id = 0;
+static GPUFilePool* global_pool = nullptr;
+std::vector<std::string> global_avaible_pci_addr = {"0000:50:00.0", "0000:51:00.0", "0000:42:00.0", "0000:42:00.0"};
+static int num_SSDs_per_gpu_global = -1;
+static inline
+void *host_batch_create(int block_size, int nr_files, size_t file_size) {
+    assert(file_size % block_size == 0);
+    assert(nr_files > 0);
+
+    auto nvpage_size = ctrls[0]->page_size;
+    assert(block_size % nvpage_size == 0);
+
+    void *host_fds_base;
+    auto hdr_size = ROUND_UP(sizeof(struct geminiFS_hdr) + 
+                                    sizeof(nvme_ofst_t) * (file_size / block_size), block_size);
+    auto nr_device = ctrls.size();
+    cuda_check_error(cudaMallocHost(&host_fds_base, hdr_size * nr_files * nr_device));
+
+    if (pool_id == 0) {
+        pool_id = (GPUPoolId)time(NULL);
+    }
+
+    for (int idx = 0; idx < nr_device; idx++) {
+        auto ctrl = ctrls[idx].get();
+        auto dev_mount_path = std::string(ctrl->dev_mount_path) + "/" + std::to_string(pool_id);
+        std::string dir_path = dev_mount_path + "/" + std::to_string(idx);
+        std::string file_path;
+        std::filesystem::create_directories(dir_path);
+
+        for (uint16_t file_idx = 0; file_idx < nr_files; file_idx++) {
+            file_path = dir_path + "/" + std::to_string(file_idx);
+            auto hdr = (struct geminiFS_hdr *)(
+                                (uintptr_t)host_fds_base + (file_idx * nr_device + idx) * hdr_size);
+            host_create_geminifs_file(hdr, std::string(file_path).c_str(), block_size, file_size);
+            geminifs_debug("hdr info: block_size %d, file_size %lu, first_block_base %ld, file_path %s\n", 
+                            hdr->block_bit, hdr->virtual_space_size, hdr->first_block_base, file_path.c_str());
+        }
+
+    }
+    
+    void *dev_fds_base;
+    cuda_check_error(cudaMalloc(&dev_fds_base, hdr_size * nr_files * nr_device));
+    cuda_check_error(cudaMemcpy(dev_fds_base, host_fds_base, hdr_size * nr_files * nr_device, cudaMemcpyHostToDevice));
+    cuda_check_error(cudaStreamSynchronize(0));
+    cuda_check_error(cudaFreeHost(host_fds_base));
+
+    return dev_fds_base;
+}
+
+static 
+NVMeFile *device_batch_open(size_t block_size, int nr_files, size_t file_size, int cudaDevice) {
+    struct nvme_cmd__addr *total_nvme_cmds;
+    QueueAcquireHelper *queue_acquire_helper;
+    NVMeFile *files;
+    uint16_t *total_cids;
+    uint16_t *total_sq_poss;
+    void **ctrl_ptrs;
+
+    cuda_check_error(cudaSetDevice(cudaDevice));
+    void *dev_fds_base = host_batch_create(block_size, nr_files, file_size);
+    size_t nvme_page_size = ctrls[0]->page_size;
+    size_t per_file_size = file_size / ctrls.size();
+    size_t hdr_size = ROUND_UP(sizeof(struct geminiFS_hdr) + sizeof(nvme_ofst_t) * (file_size / block_size), block_size);
+    size_t max_nvme_cmds = file_size / nvme_page_size;
+    size_t nr_device = ctrls.size();
+    size_t total_cnt = nr_files * nr_device;
+    
+    cuda_check_error(cudaMalloc(&files, sizeof(NVMeFile) * total_cnt));
+    cuda_check_error(cudaMalloc(&total_cids, sizeof(uint16_t) * max_nvme_cmds * total_cnt));
+    cuda_check_error(cudaMalloc(&total_sq_poss, sizeof(uint16_t) * max_nvme_cmds * total_cnt));
+    cuda_check_error(cudaMalloc(&total_nvme_cmds, sizeof(struct nvme_cmd__addr) * max_nvme_cmds * total_cnt));
+    cuda_check_error(cudaMalloc(&queue_acquire_helper, sizeof(QueueAcquireHelper) * nr_device));
+    cuda_check_error(cudaMallocManaged(&ctrl_ptrs, sizeof(void *) * nr_device));
+
+    for (int dev_idx = 0; dev_idx < nr_device; dev_idx++) {
+        auto *dev_ctrl = ctrls[dev_idx]->d_ctrl_ptr;
+        ctrl_ptrs[dev_idx] = dev_ctrl;
+    }
+
+    // assume that all the devices have the same block size
+    auto block_log = ctrls[0]->h_qps[0]->block_size_log;
+    auto nr_queues = ctrls[0]->n_qps;
+
+    RUN_ON_DEVICE({
+        for (int dev_idx = 0; dev_idx < nr_device; dev_idx++) {
+            auto q_helper = queue_acquire_helper + dev_idx;
+            new (q_helper) QueueAcquireHelper(nr_queues);
+        }
+        for (int file_idx = 0; file_idx < nr_files; file_idx ++){    
+            for (int dev_idx = 0; dev_idx < nr_device; dev_idx++) {
+                auto q_helper = queue_acquire_helper + dev_idx;
+                auto this_file = files + file_idx * nr_device + dev_idx;
+                auto dev_ctrl = (Controller *)ctrl_ptrs[dev_idx];
+                auto *hdr = (struct geminiFS_hdr *)((uintptr_t)dev_fds_base  
+                                                        + (file_idx * nr_device + dev_idx) * hdr_size);
+                new (this_file) NVMeFile(dev_ctrl, hdr);
+                this_file->max_nvme_cmds = max_nvme_cmds;
+                this_file->nvme_cmds = total_nvme_cmds + (file_idx * nr_device + dev_idx) * max_nvme_cmds;
+                this_file->cids = total_cids + (file_idx * nr_device + dev_idx) * max_nvme_cmds;
+                this_file->sq_poss = total_sq_poss + (file_idx * nr_device + dev_idx) * max_nvme_cmds;
+                this_file->hqps_block_size_log = block_log;
+                this_file->queue_acquire_helper = q_helper;
+                this_file->file_size = per_file_size;
+                this_file->nvme_page_size = dev_ctrl->page_size;
+                this_file->block_size = block_size;
+            }
+        }
+    })
+    cudaFree(ctrl_ptrs);
+
+    return files;
+
+}
+
+__host__ void *device_batch_open_test(size_t block_size, int nr_files, size_t file_size, int cudaDevice){
+    return device_batch_open(block_size, nr_files, file_size, cudaDevice);
+}
+
+struct DMAInfo{
+    uint64_t *vaddr;
+    uint64_t ioaddr_base;
+    DmaPtr dma_ptr;
+};
+
+__host__ GPUFile* 
+geminifs_batch_create(int nr_device, int nr_files, size_t block_size, size_t file_size, int cudaDevice){
+    
+    cuda_check_error(cudaSetDevice(cudaDevice));
+
+    auto nv_file_size = file_size / nr_device;
+    auto nvme_page_size = ctrls[0].get()->page_size;
+    NVMeFile *nv_files = device_batch_open(block_size, nr_files, file_size, cudaDevice);
+
+    GPUFile * gpu_files__ptr;
+    void *dma_info__ptr;
+    cuda_check_error(cudaMalloc(&gpu_files__ptr, sizeof(GPUFile) * nr_files));
+    cuda_check_error(cudaMallocManaged(&dma_info__ptr, sizeof(struct DMAInfo) * nr_files));
+
+    for (auto idx = 0; idx < nr_files; idx ++) {
+        auto *dma_info = (struct DMAInfo *)((uintptr_t)dma_info__ptr + idx * sizeof(struct DMAInfo));
+        dma_info->dma_ptr = createDma(ctrls[idx % nr_device].get()->ctrl, 
+                                        sizeof(uint64_t) * nv_file_size / nvme_page_size, cudaDevice);
+        dma_info->vaddr = (uint64_t *)dma_info->dma_ptr->vaddr;
+        dma_info->ioaddr_base = dma_info->dma_ptr->ioaddrs[0];
+    }
+
+    RUN_ON_DEVICE({
+        for (int idx = 0; idx < nr_files; idx++){
+            auto gpu_file = gpu_files__ptr + idx;
+            auto dma_info = (struct DMAInfo *)((uintptr_t)dma_info__ptr + idx * sizeof(struct DMAInfo));
+            new (gpu_file)GPUFile(nv_files + idx * nr_device, nr_device, file_size);
+            // new (gpu_file)GPUFile(nv_files + idx * nr_device, static_cast<size_t>(file_size));
+            gpu_file->nvme_page_size = nvme_page_size;
+            gpu_file->block_size = block_size;
+            gpu_file->prp_list__of_total_pages_vaddr = dma_info->vaddr;
+            gpu_file->prp_list_ioaddr_base = dma_info->ioaddr_base;
+            gpu_file->file_id = idx;
+            // geminifs_info("allocate %d gpu_file, file_id is: %lld\n", idx, gpu_file->file_id);
+        }
+    });
+
+    return gpu_files__ptr;
+}
+
+void host_open_ctrls(struct geminifs_ctrl_params *ctrl_params){
+    std::filesystem::create_directories(ctrl_params->mount_path);
+
+    auto nr_device = ctrl_params->pci_addr.size();
+
+    for (int idx = 0; idx < nr_device; idx++){
+        std::string mount_path = ctrl_params->mount_path + std::to_string(idx);
+        std::filesystem::create_directories(mount_path);
+
+        char *mount_path_c = new char[mount_path.size() + 1];
+        std::copy(mount_path.begin(), mount_path.end(), mount_path_c);
+        nvm_info("Opening controller %d: pci addr %s, mount path %s", 
+                            idx, ctrl_params->pci_addr[idx].c_str(), mount_path.c_str());
+        // cuda_check_error(cudaSetDevice(ctrl_params->cudaDevice));
+        auto ctrl = new Controller(
+            ctrl_params->snvme_control_path.c_str(),
+            ctrl_params->pci_addr[idx].c_str(),
+            mount_path_c,
+            ctrl_params->ns_id,
+            ctrl_params->cudaDevice,
+            ctrl_params->queueDepth,
+            ctrl_params->numQueues);
+        ctrls.push_back(std::shared_ptr<Controller>(ctrl));
+    }
+
+    for (int idx = 0; idx < nr_device; idx++) {
+      auto ctrl = ctrls[idx].get();
+      nvm_debug("Opening controller %d: dev path %s, mount path %s", idx,
+               ctrl->dev_path, ctrl->dev_mount_path);
+    }
+}
+
+void host_close_ctrls(){
+    for (auto &ctrl : ctrls)
+        ctrl.reset();
+    ctrls.clear();
+}
+
+void host_close_all(){
+    host_close_ctrls();
+}
+
+__host__ GPUFilePool* geminifs_init_fds(size_t nr_files, size_t file_size, int device, int num_SSDs_per_gpu, std::string mount_prifix) {
+    assert(nr_files > 0);
+    assert(ctrls.size() > 0);
+    assert(file_size % ctrls.size() == 0);
+    // 根据时间创建pool_id
+    GPUPoolId this_pool_id = (GPUPoolId)time(NULL);
+    size_t nr_device = ctrls.size();
+    GPUFilePool *pool;
+
+    pool_id = this_pool_id;
+
+    // int device;
+    cuda_check_error(cudaGetDevice(&device));
+    file_size = ROUND_UP(file_size, GPU_PAGE_SIZE);
+    auto files = geminifs_batch_create(nr_device, nr_files, GPU_PAGE_SIZE, file_size, device);
+    cuda_check_error(cudaMalloc(&pool, sizeof(GPUFilePool)));
+    
+    RUN_ON_DEVICE({
+        new (pool) GPUFilePool(files, file_size, nr_files);
+        pool->set_pool_id(this_pool_id);
+    });
+    
+    geminifs_info("pool_id %lu\n", pool_id);
+
+    return pool;
+}
+
+
+/*----------------------Xfer-------------------*/
+__global__ void
+__geminifs_device_xfer_test(GPUFile *file, uint64_t *ioaddr, 
+                            size_t file_offset, size_t nbytes, 
+                            enum FileXferType type){
+
+    file->scatter_ioaddrs(ioaddr, file_offset, nbytes);
+    if (type == FILE_XFER_READ) {
+        file->read_in(file_offset, nbytes);
+    } else {
+        file->write_out(file_offset, nbytes);
+    }
+}
+
+
+__global__ void 
+__geminifs_device_xfer(GPUFile *file, uint64_t *ioaddr, 
+                        size_t file_offset, size_t nbytes, 
+                        enum FileXferType type){
+    
+    size_t nr_block = gridDim.x;
+    size_t nr_thread_per_block = blockDim.x;
+    size_t nr_warp__per_block = nr_thread_per_block / 32;
+    size_t nbytes__per_thread = nbytes / nr_block / nr_thread_per_block;
+
+    int lane = my_lane_id();
+
+    assert(nr_warp__per_block > 0);
+    assert(blockDim.x == 32);
+    
+    size_t this_thread_file_offset = file_offset + nbytes__per_thread * (blockIdx.x * nr_thread_per_block + threadIdx.x);
+
+    if (lane == 0) {
+        file->scatter_ioaddrs(ioaddr, file_offset, nbytes);
+    }
+    __syncwarp();
+
+    if (type == FILE_XFER_READ) {
+        file->read_in(this_thread_file_offset, nbytes__per_thread);
+    } else {
+        file->write_out(this_thread_file_offset, nbytes__per_thread);
+    }
+
+}
+
+__host__ void 
+geminifs_device_xfer(GPUFile *file, uint64_t *ioaddr, 
+                        size_t file_offset, size_t nbytes,
+                        enum FileXferType type){
+    assert(nbytes % GPU_PAGE_SIZE == 0);
+    assert(ioaddr != NULL);
+    assert(file != NULL);
+
+    __geminifs_device_xfer<<<1, 32>>>(file, ioaddr, file_offset, nbytes, type);
+}
+
+__global__ void 
+__geminifs_device_batch_xfer(GPUFile *files, uint64_t **ioaddr, 
+                                size_t file_offset, size_t nbytes,
+                                enum FileXferType type, size_t batch_size){
+
+    size_t nr_block = gridDim.x;
+    size_t nr_thread_per_block = blockDim.x;
+    size_t nbytes__per_thread = nbytes / 32;
+
+    assert(nr_block == batch_size);
+    assert(nr_thread_per_block == 32);
+
+    int lane = my_lane_id();    
+    size_t this_thread_file_offset = file_offset + lane * nbytes__per_thread;
+
+    auto file = files + blockIdx.x;
+
+    if (lane == 0) {
+        file->scatter_ioaddrs(ioaddr[blockIdx.x], file_offset, nbytes);
+    }
+    __syncwarp();
+
+    if (type == FILE_XFER_READ) {
+        file->read_in(this_thread_file_offset, nbytes__per_thread);
+    } else {
+        file->write_out(this_thread_file_offset, nbytes__per_thread);
+    }
+}
+
+__host__ void
+geminifs_device_batch_xfer(GPUFile *files, uint64_t **ioaddr, 
+                            size_t file_offset, size_t nbytes,
+                            enum FileXferType type, size_t batch_size){
+    assert(nbytes % GPU_PAGE_SIZE == 0);
+    assert(ioaddr != NULL);
+    assert(files != NULL);
+    assert(batch_size > 0);
+
+    // geminifs_info("geminifs_device_batch_xfer: file_offset %lu, nbytes %lu, batch_size %lu\n", 
+    //                         file_offset, nbytes, batch_size);
+    
+    __geminifs_device_batch_xfer<<<batch_size, 32>>>(files, ioaddr, file_offset, nbytes, type, batch_size);
+    cudaDeviceSynchronize();
+}
+
+
+
+/*--------------------Test---------------------*/
+__host__
+DmaPtr createDmaTest(int idx, size_t block_size, int device){
+    return createDma(ctrls[idx].get()->ctrl, block_size, device);
+}
+
+__host__
+DmaPtr getdeviceDmaTest(int idx, void* buffer, size_t size, int cudaDevice){
+    return getDeviceDma(ctrls[idx].get()->ctrl, buffer, size, cudaDevice);
+}
+
+// namespace geminifs_ops {
+/*--------------------utils---------------------*/
+std::string parse_tensor_to_string(const torch::Tensor& tensor) {
+    torch::Tensor cpu_tensor = tensor.to(torch::kCPU);
+        
+    uint8_t* data_ptr = cpu_tensor.data_ptr<uint8_t>();
+    
+    size_t actual_length = 0;
+    while (actual_length < cpu_tensor.size(0) && data_ptr[actual_length] != 0) {
+        actual_length++;
+    }
+    
+    std::string result(reinterpret_cast<char*>(data_ptr), actual_length);
+    return result;
+}
+
+template <typename T>
+torch::Tensor wrap_address(T* ptr, bool is_cuda_ptr = false) {
+    static_assert(sizeof(uintptr_t) <= sizeof(uint64_t), 
+                 "Pointer size exceeds 64 bits, casting may truncate");
+
+    uint64_t addr = reinterpret_cast<uint64_t>(ptr);
+    uint64_t size = sizeof(T);
+
+    torch::TensorOptions options(torch::kUInt64);
+    if (is_cuda_ptr) {
+        options = options.device(torch::kCUDA);
+    }
+
+    return torch::from_blob(
+        &addr, 
+        {2}, 
+        options
+    ).clone().view({1, 2}); 
+}
+
+template <typename T>
+T* unwrap_address(const torch::Tensor& tensor) {
+    // 直接使用张量所在设备的数据指针
+    auto data = tensor.device().is_cuda() 
+        ? tensor.data_ptr<uint64_t>() 
+        : tensor.to(torch::kCPU).data_ptr<uint64_t>();
+
+    uint64_t addr = data[0];
+    uint64_t size = data[1];
+
+    TORCH_CHECK(size == sizeof(T), 
+                "Size mismatch: expected {}, got {}", 
+                sizeof(T), size);
+
+    return reinterpret_cast<T*>(addr);
+}
+
+
+/**
+ * 检查指针是否为CUDA设备指针
+ */
+bool is_device_pointer(const void* ptr, const char* error_msg = nullptr) {
+    cudaPointerAttributes attrs;
+    cudaError_t err = cudaPointerGetAttributes(&attrs, ptr);
+    
+    bool is_device = (err == cudaSuccess && attrs.type == cudaMemoryTypeDevice);
+    
+    if (error_msg != nullptr && !is_device) {
+        TORCH_CHECK(false, error_msg);
+    }
+    
+    return is_device;
+}
+
+
+// GPU 获取DMA地址
+// uint64_t* get_dma_ptr(void* buffer, size_t size, int device) {
+//     // TODO: control的选择, 不需要为每个控制器都创建一个吗？
+//     DmaPtr ioaddr = createDma(ctrls[0].get()->ctrl, buffer, size, device);
+//     return ioaddr.get()->ioaddrs;
+// }
+
+// uint64_t* get_dma_ptr(size_t size, int device) {
+//     DmaPtr ioaddr = createDma(ctrls[0].get()->ctrl, buffer, size, device);
+//     return ioaddr.get()->ioaddrs;
+// }
+/*--------------------utils---------------------*/
+
+/*----------------------custom ops-------------------*/
+__host__ GPUFilePool* init_fds(size_t nr_files, size_t file_size, int device, int num_SSDs_per_gpu, std::string mount_prifix) {
+    assert(nr_files > 0);
+    // 为GPU指定nvme控制器
+    char snvme_control_path[] = "/dev/snvm_control";
+    std::vector<std::string> pci_addr;
+    // 根据device信息指定对应的nvme设备
+    for (int i = 0; i < num_SSDs_per_gpu; i++) {
+        pci_addr.push_back(global_avaible_pci_addr[device * num_SSDs_per_gpu + i]);
+    }
+
+    struct geminifs_ctrl_params ctrl_params = {
+        .mount_path = mount_prifix,
+		.snvme_control_path = snvme_control_path,
+        .pci_addr = pci_addr,
+		.cudaDevice = device,
+		.ns_id = 1,                         
+		.queueDepth = 1024,    
+		.numQueues = 64
+	};
+    cuda_check_error(cudaSetDevice(ctrl_params.cudaDevice));
+    host_open_ctrls(&ctrl_params);
+    assert(ctrls.size() > 0);
+    assert(file_size % ctrls.size() == 0);
+    // 根据时间创建pool_id
+    GPUPoolId this_pool_id = (GPUPoolId)time(NULL);
+    size_t nr_device = ctrls.size();
+    GPUFilePool *pool;
+    pool_id = this_pool_id;
+
+    // cuda_check_error(cudaGetDevice(&device));
+    file_size = ROUND_UP(file_size, GPU_PAGE_SIZE);
+    auto files = geminifs_batch_create(nr_device, nr_files, GPU_PAGE_SIZE, file_size, device);
+    cuda_check_error(cudaMalloc(&pool, sizeof(GPUFilePool)));
+    
+    RUN_ON_DEVICE({
+        new (pool) GPUFilePool(files, file_size, nr_files);
+        pool->set_pool_id(this_pool_id);
+    });
+    
+    geminifs_info("pool_id %lu\n", pool_id);
+    return pool;
+}
+// 如果传入的是指针，必要是设备指针，常量无所谓
+__global__ void 
+    __batch_xfer(GPUFilePool* global_pool,
+                uint64_t *file_ids, 
+                uint64_t *ioaddr, 
+                size_t file_offset, 
+                size_t nbytes,
+                enum FileXferType type, 
+                size_t batch_size) {
+
+    size_t nr_block = gridDim.x;
+    size_t nr_thread_per_block = blockDim.x;
+    size_t nbytes__per_thread = nbytes / 32;
+
+    assert(nr_block == batch_size);
+    assert(nr_thread_per_block == 32);
+
+    int lane = my_lane_id();    
+    size_t this_thread_file_offset = file_offset + lane * nbytes__per_thread;
+    int file_id = blockIdx.x;
+    // TODO: 如何取到历史pool的文件
+    auto file = global_pool->get_file(file_id);
+    if (lane == 0) {
+        file->scatter_ioaddrs(ioaddr, file_offset, nbytes);
+    }
+    __syncwarp();
+
+    if (type == FILE_XFER_READ) {
+        file->read_in(this_thread_file_offset, nbytes__per_thread);
+    } else {
+        file->write_out(this_thread_file_offset, nbytes__per_thread);
+    }
+}
+/*----------------------custom ops-------------------*/
+
+// 优化TODO: 避免调用cudaMalloc、memcopy以及cudaDeviceSynchronize
+bool batch_read_direct(const torch::Tensor& cached_file_ids,    // len = [ceil(num_tokens/chunk_size)]
+                                       const torch::Tensor& keys,               // shape = [num_layers, num_tokens, num_heads, head_size]
+                                       const torch::Tensor& values,             //shape = [num_layers, num_tokens, num_heads, head_size]
+                                       int64_t chunk_size,  // default = 256
+                                       int64_t start_layer_idx,
+                                       int64_t layers // default=1
+                                      ) {
+    std::cout<< "start call batch_read_direct" << std::endl;
+
+    uint64_t* file_ids_ptr = cached_file_ids.data_ptr<uint64_t>();
+    int num_files = cached_file_ids.size(0);
+    std::cout << "cached_file_ids" << cached_file_ids << "num_files: " << num_files << std::endl;
+    
+    int num_tokens = keys.size(0);
+    int total_num_heads = keys.size(1);
+    int head_size = keys.size(2);
+    int element_size = keys.element_size();
+    int device = keys.device().index();
+    int deviceCount = 1;
+    // cudaError_t error = cudaGetDeviceCount(&deviceCount);
+    // if (error != cudaSuccess) {
+    //     geminifs_info("cudaGetDeviceCount failed: %s\n", cudaGetErrorString(error));
+    //     return false;
+    // }
+
+    // uint64_t num_heads_per_device = total_num_heads / deviceCount;
+    // 一个文件内应该是存储chunk_size长度num_layers的kv,因此存储tensor的shape应该为[num_layers, 2, chunk_size, num_heads, head_size]
+    // 以下操作为计算访存文件的偏移量，其中key存在[0]，value存在[1]
+    // 因此每一层的偏移量为2 * chunk_size * num_heads * head_size * element_size
+    // 因此每一层的key的偏移量为， value的偏移量为
+    uint64_t size_of_one_kv_tensor_in_layer = chunk_size * total_num_heads * head_size * element_size;
+    uint64_t layer_stride = 2 * size_of_one_kv_tensor_in_layer;
+    uint64_t key_file_offset = start_layer_idx * layer_stride;
+    uint64_t value_file_offset = start_layer_idx * layer_stride + size_of_one_kv_tensor_in_layer;
+
+
+    
+    uint64_t layer_stride = 2 * chunk_size * num_heads * head_size * element_size;
+    uint64_t key_stride = chunk_size * num_heads_per_device * head_size * element_size;
+    uint64_t key_file_offset = start_layer_idx * layer_stride;
+    uint64_t value_file_offset = start_layer_idx * layer_stride + key_stride;
+    std::cout << "ready to call read, key_file_offset: " << key_file_offset << ", value_file_offset: " << value_file_offset << std::endl;
+
+
+    uint64_t key_nbytes = ROUND_UP(keys.numel() * keys.element_size(), GPU_PAGE_SIZE);
+    uint64_t value_nbytes = ROUND_UP(values.numel() * values.element_size(), GPU_PAGE_SIZE);
+
+    // 根据device信息指定对应的控制器
+    int first_control_idx = device * num_SSDs_per_gpu_global;
+    DmaPtr key_ioaddr = createDmaTest(first_control_idx, key_nbytes, device);
+    DmaPtr value_ioaddr = createDmaTest(first_control_idx, value_nbytes, device);
+    uint64_t* key_ioaddr_ptr = key_ioaddr.get()->ioaddrs;
+    uint64_t* value_ioaddr_ptr = value_ioaddr.get()->ioaddrs;
+    TORCH_CHECK(key_ioaddr_ptr != nullptr, "Failed to get DMA pointer for keys");
+    TORCH_CHECK(value_ioaddr_ptr != nullptr, "Failed to get DMA pointer for values");
+
+    uint64_t *d_key_ioaddr;
+    uint64_t *d_value_ioaddr;
+    cuda_check_error(cudaMalloc(&d_key_ioaddr, sizeof(uint64_t) *  key_ioaddr.get()->n_ioaddrs));
+    cuda_check_error(cudaMalloc(&d_value_ioaddr, sizeof(uint64_t) * value_ioaddr.get()->n_ioaddrs));
+    cuda_check_error(cudaMemcpy(d_key_ioaddr, key_ioaddr_ptr, sizeof(uint64_t) *  key_ioaddr.get()->n_ioaddrs, cudaMemcpyHostToDevice));
+    cuda_check_error(cudaMemcpy(d_value_ioaddr, value_ioaddr_ptr, sizeof(uint64_t) * value_ioaddr.get()->n_ioaddrs, cudaMemcpyHostToDevice));
+	
+    dim3 grid(num_files);
+    dim3 block(32);
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(keys));
+    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    
+    is_device_pointer(global_pool, "global_pool must be device ptr");
+    is_device_pointer(file_ids_ptr, "file_ids_ptr must be device ptr");
+    is_device_pointer(d_key_ioaddr, "key_ioaddr must be device ptr");
+    is_device_pointer(d_value_ioaddr, "value_ioaddr must be device ptr");
+   
+
+    __batch_xfer<<<grid, block, 0, stream>>>(global_pool, file_ids_ptr, d_key_ioaddr, key_file_offset, key_nbytes, FILE_XFER_READ, num_files);
+    cudaDeviceSynchronize();
+    geminifs_info("batch xfer_read keys success\n");
+
+    __batch_xfer<<<grid, block, 0, stream>>>(global_pool, file_ids_ptr, d_value_ioaddr, value_file_offset, value_nbytes, FILE_XFER_READ, num_files);
+    cudaDeviceSynchronize();
+    geminifs_info("batch xfer_read values success\n");
+
+    // 确保keys和values内存是连续的
+    cudaMemcpy(keys.data_ptr(), key_ioaddr->vaddr, keys.numel() * keys.element_size(), cudaMemcpyDeviceToDevice);
+	cudaMemcpy(values.data_ptr(), value_ioaddr->vaddr, values.numel() * values.element_size(), cudaMemcpyDeviceToDevice);
+    TORCH_CHECK(cudaGetLastError() == cudaSuccess, "CUDA error in batch_read transfer");
+
+    return true;
+}
+
+bool batch_write_direct(const torch::Tensor& file_ids,    // shape = [ceil(num_tokens/chunk_size)]
+                                        const torch::Tensor& keys,               // shape = [num_tokens, num_heads, head_size]
+                                        const torch::Tensor& values,             //shape = [num_tokens, num_heads, head_size]
+                                        int64_t chunk_size,  // default = 256
+                                        int64_t start_layer_idx,
+                                        int64_t layers // default = 1
+                                      ) {
+    TORCH_CHECK(keys.device().is_cuda(), "Keys tensor must be on CUDA device");
+    TORCH_CHECK(values.device().is_cuda(), "Values tensor must be on CUDA device");
+    TORCH_CHECK(keys.sizes() == values.sizes(), "Keys and values must have same shape");
+    
+    // std::cout << "call batch_write_direct" << std::endl;
+    uint64_t* file_ids_ptr = file_ids.data_ptr<uint64_t>();
+    int num_files = file_ids.size(0);
+    
+    int num_tokens = keys.size(0);
+    int total_num_heads = keys.size(1);
+    int head_size = keys.size(2);
+    int element_size = keys.element_size();
+    uint64_t key_nbytes = keys.numel() * keys.element_size();
+    uint64_t value_nbytes = values.numel() * values.element_size();
+   
+    int device = keys.device().index();
+   
+    int deviceCount = 1;
+    // cudaError_t error = cudaGetDeviceCount(&deviceCount);
+    // if (error != cudaSuccess) {
+    //     geminifs_info("cudaGetDeviceCount failed: %s\n", cudaGetErrorString(error));
+    //     return false;
+    // }
+    // std::cout << "file ids: " << file_ids << std::endl;
+    geminifs_info("deviceCount: %d, file_ids: %p, keys: %p, values: %p, chunk_size: %ld, start_layer_idx: %ld\n", 
+                 deviceCount, file_ids.data_ptr(), keys.data_ptr(), values.data_ptr(), chunk_size, start_layer_idx);
+    uint64_t num_heads_per_device = total_num_heads / deviceCount;
+    uint64_t layer_stride = 2 * chunk_size * num_heads_per_device * head_size * element_size;
+    uint64_t key_stride = chunk_size * num_heads_per_device * head_size * element_size;
+    uint64_t key_file_offset = start_layer_idx * layer_stride;
+    uint64_t value_file_offset = start_layer_idx * layer_stride + key_stride;
+    std::cout << "ready to call write, key_file_offset: " << key_file_offset << ", value_file_offset: " << value_file_offset << std::endl;
+    // 确保内存与GPU Page Size对齐
+    key_nbytes = ROUND_UP(key_nbytes, GPU_PAGE_SIZE);
+    value_nbytes = ROUND_UP(value_nbytes, GPU_PAGE_SIZE);
+
+    // 根据device信息指定对应的控制器
+    int first_control_idx = device * num_SSDs_per_gpu_global;
+    DmaPtr key_ioaddr = createDmaTest(first_control_idx, key_nbytes, device);
+    DmaPtr value_ioaddr = createDmaTest(first_control_idx, value_nbytes, device);
+    uint64_t* key_ioaddr_ptr = key_ioaddr.get()->ioaddrs;
+    uint64_t* value_ioaddr_ptr = value_ioaddr.get()->ioaddrs;
+
+    TORCH_CHECK(key_ioaddr_ptr != nullptr, "Failed to get DMA pointer for keys");
+    TORCH_CHECK(value_ioaddr_ptr != nullptr, "Failed to get DMA pointer for values");
+    
+    uint64_t *d_key_ioaddr;
+    uint64_t *d_value_ioaddr;
+    cuda_check_error(cudaMalloc(&d_key_ioaddr, sizeof(uint64_t) *  key_ioaddr.get()->n_ioaddrs));
+    cuda_check_error(cudaMalloc(&d_value_ioaddr, sizeof(uint64_t) * value_ioaddr.get()->n_ioaddrs));
+    cuda_check_error(cudaMemcpy(d_key_ioaddr, key_ioaddr_ptr, sizeof(uint64_t) *  key_ioaddr.get()->n_ioaddrs, cudaMemcpyHostToDevice));
+    cuda_check_error(cudaMemcpy(d_value_ioaddr, value_ioaddr_ptr, sizeof(uint64_t) * value_ioaddr.get()->n_ioaddrs, cudaMemcpyHostToDevice));
+	
+    // MemoryCopyD2D
+    cudaMemcpy(key_ioaddr->vaddr, keys.data_ptr(), keys.element_size() * keys.numel(), cudaMemcpyDeviceToDevice);
+	cudaMemcpy(value_ioaddr->vaddr, values.data_ptr(), values.element_size() * values.numel(), cudaMemcpyDeviceToDevice);
+
+    dim3 grid(num_files);
+    dim3 block(32);
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(keys));
+    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+ 
+    is_device_pointer(global_pool, "global_pool must be device ptr");
+    is_device_pointer(file_ids_ptr, "file_ids_ptr must be device ptr");
+    is_device_pointer(d_key_ioaddr, "key_ioaddr must be device ptr");
+    is_device_pointer(d_value_ioaddr, "value_ioaddr must be device ptr");
+ 
+    __batch_xfer<<<grid, block, 0, stream>>>(global_pool, file_ids_ptr, d_key_ioaddr, key_file_offset, key_nbytes, FILE_XFER_WRITE, num_files);
+    cudaDeviceSynchronize();
+    geminifs_info("batch xfer keys success\n");
+
+    __batch_xfer<<<grid, block, 0, stream>>>(global_pool, file_ids_ptr, d_value_ioaddr, value_file_offset, value_nbytes, FILE_XFER_WRITE, num_files);
+    cudaDeviceSynchronize();
+    geminifs_info("batch xfer values success\n");
+    TORCH_CHECK(cudaGetLastError() == cudaSuccess, "CUDA error in batch transfer");
+ 
+    return true;
+}
+
+// bool geminifs_init_fds_wrapper_cuda(const torch::Tensor& metadata, const torch::Tensor& root_path) {
+bool geminifs_init_fds_wrapper_cuda(const torch::Tensor& metadata, const std::string& nvme_config_path) {
+
+    // TODO: 解析nvme_config_path
+    TORCH_CHECK(metadata.dim() == 1, "Input must be a 1D tensor");
+    TORCH_CHECK(metadata.size(0) == 3, "Input must have exactly 3 elements");
+  
+    size_t nr_files = metadata[0].item<int64_t>();  
+    size_t file_size = metadata[1].item<int64_t>();  
+    int num_SSDs_per_gpu = metadata[2].item<int64_t>();
+    num_SSDs_per_gpu_global = num_SSDs_per_gpu;
+    // 获取当前设备ID
+    int device = metadata.device().index();
+    
+    // TODO:  打开历史的文件，根据pool id？user id，user id可以预先打开
+
+    // 创建新的empty file
+    global_pool = init_fds(nr_files, 
+                        file_size, 
+                        device,  // 添加device参数
+                        num_SSDs_per_gpu,
+                        nvme_config_path);
+
+    geminifs_info("init fds success, pool id is: %p\n", global_pool);
+    cudaDeviceSynchronize();
+    return true;
+}
