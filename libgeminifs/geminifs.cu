@@ -63,12 +63,21 @@ NVMeController::NVMeController(const nvme_ctrl_param& params) {
     // Initialize single controller using the provided PCI address
     controller = open_single_controller(params.pci_addr, params);
     
-    // Initialize file manager with log file in mount path
-    std::string log_file_path = mount_path + "/nvme_file_log.dat";
+    // Initialize file manager with log file in the controller's actual mount path
+    std::string log_file_path = controller->dev_mount_path + "/nvme_file_log.dat";
     file_manager = std::make_unique<FileManager>(log_file_path, 1000); // 1000 is persistence threshold
 }
 
 NVMeController::~NVMeController() {
+    if (file_manager) {
+        // File manager will automatically clean up resources
+        file_manager.reset();
+    }
+    if (controller) {
+        // Close the controller
+        controller.reset();
+    }
+
     // Destructor automatically cleans up smart pointers
     // No explicit cleanup needed for shared_ptr and unique_ptr
 }
