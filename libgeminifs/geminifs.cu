@@ -22,6 +22,8 @@
 #include <vector>
 #include <cuda_runtime.h>
 
+#include <sys/file.h>
+#include <fcntl.h>
 
 #include <torch/library.h>
 #include <torch/torch.h>
@@ -47,9 +49,80 @@
 /*-------------------------metadata--------------------------------*/
 static std::unordered_map<int, struct geminifs_metadata *> global_metadata;
 static std::unordered_map<uint64_t, geminifs_dma *> global_dam_ctx;
+
 static char snvme_control_path[] = "/dev/snvm_control";
 static char sys_config_path[] = "/mnt/sys_GPU_NVMe_topology.json";
 
+NVMeController::NVMeController(const nvme_ctrl_param& params) {
+    // Set mount path
+    mount_path = params.mount_path;
+    
+    // Create mount directory if it doesn't exist
+    std::filesystem::create_directories(mount_path);
+    
+    // Initialize single controller using the provided PCI address
+    controller = open_single_controller(params.pci_addr, params);
+    
+    // Initialize file manager with log file in mount path
+    std::string log_file_path = mount_path + "/nvme_file_log.dat";
+    file_manager = std::make_unique<FileManager>(log_file_path, 1000); // 1000 is persistence threshold
+}
+
+NVMeController::~NVMeController() {
+    // Destructor automatically cleans up smart pointers
+    // No explicit cleanup needed for shared_ptr and unique_ptr
+}
+
+// std::vector<ControllerPtr> geminifs_nvme_host_open_ctrls(struct geminifs_ctrl_params *ctrl_params) {
+//     std::vector<ControllerPtr> ctrls;
+    
+//     // Check if SNVM control device exists
+//     if (!check_snvme_control_exists()) {
+//         geminifs_error("Failed to initialize controllers: SNVM kernel module not loaded\n");
+//         return ctrls;  // Return empty vector to indicate error
+//     }
+
+//     // Check if Sys config file exists  
+//     if (!check_sys_config_exists()) {
+//         geminifs_error("Failed to initialize controllers: SNVM kernel module not loaded\n");
+//         return ctrls;  // Return empty vector to indicate error
+//     }
+    
+//     std::filesystem::create_directories(ctrl_params->mount_path);
+//     std::filesystem::path mount_path(ctrl_params->mount_path);
+
+//     for (size_t idx = 0; idx < ctrl_params->pci_addr.size(); idx++){
+//         std::filesystem::path this_mount_path = mount_path / 
+//                                     ("cuda" + std::to_string(ctrl_params->cudaDevice) + '-' + std::to_string(idx));
+//         if (!std::filesystem::exists(this_mount_path)) {
+//             std::filesystem::create_directories(this_mount_path);
+//         }
+//         auto ctrl = new Controller(
+//             snvme_control_path,
+//             ctrl_params->pci_addr[idx].c_str(),
+//             this_mount_path,
+//             ctrl_params->ns_id,
+//             ctrl_params->cudaDevice,
+//             ctrl_params->queueDepth,
+//             ctrl_params->numQueues);
+//         nvm_info("Opening controller %ld: pci addr %s, mount path %s", 
+//                             idx, ctrl_params->pci_addr[idx].c_str(), this_mount_path.c_str());  
+//         ctrls.push_back(std::shared_ptr<Controller>(ctrl));
+//     }
+
+// #ifdef DEBUG
+//     for (size_t idx = 0; idx < ctrl_params->pci_addr.size(); idx++) {
+//       auto ctrl = ctrls[idx].get();
+//       nvm_debug("Opening controller %d: dev path %s, mount path %s", idx,
+//                ctrl->dev_path, ctrl->dev_mount_path);
+//     }
+// #endif
+
+//     return std::move(ctrls);
+// }
+
+
+// Global helper functions for checking system components
 static inline bool check_snvme_control_exists() {
     if (access(snvme_control_path, F_OK) != 0) {
         geminifs_error("SNVM control device '%s' does not exist. Please ensure the kernel module is properly installed.\n", snvme_control_path);
@@ -65,7 +138,6 @@ static inline bool check_sys_config_exists() {
     }
     return true;
 }
-
 
 static inline void host_close_ctrls(struct geminifs_metadata *metadata){
     for (auto &ctrl : metadata->ctrls) {
@@ -153,6 +225,7 @@ static inline void *host_batch_create(std::vector<ControllerPtr> &ctrls, GPUPool
     return dev_fds_base;
 }
 
+
 /**
  * Creates a file on the host with specified parameters
  * 
@@ -197,7 +270,9 @@ void *geminifs_host_file_create(ControllerPtr &ctrl, int block_size, size_t file
     host_create_geminifs_file(hdr, std::string(file_path).c_str(), block_size, file_size);
     geminifs_debug("hdr info: block_size %d, file_size %lu, first_block_base %ld, file_path %s\n", 
                     hdr->block_bit, hdr->virtual_space_size, hdr->first_block_base, file_path.c_str());
-
+    /*create the uuid and update the file info */
+    
+    /* */
     void *dev_fd_base;
     cuda_check_error(cudaMalloc(&dev_fd_base, hdr_size));
     cuda_check_error(cudaMemcpy(dev_fd_base, host_fd_base, hdr_size, cudaMemcpyHostToDevice));
@@ -209,6 +284,61 @@ void *geminifs_host_file_create(ControllerPtr &ctrl, int block_size, size_t file
 
     return dev_fd_base;
 }
+
+
+// /**
+//  * open a file on the host with specified parameters
+//  * 
+//  * @param ctrl        NVMe controller pointers to manage storage devices
+//  * @param file_size    Total size of the file to create
+//  * geminiFS allow allow different file size for different files, but the file size must be multiple of block_size
+//  * @param filename    filename of the file to open, it will check the file exists in the controller's mount path
+//  * 
+//  * Requirements:
+//  * - file_size must be divisible by block_size (file_size % block_size == 0)
+//  * - block_size must be a power of 2 and >= NVMe page size
+//  * - block_size is typically 4KB (4096 bytes)
+//  * 
+//  * Example usage:
+//  * ```cpp
+//  * size_t block_size = 4096;  // 4KB blocks
+//  * size_t file_size = 1048576; // 1MB file (must be multiple of block_size)
+//  * filename = "example_file";
+//  * void* file_ptr = geminifs_host_file_create(controllers, block_size, file_size);
+//  * ```
+//  * 
+//  * @return Pointer to the created file structure in host memory and in GPU memory, or nullptr on failure
+//  */
+// __host__
+// void *g_open(ControllerPtr &ctrl, size_t file_size, std::string filename)
+// {
+//     // Check if the file size is a multiple of the ctrl block size
+//     assert(file_size % ctrl->block_size == 0);
+//     // check if the file exists in the controller's log file 
+//     std::filesystem::path file_path = std::filesystem::path(ctrl->dev_mount_path) / filename;
+     
+//     auto exist = check_file_exists(ctrl, filename);
+//     if(exist) {
+//         // if file exists, open it
+//         host_fd_t fd = geminifs_host_file_open(ctrl, ctrl->block_size, file_size, filename);
+//         return fd;
+//     }
+//     else {
+//         host_fd_t fd = geminifs_host_file_create(ctrl, ctrl->block_size, file_size, filename);
+//     }
+//     // if file does not exist, create it
+    
+
+//     // using a Advisory Locks to open the file
+//     struct flock lock_info;
+//     lock_info.l_type = F_WRLCK;    // 排他锁 (Write Lock)
+//     lock_info.l_whence = SEEK_SET; // 从文件开头开始
+//     lock_info.l_start = 0;         // 偏移量为0
+//     lock_info.l_len = 0;           // 长度为0，表示锁定整个文件
+
+//     return fd;
+// }
+
 
 static 
 NVMeFile *device_batch_open(std::vector<ControllerPtr> &ctrls, GPUPoolId pool_id, size_t block_size, 
@@ -492,6 +622,29 @@ geminifs_file_create(std::vector<ControllerPtr> &ctrls, GPUPoolId pool_id, int n
     return gpu_files__ptr;
 }
 
+ControllerPtr NVMeController::open_single_controller(const std::string& pci_addr, const nvme_ctrl_param& params) {
+    // Create mount path for this specific controller
+    std::filesystem::path mount_path(params.mount_path);
+    std::filesystem::path this_mount_path = mount_path / 
+        ("cuda" + std::to_string(params.cudaDevice) + '-' + pci_addr);
+
+    if (!std::filesystem::exists(this_mount_path)) {
+        std::filesystem::create_directories(this_mount_path);
+    }
+    
+    // Create and initialize controller
+    ControllerPtr ctrl = std::make_shared<Controller>(
+        snvme_control_path, 
+        pci_addr.c_str(), 
+        this_mount_path.c_str(), 
+        params.ns_id, 
+        params.cudaDevice, 
+        params.queueDepth, 
+        params.numQueues);
+        
+    return ctrl;
+}
+
 std::vector<ControllerPtr> host_open_ctrls(struct geminifs_ctrl_params *ctrl_params){
     
 
@@ -542,57 +695,9 @@ std::vector<ControllerPtr> host_open_ctrls(struct geminifs_ctrl_params *ctrl_par
     return std::move(ctrls);
 }
 
-std::vector<ControllerPtr> Geminifs_NVMe_Host_open_ctrls(struct geminifs_ctrl_params *ctrl_params){
-    
 
-    std::vector<ControllerPtr> ctrls;
 
-    // Check if SNVM control device exists
-    if (!check_snvme_control_exists()) {
-        geminifs_error("Failed to initialize controllers: SNVM kernel module not loaded\n");
-        return ctrls;  // Return empty vector to indicate error
-    }
-
-    // Check if Sys config file exists
-    if (!check_sys_config_exists()) {
-        geminifs_error("Failed to initialize controllers: SNVM kernel module not loaded\n");
-        return ctrls;  // Return empty vector to indicate error
-    }
-
-    std::filesystem::create_directories(ctrl_params->mount_path);
-    std::filesystem::path mount_path(ctrl_params->mount_path);
-
-    for (size_t idx = 0; idx < ctrl_params->pci_addr.size(); idx++){
-        std::filesystem::path this_mount_path = mount_path / 
-                                    ("cuda" + std::to_string(ctrl_params->cudaDevice) + '-' + std::to_string(idx));
-        if (!std::filesystem::exists(this_mount_path)) {
-            std::filesystem::create_directories(this_mount_path);
-        }
-        auto ctrl = new Controller(
-            snvme_control_path,
-            ctrl_params->pci_addr[idx].c_str(),
-            this_mount_path,
-            ctrl_params->ns_id,
-            ctrl_params->cudaDevice,
-            ctrl_params->queueDepth,
-            ctrl_params->numQueues);
-        nvm_info("Opening controller %ld: pci addr %s, mount path %s", 
-                            idx, ctrl_params->pci_addr[idx].c_str(), this_mount_path.c_str());  
-        ctrls.push_back(std::shared_ptr<Controller>(ctrl));
-    }
-
-#ifdef DEBUG
-    for (size_t idx = 0; idx < ctrl_params->pci_addr.size(); idx++) {
-      auto ctrl = ctrls[idx].get();
-      nvm_debug("Opening controller %d: dev path %s, mount path %s", idx,
-               ctrl->dev_path, ctrl->dev_mount_path);
-    }
-#endif
-
-    return std::move(ctrls);
-}
-
-void  Geminifs_NVMe_Host_close_ctrls(std::vector<ControllerPtr> &ctrls)
+void  geminifs_nvme_host_close_ctrls(std::vector<ControllerPtr> &ctrls)
 {
     for (auto &ctrl : ctrls) {
         if (ctrl) {

@@ -9,9 +9,40 @@
 #include <torch/all.h>
 #include <thrust/device_ptr.h>
 #include <vector>
-
+#include <memory>
+#include <concepts>
+#include "geminifs_nvme_file.h"
 
 using ControllerPtr = std::shared_ptr<Controller>;
+
+
+
+
+
+class NVMeController {
+public:
+    ControllerPtr controller;      // NVMe controller smart pointer
+    std::unique_ptr<FileManager> file_manager; // File manager for this mount
+    std::string mount_path;        // Mount path
+ 
+    NVMeController(const ControllerPtr& ctrl, std::unique_ptr<FileManager> fm, const std::string& path)
+        : controller(ctrl), file_manager(std::move(fm)), mount_path(path) {}
+
+    NVMeController(const nvme_ctrl_param& params);
+    
+    // Destructor
+    ~NVMeController();
+
+private:
+    // Private helper methods
+    bool check_sys_config_exists();
+    bool check_snvme_control_exists();
+    ControllerPtr open_single_controller(const std::string& pci_addr, const nvme_ctrl_param& params);
+};
+// Smart pointer for MountController
+using NVMeControllerPtr = std::shared_ptr<NVMeController>;
+
+
 struct geminifs_metadata{
     std::vector<ControllerPtr> ctrls;
     std::atomic<bool> is_init{false};
@@ -27,10 +58,6 @@ struct geminifs_dma{
     DmaPtr dma_ptr;
 };
 
-template <typename T>
-concept IOAddressType =
-    std::is_same_v<T, uint64_t> ||
-    std::is_same_v<T, cuda::std::span<uint64_t>>;
 
 __host__ GPUFilePool* geminifs_init_fds(size_t nr_files, size_t file_size);
 __host__ struct geminifs_metadata* geminifs_get_metadata(int device_id);
@@ -42,11 +69,11 @@ __host__ std::vector<ControllerPtr>
 host_open_ctrls(struct geminifs_ctrl_params *ctrl_params);
 
 __host__ std::vector<ControllerPtr> 
-Geminifs_NVMe_Host_open_ctrls(struct geminifs_ctrl_params *ctrl_params);
+geminifs_nvme_host_open_ctrls(struct geminifs_ctrl_params *ctrl_params);
 
 
 __host__ void 
-Geminifs_NVMe_Host_close_ctrls(std::vector<ControllerPtr> &ctrls); 
+geminifs_nvme_host_close_ctrls(std::vector<ControllerPtr> &ctrls); 
 
 
 // geminifs_batch_create(int nr_device, int nr_files, size_t block_size, size_t file_size, int  cudaDevice);

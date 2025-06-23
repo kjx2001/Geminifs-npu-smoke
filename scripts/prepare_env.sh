@@ -1,6 +1,15 @@
 #!/bin/bash
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+# Install uuid-dev if not present
+if ! dpkg -s uuid-dev >/dev/null 2>&1; then
+    echo "Installing uuid-dev package..."
+    sudo apt-get update
+    sudo apt-get install -y uuid-dev
+else
+    echo "uuid-dev is already installed."
+fi
+
 # 定义变量
 third_pkgs_dir="${PROJECT_ROOT}/third_pkgs"
 url="https://download.pytorch.org/libtorch/cu128/libtorch-cxx11-abi-shared-with-deps-2.7.1%2Bcu128.zip"

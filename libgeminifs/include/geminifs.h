@@ -39,6 +39,15 @@ struct geminifs_ctrl_params {
 	uint64_t numQueues;
 };
 
+struct nvme_ctrl_param {
+	std::string mount_path; // mount path
+	std::string pci_addr; // disk pci address in the form of 0000:00:00.0
+	int cudaDevice; // gpu id cuda device id
+	uint32_t ns_id;
+	uint64_t queueDepth;
+	uint64_t numQueues;
+};
+
 typedef int fd_t;
 typedef struct geminiFS_hdr* host_fd_t;
 

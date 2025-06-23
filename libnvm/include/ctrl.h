@@ -56,7 +56,6 @@ struct Controller
     char* dev_path;
     // char* dev_mount_path;
     std::string dev_mount_path;
-
     void* d_ctrl_ptr;
     BufferPtr d_ctrl_buff;
 

@@ -82,3 +82,19 @@ set_target_properties(TestForPythonInterface PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
 )
+
+add_executable(TestForNVMeLayer TestForNVMeLayer.cu)
+
+# Link libraries
+target_link_libraries(TestForNVMeLayer PRIVATE
+    geminifs
+    nvm
+    CUDA::cudart
+    "${TORCH_LIBRARIES}"
+)
+
+# Set CUDA properties
+set_target_properties(TestForNVMeLayer PROPERTIES 
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+)
