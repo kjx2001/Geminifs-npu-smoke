@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cuda_device_runtime_api.h>
 #include <cuda_runtime_api.h>
+#include <fcntl.h>
 #include <filesystem>
 #include <memory>
 #include <stddef.h>
@@ -53,7 +54,7 @@ static std::unordered_map<uint64_t, geminifs_dma *> global_dam_ctx;
 static char snvme_control_path[] = "/dev/snvm_control";
 static char sys_config_path[] = "/mnt/sys_GPU_NVMe_topology.json";
 
-NVMeController::NVMeController(const nvme_ctrl_param& params) {
+NVMeController::NVMeController(const nvme_ctrl_param& params) : is_initialized_(false) {
     // Set mount path
     mount_path = params.mount_path;
     
@@ -66,9 +67,12 @@ NVMeController::NVMeController(const nvme_ctrl_param& params) {
     // Initialize file manager with log file in the controller's actual mount path
     std::string log_file_path = controller->dev_mount_path + "/nvme_file_log.dat";
     file_manager = std::make_unique<FileManager>(log_file_path, 1000); // 1000 is persistence threshold
+    
+    // Set initialization state to true after successful initialization
+    is_initialized_ = true;
 }
 
-NVMeController::~ () {
+NVMeController::~NVMeController() {
     if (file_manager) {
         // File manager will automatically clean up resources
         file_manager.reset();
@@ -85,8 +89,14 @@ NVMeController::~ () {
 __host__
 void * NVMeController::g_open(std::string filename, size_t file_size, uint32_t o_flag)
 {
+    // Check if controller is properly initialized
+    if (!is_initialized()) {
+        geminifs_error("g_open: NVMeController is not properly initialized. Please ensure the constructor completed successfully.\n");
+        return nullptr;
+    }
+    
     // Check if the file size is a multiple of the ctrl block size
-    assert(file_size % ctrl->block_size == 0);
+    assert(file_size % controller->blk_size == 0);
     
     // Check if both O_HOST and O_DEVICE flags are set (invalid)
     if ((o_flag & O_HOST) && (o_flag & O_DEVICE)) {
@@ -112,33 +122,28 @@ void * NVMeController::g_open(std::string filename, size_t file_size, uint32_t o
         geminifs_info("g_open: File '%s' found in log at slot %u\n", 
                       filename.c_str(), file_desc.slot_index);
         
-        // Check if the file size needs to be adjusted
+        // Check if the file size matches the requested size
         if (file_desc.size != file_size) {
-            geminifs_info("g_open: Adjusting file size from %zu to %zu bytes\n", 
-                          file_desc.size, file_size);
-            
-            // Update file descriptor with new size
-            file_desc.size = file_size;
-            file_desc.modify_time = FileManager::getCurrentTimestamp();
-            
-            // Update the log record
-            file_manager->deleteFile(filename);  // Remove old record
-            file_manager->createFile(filename, file_desc);  // Create new record with updated size
+            geminifs_error("g_open: File '%s' exists with size %zu bytes, but requested size is %zu bytes. "
+                          "Please delete the existing file if you want to create a new one with different size.\n", 
+                          filename.c_str(), file_desc.size, file_size);
+            return nullptr;
         }
-        
         // Open the existing file
         if (o_flag & O_HOST) {
             // Open for host-side operations
             std::filesystem::path file_path = controller->dev_mount_path;
             file_path = file_path / filename;
             
-            // Check if physical file exists, if not recreate it
+            // Check if physical file exists
             if (!std::filesystem::exists(file_path)) {
-                geminifs_info("g_open: Physical file not found, recreating '%s'\n", file_path.c_str());
-                result_fd = host_file_create_managed(ctrl->block_size, file_size, filename);
+                geminifs_error("g_open: File '%s' exists in log but physical file not found. Removing from log.\n", filename.c_str());
+                // Remove the inconsistent record from log
+                file_manager->deleteFile(filename);
+                return nullptr;
             } else {
                 // Open existing file using managed version
-                result_fd = host_file_open_managed(file_path.string());
+                result_fd = host_file_open_managed(file_path.string(), o_flag);
                 if (result_fd == nullptr) {
                     geminifs_error("g_open: Failed to open existing file '%s'\n", file_path.c_str());
                     return nullptr;
@@ -166,7 +171,7 @@ void * NVMeController::g_open(std::string filename, size_t file_size, uint32_t o
         // Create new file
         if (o_flag & O_HOST) {
             // Create for host-side operations
-            result_fd = host_file_create_managed(ctrl->block_size, file_size, filename);
+            result_fd = host_file_create_managed(controller->page_size, file_size, filename);
             if (result_fd == nullptr) {
                 geminifs_error("g_open: Failed to create host file '%s'\n", filename.c_str());
                 return nullptr;
@@ -212,6 +217,12 @@ static int one_nr__of__binary_int(unsigned long long i) {
  * NVMeController member function to create a file with automatic FileManager integration
  */
 host_fd_t NVMeController::host_file_create_managed(int block_size, size_t file_size, const std::string& filename) {
+    // Check if controller is properly initialized
+    if (!is_initialized()) {
+        geminifs_error("host_file_create_managed: NVMeController is not properly initialized\n");
+        return nullptr;
+    }
+    
     assert(file_size % block_size == 0);
 
     auto nvpage_size = controller->page_size;
@@ -289,10 +300,35 @@ host_fd_t NVMeController::host_file_create_managed(int block_size, size_t file_s
 /**
  * NVMeController member function to open a file with automatic FileManager integration
  */
-host_fd_t NVMeController::host_file_open_managed(const std::string& filepath) {
+host_fd_t NVMeController::host_file_open_managed(const std::string& filepath, uint32_t o_flag) {
+    // Check if controller is properly initialized
+    if (!is_initialized()) {
+        geminifs_error("host_file_open_managed: NVMeController is not properly initialized\n");
+        return nullptr;
+    }
+    
+    // Remove O_DEVICE and O_HOST flags before passing to host_open_geminifs_file
+    // These are GeminiFS-specific flags that shouldn't be passed to the underlying file operations
+    uint32_t file_flags = o_flag & ~(O_HOST | O_DEVICE);
+    
+    // For now, we'll still use the existing host_open_geminifs_file function
+    // In the future, this could be extended to accept different flags
     host_fd_t result = host_open_geminifs_file(filepath.c_str());
     
-    if (result != nullptr && file_manager != nullptr) {
+    // Check for read-only file access errors
+    if (result == nullptr) {
+        // Check if the failure might be due to read-only access requirements
+        if ((file_flags & O_ACCMODE) == O_RDONLY) {
+            geminifs_error("host_file_open_managed: Failed to open file '%s' in read-only mode. "
+                          "GeminiFS files currently require read-write access for proper operation.\n", 
+                          filepath.c_str());
+        } else {
+            geminifs_error("host_file_open_managed: Failed to open file '%s'\n", filepath.c_str());
+        }
+        return nullptr;
+    }
+    
+    if (file_manager != nullptr) {
         // Calculate the size of the allocated header for registration
         size_t hdr_size = ROUND_UP(sizeof(struct geminiFS_hdr) + sizeof(nvme_ofst_t) * result->nr_l1, result->first_block_base);
         file_manager->registerOpenFile(result, filepath, hdr_size);
@@ -303,8 +339,14 @@ host_fd_t NVMeController::host_file_open_managed(const std::string& filepath) {
 
 /**
  * NVMeController member function to close a file with automatic FileManager cleanup
- */
+ */    
 void NVMeController::host_file_close_managed(host_fd_t fd) {
+    // Check if controller is properly initialized
+    if (!is_initialized()) {
+        geminifs_error("host_file_close_managed: NVMeController is not properly initialized\n");
+        return;
+    }
+    
     if (file_manager != nullptr) {
         file_manager->unregisterOpenFile(fd);
     }

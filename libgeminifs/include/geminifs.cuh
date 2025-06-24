@@ -26,7 +26,7 @@ public:
     std::string mount_path;        // Mount path
  
     NVMeController(const ControllerPtr& ctrl, std::unique_ptr<FileManager> fm, const std::string& path)
-        : controller(ctrl), file_manager(std::move(fm)), mount_path(path) {}
+        : controller(ctrl), file_manager(std::move(fm)), mount_path(path), is_initialized_(false) {}
 
     NVMeController(const nvme_ctrl_param& params);
     
@@ -37,14 +37,20 @@ public:
 
     // Managed file operations - automatically handle file descriptor tracking
     host_fd_t host_file_create_managed(int block_size, size_t file_size, const std::string& filename);
-    host_fd_t host_file_open_managed(const std::string& filepath);
+    host_fd_t host_file_open_managed(const std::string& filepath, uint32_t o_flag);
     void host_file_close_managed(host_fd_t fd);
+
+    // Check if controller is properly initialized
+    bool is_initialized() const { return is_initialized_; }
 
 private:
     // Private helper methods
     bool check_sys_config_exists();
     bool check_snvme_control_exists();
     ControllerPtr open_single_controller(const std::string& pci_addr, const nvme_ctrl_param& params);
+    
+    // Initialization state
+    bool is_initialized_;
 };
 // Smart pointer for MountController
 using NVMeControllerPtr = std::shared_ptr<NVMeController>;
