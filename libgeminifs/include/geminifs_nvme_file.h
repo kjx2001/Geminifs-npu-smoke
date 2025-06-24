@@ -17,6 +17,19 @@ constexpr size_t MAX_RECORDS = BITMAP_SIZE_BYTES * BITS_PER_BYTE; // 1,048,576 r
 // Forward declaration
 struct LogHeader;
 
+// Forward declaration for host_fd_t
+typedef struct geminiFS_hdr* host_fd_t;
+
+// Structure to track opened host file descriptors for automatic cleanup
+struct OpenFileHandle {
+    host_fd_t fd;           // The file descriptor
+    std::string filename;   // Filename for logging purposes
+    size_t hdr_size;        // Size of the allocated header (including l1 array)
+    
+    OpenFileHandle(host_fd_t fd_, const std::string& name, size_t size)
+        : fd(fd_), filename(name), hdr_size(size) {}
+};
+
 // File descriptor structure for NVMe files (Optimized)
 struct NVMeFileDesc {
     uint32_t slot_index;     // The index of this record in the log area (4 bytes)
@@ -59,6 +72,11 @@ public:
     bool getFileByFilename(const std::string& filename, NVMeFileDesc& out_desc) const;
     std::vector<std::string> getAllFilenames() const;
 
+    // Host file descriptor management
+    void registerOpenFile(host_fd_t fd, const std::string& filename, size_t hdr_size);
+    bool unregisterOpenFile(host_fd_t fd);
+    void closeAllOpenFiles();
+
     void forcePersist();
 
 private:
@@ -81,6 +99,10 @@ private:
     
     mutable std::mutex mtx_;
     std::unordered_map<std::string, NVMeFileDesc> filename_to_file_map_;
+
+    // Host file descriptor tracking for automatic cleanup
+    std::vector<OpenFileHandle> open_files_;
+    mutable std::mutex open_files_mtx_;
 
     size_t persistence_threshold_;
     size_t pending_writes_count_;

@@ -133,9 +133,12 @@ int main() {
 // =====================================================================================
 
 #include "geminifs_nvme_file.h"
+#include "geminifs.h"  // For geminiFS_hdr definition
 #include <stdexcept>
 #include <cstring>
 #include <chrono>
+#include <algorithm>  // For std::find_if
+#include <unistd.h>   // For close()
 
 FileManager::FileManager(const std::string& log_path, size_t persistence_threshold)
     : log_file_path_(log_path),
@@ -221,6 +224,8 @@ FileManager::FileManager(const std::string& log_path, size_t persistence_thresho
 }
 
 FileManager::~FileManager() {
+    std::cout << "FileManager shutting down. Closing all open files..." << std::endl;
+    closeAllOpenFiles();
     std::cout << "FileManager shutting down. Forcing persistence..." << std::endl;
     forcePersist();
     if (log_file_handle_ != nullptr) {
@@ -462,6 +467,45 @@ std::vector<std::string> FileManager::getAllFilenames() const {
         filenames.push_back(pair.first);
     }
     return filenames;
+}
+
+// Host file descriptor management methods
+void FileManager::registerOpenFile(host_fd_t fd, const std::string& filename, size_t hdr_size) {
+    std::lock_guard<std::mutex> lock(open_files_mtx_);
+    open_files_.emplace_back(fd, filename, hdr_size);
+    std::cout << "Registered open file: " << filename << " (fd: " << fd << ", size: " << hdr_size << ")" << std::endl;
+}
+
+bool FileManager::unregisterOpenFile(host_fd_t fd) {
+    std::lock_guard<std::mutex> lock(open_files_mtx_);
+    auto it = std::find_if(open_files_.begin(), open_files_.end(), 
+                          [fd](const OpenFileHandle& handle) { return handle.fd == fd; });
+    
+    if (it != open_files_.end()) {
+        std::cout << "Unregistered open file: " << it->filename << " (fd: " << fd << ")" << std::endl;
+        open_files_.erase(it);
+        return true;
+    }
+    return false;
+}
+
+void FileManager::closeAllOpenFiles() {
+    std::lock_guard<std::mutex> lock(open_files_mtx_);
+    
+    for (const auto& handle : open_files_) {
+        std::cout << "Auto-closing file: " << handle.filename << " (fd: " << handle.fd << ")" << std::endl;
+        
+        // Close the file descriptor first
+        if (handle.fd->fd > 0) {
+            close(handle.fd->fd);
+        }
+        
+        // Free the allocated memory (accounting for variable size)
+        free(handle.fd);
+    }
+    
+    open_files_.clear();
+    std::cout << "All open files have been automatically closed." << std::endl;
 }
 
 

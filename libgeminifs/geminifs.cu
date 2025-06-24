@@ -68,7 +68,7 @@ NVMeController::NVMeController(const nvme_ctrl_param& params) {
     file_manager = std::make_unique<FileManager>(log_file_path, 1000); // 1000 is persistence threshold
 }
 
-NVMeController::~NVMeController() {
+NVMeController::~ () {
     if (file_manager) {
         // File manager will automatically clean up resources
         file_manager.reset();
@@ -81,6 +81,239 @@ NVMeController::~NVMeController() {
     // Destructor automatically cleans up smart pointers
     // No explicit cleanup needed for shared_ptr and unique_ptr
 }
+
+__host__
+void * NVMeController::g_open(std::string filename, size_t file_size, uint32_t o_flag)
+{
+    // Check if the file size is a multiple of the ctrl block size
+    assert(file_size % ctrl->block_size == 0);
+    
+    // Check if both O_HOST and O_DEVICE flags are set (invalid)
+    if ((o_flag & O_HOST) && (o_flag & O_DEVICE)) {
+        geminifs_error("g_open: Cannot specify both O_HOST and O_DEVICE flags\n");
+        return nullptr;
+    }
+    
+    // Default to O_HOST if no flag is specified
+    if (!(o_flag & O_HOST) && !(o_flag & O_DEVICE)) {
+        o_flag |= O_HOST;
+    }
+    
+    geminifs_info("g_open: Opening file '%s' with size %zu bytes, flags 0x%x\n", 
+                  filename.c_str(), file_size, o_flag);
+    
+    // Check if file exists in the file_manager log
+    NVMeFileDesc file_desc;
+    bool file_exists_in_log = file_manager->getFileByFilename(filename, file_desc);
+    
+    void* result_fd = nullptr;
+    
+    if (file_exists_in_log) {
+        geminifs_info("g_open: File '%s' found in log at slot %u\n", 
+                      filename.c_str(), file_desc.slot_index);
+        
+        // Check if the file size needs to be adjusted
+        if (file_desc.size != file_size) {
+            geminifs_info("g_open: Adjusting file size from %zu to %zu bytes\n", 
+                          file_desc.size, file_size);
+            
+            // Update file descriptor with new size
+            file_desc.size = file_size;
+            file_desc.modify_time = FileManager::getCurrentTimestamp();
+            
+            // Update the log record
+            file_manager->deleteFile(filename);  // Remove old record
+            file_manager->createFile(filename, file_desc);  // Create new record with updated size
+        }
+        
+        // Open the existing file
+        if (o_flag & O_HOST) {
+            // Open for host-side operations
+            std::filesystem::path file_path = controller->dev_mount_path;
+            file_path = file_path / filename;
+            
+            // Check if physical file exists, if not recreate it
+            if (!std::filesystem::exists(file_path)) {
+                geminifs_info("g_open: Physical file not found, recreating '%s'\n", file_path.c_str());
+                result_fd = host_file_create_managed(ctrl->block_size, file_size, filename);
+            } else {
+                // Open existing file using managed version
+                result_fd = host_file_open_managed(file_path.string());
+                if (result_fd == nullptr) {
+                    geminifs_error("g_open: Failed to open existing file '%s'\n", file_path.c_str());
+                    return nullptr;
+                }
+            }
+        } else if (o_flag & O_DEVICE) {
+            // Open for device-side operations - create GPU file descriptor
+            // For device operations, we need to create a GPU file pool if not already created
+            geminifs_error("g_open: O_DEVICE flag not yet fully implemented for single file operations\n");
+            return nullptr;
+        }
+    } else {
+        geminifs_info("g_open: File '%s' not found in log, creating new file\n", filename.c_str());
+        
+        // File doesn't exist in log, check if physical file exists
+        std::filesystem::path file_path = controller->dev_mount_path;
+        file_path = file_path / filename;
+        
+        if (std::filesystem::exists(file_path)) {
+            geminifs_info("g_open: Physical file exists but not in log, recreating and adjusting size\n");
+            // Remove existing physical file as required by spec
+            std::filesystem::remove(file_path);
+        }
+        
+        // Create new file
+        if (o_flag & O_HOST) {
+            // Create for host-side operations
+            result_fd = host_file_create_managed(ctrl->block_size, file_size, filename);
+            if (result_fd == nullptr) {
+                geminifs_error("g_open: Failed to create host file '%s'\n", filename.c_str());
+                return nullptr;
+            }
+            
+            // Create file record in log
+            NVMeFileDesc new_desc;
+            if (!file_manager->createFile(filename, new_desc)) {
+                geminifs_error("g_open: Failed to create file record in log for '%s'\n", filename.c_str());
+                // Clean up the created file using managed close function
+                host_file_close_managed((host_fd_t)result_fd);
+                std::filesystem::remove(file_path);
+                return nullptr;
+            }
+            
+            geminifs_info("g_open: Created new file '%s' with log slot %u\n", 
+                          filename.c_str(), new_desc.slot_index);
+        } else if (o_flag & O_DEVICE) {
+            // Create for device-side operations
+            geminifs_error("g_open: O_DEVICE flag not yet fully implemented for single file operations\n");
+            return nullptr;
+        }
+    }
+    
+    geminifs_info("g_open: Successfully opened file '%s', returning fd %p\n", 
+                  filename.c_str(), result_fd);
+    
+    return result_fd;
+}
+
+// Helper function for binary bit counting (needed by NVMeController member functions)
+static int one_nr__of__binary_int(unsigned long long i) {
+    int count = 0;
+    while (i != 0) {
+        if ((i & 1) == 1)
+            count++;
+        i = i >> 1;
+    }
+    return count;
+}
+
+/**
+ * NVMeController member function to create a file with automatic FileManager integration
+ */
+host_fd_t NVMeController::host_file_create_managed(int block_size, size_t file_size, const std::string& filename) {
+    assert(file_size % block_size == 0);
+
+    auto nvpage_size = controller->page_size;
+    assert(block_size % nvpage_size == 0);
+
+    auto hdr_size = ROUND_UP(sizeof(struct geminiFS_hdr) + 
+                                    sizeof(nvme_ofst_t) * (file_size / block_size), block_size);
+
+    // Allocate host memory for the header
+    struct geminiFS_hdr *hdr = (struct geminiFS_hdr *)malloc(hdr_size);
+    if (!hdr) {
+        geminifs_error("host_file_create_managed: Failed to allocate memory for header\n");
+        return nullptr;
+    }
+    
+    std::filesystem::path dev_mount_path(controller->dev_mount_path);
+    std::filesystem::path dir_path = dev_mount_path;
+    std::filesystem::create_directories(dir_path);
+    std::filesystem::path file_path = dir_path / filename;
+    
+    // Create the file structure
+    hdr->magic_num = the_geminiFS_magic.magic_num;
+    hdr->virtual_space_size = ROUND_UP(file_size, block_size);
+    hdr->block_bit = one_nr__of__binary_int(block_size - 1);
+    hdr->nr_l1 = file_size / block_size;
+    hdr->first_block_base = hdr_size;
+    
+    // Create the physical file
+    int fd = open(file_path.c_str(), O_RDWR | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
+    if (fd < 0) {
+        geminifs_error("host_file_create_managed: Failed to create file '%s'\n", file_path.c_str());
+        free(hdr);
+        return nullptr;
+    }
+    
+    // Allocate space for the file
+    if (fallocate(fd, 0, 0, hdr->first_block_base + hdr->virtual_space_size) != 0) {
+        geminifs_error("host_file_create_managed: Failed to allocate space for file '%s'\n", file_path.c_str());
+        close(fd);
+        free(hdr);
+        return nullptr;
+    }
+    
+    // Write the header
+    if (lseek(fd, 0, SEEK_SET) == (off_t)(-1)) {
+        geminifs_error("host_file_create_managed: Failed to seek to beginning of file\n");
+        close(fd);
+        free(hdr);
+        return nullptr;
+    }
+    
+    if (write(fd, hdr, sizeof(*hdr)) != sizeof(*hdr)) {
+        geminifs_error("host_file_create_managed: Failed to write header to file\n");
+        close(fd);
+        free(hdr);
+        return nullptr;
+    }
+    
+    hdr->fd = fd;
+    
+    // Refine NVMe offsets
+    host_refine_nvmeofst(hdr);
+    
+    // Register with FileManager for automatic cleanup
+    if (file_manager != nullptr) {
+        file_manager->registerOpenFile(hdr, filename, hdr_size);
+    }
+    
+    geminifs_debug("host_file_create_managed: Created file '%s' with size %zu, hdr_size %zu\n", 
+                   filename.c_str(), file_size, hdr_size);
+    
+    return hdr;
+}
+
+/**
+ * NVMeController member function to open a file with automatic FileManager integration
+ */
+host_fd_t NVMeController::host_file_open_managed(const std::string& filepath) {
+    host_fd_t result = host_open_geminifs_file(filepath.c_str());
+    
+    if (result != nullptr && file_manager != nullptr) {
+        // Calculate the size of the allocated header for registration
+        size_t hdr_size = ROUND_UP(sizeof(struct geminiFS_hdr) + sizeof(nvme_ofst_t) * result->nr_l1, result->first_block_base);
+        file_manager->registerOpenFile(result, filepath, hdr_size);
+    }
+    
+    return result;
+}
+
+/**
+ * NVMeController member function to close a file with automatic FileManager cleanup
+ */
+void NVMeController::host_file_close_managed(host_fd_t fd) {
+    if (file_manager != nullptr) {
+        file_manager->unregisterOpenFile(fd);
+    }
+    
+    // Close and free the file descriptor
+    close(fd->fd);
+    free(fd);
+}
+
 
 // std::vector<ControllerPtr> geminifs_nvme_host_open_ctrls(struct geminifs_ctrl_params *ctrl_params) {
 //     std::vector<ControllerPtr> ctrls;
@@ -318,35 +551,6 @@ void *geminifs_host_file_create(ControllerPtr &ctrl, int block_size, size_t file
 //  * 
 //  * @return Pointer to the created file structure in host memory and in GPU memory, or nullptr on failure
 //  */
-// __host__
-// void *g_open(ControllerPtr &ctrl, size_t file_size, std::string filename)
-// {
-//     // Check if the file size is a multiple of the ctrl block size
-//     assert(file_size % ctrl->block_size == 0);
-//     // check if the file exists in the controller's log file 
-//     std::filesystem::path file_path = std::filesystem::path(ctrl->dev_mount_path) / filename;
-     
-//     auto exist = check_file_exists(ctrl, filename);
-//     if(exist) {
-//         // if file exists, open it
-//         host_fd_t fd = geminifs_host_file_open(ctrl, ctrl->block_size, file_size, filename);
-//         return fd;
-//     }
-//     else {
-//         host_fd_t fd = geminifs_host_file_create(ctrl, ctrl->block_size, file_size, filename);
-//     }
-//     // if file does not exist, create it
-    
-
-//     // using a Advisory Locks to open the file
-//     struct flock lock_info;
-//     lock_info.l_type = F_WRLCK;    // 排他锁 (Write Lock)
-//     lock_info.l_whence = SEEK_SET; // 从文件开头开始
-//     lock_info.l_start = 0;         // 偏移量为0
-//     lock_info.l_len = 0;           // 长度为0，表示锁定整个文件
-
-//     return fd;
-// }
 
 
 static 

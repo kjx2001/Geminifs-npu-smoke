@@ -10,6 +10,10 @@
 #include <string>
 #include <vector>
 
+// GeminiFS specific file open flags
+#define O_HOST      0x10000000  // Open for host-side operations
+#define O_DEVICE    0x20000000  // Open for device-side operations
+
 typedef uint64_t vaddr_t;
 typedef uint64_t rawfile_ofst_t;
 typedef uint64_t nvme_ofst_t;

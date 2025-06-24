@@ -33,6 +33,13 @@ public:
     // Destructor
     ~NVMeController();
 
+    void* g_open(std::string filename, size_t file_size, uint32_t o_flag);
+
+    // Managed file operations - automatically handle file descriptor tracking
+    host_fd_t host_file_create_managed(int block_size, size_t file_size, const std::string& filename);
+    host_fd_t host_file_open_managed(const std::string& filepath);
+    void host_file_close_managed(host_fd_t fd);
+
 private:
     // Private helper methods
     bool check_sys_config_exists();

@@ -123,16 +123,29 @@ host_fd_t host_create_geminifs_file(void *buf,
 }
 
 host_fd_t host_open_geminifs_file(const char *filename) {
-	struct geminiFS_hdr *hdr = (struct geminiFS_hdr *)malloc(sizeof(struct geminiFS_hdr));
 	fd_t fd = open(filename, O_RDWR);
 	my_assert(0 <= fd);
 
+	// First, read just the header part to get the file size information
+	struct geminiFS_hdr temp_hdr;
 	my_assert((off_t)(-1) != lseek(fd, 0, SEEK_SET));
-	my_assert(sizeof(*hdr) == read(fd, hdr, sizeof(*hdr)));
+	my_assert(sizeof(temp_hdr) == read(fd, &temp_hdr, sizeof(temp_hdr)));
+
+	// Validate magic number
+	my_assert(temp_hdr.magic_num == the_geminiFS_magic.magic_num);
+
+	// Calculate the actual size needed including the l1 array
+	size_t hdr_size = ROUND_UP(sizeof(struct geminiFS_hdr) + sizeof(nvme_ofst_t) * temp_hdr.nr_l1, temp_hdr.first_block_base);
+	
+	// Allocate the correct amount of memory
+	struct geminiFS_hdr *hdr = (struct geminiFS_hdr *)malloc(hdr_size);
+	my_assert(hdr != NULL);
+
+	// Read the complete header including l1 array
+	my_assert((off_t)(-1) != lseek(fd, 0, SEEK_SET));
+	my_assert(temp_hdr.first_block_base == read(fd, hdr, temp_hdr.first_block_base));
 
 	hdr->fd = fd;
-
-	my_assert(hdr->magic_num == the_geminiFS_magic.magic_num);
 
 	return hdr;
 }
