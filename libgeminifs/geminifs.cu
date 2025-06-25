@@ -179,7 +179,7 @@ void * NVMeController::g_open(std::string filename, size_t file_size, uint32_t o
             
             // Create file record in log
             NVMeFileDesc new_desc;
-            if (!file_manager->createFile(filename, new_desc)) {
+            if (!file_manager->createFile(filename, new_desc, file_size)) {
                 geminifs_error("g_open: Failed to create file record in log for '%s'\n", filename.c_str());
                 // Clean up the created file using managed close function
                 host_file_close_managed((host_fd_t)result_fd);

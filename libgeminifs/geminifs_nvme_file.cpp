@@ -194,7 +194,7 @@ FileManager::FileManager(const std::string& log_path, size_t persistence_thresho
                 need_initialize = true;
             } else {
                 // Validate expected file size based on header
-                long expected_size = sizeof(LogHeader) + (MAX_RECORDS * sizeof(NVMeFileDesc));
+                long expected_size = sizeof(LogHeader) + BITMAP_SIZE_BYTES + (MAX_RECORDS * sizeof(NVMeFileDesc));
                 if (file_size != expected_size) {
                     std::cout << "File size mismatch. Expected: " << expected_size 
                              << " bytes, got: " << file_size << " bytes. Reinitializing..." << std::endl;
@@ -252,7 +252,7 @@ void FileManager::initializeLogFile() {
     header_.record_size = sizeof(NVMeFileDesc); // This will be 64
     header_.total_record_capacity = MAX_RECORDS;
     header_.active_record_count = 0;
-    header_.log_file_size = header_.records_offset;
+    header_.log_file_size = header_.records_offset + (MAX_RECORDS * sizeof(NVMeFileDesc));
 
     // Write header
     if (fwrite(&header_, sizeof(LogHeader), 1, file) != 1) {
@@ -265,6 +265,13 @@ void FileManager::initializeLogFile() {
     if (fwrite(empty_bitmap.data(), BITMAP_SIZE_BYTES, 1, file) != 1) {
         fclose(file);
         throw std::runtime_error("FATAL: Failed to write bitmap during initialization.");
+    }
+
+    // Write empty records space (all MAX_RECORDS)
+    std::vector<char> empty_records(MAX_RECORDS * sizeof(NVMeFileDesc), 0);
+    if (fwrite(empty_records.data(), MAX_RECORDS * sizeof(NVMeFileDesc), 1, file) != 1) {
+        fclose(file);
+        throw std::runtime_error("FATAL: Failed to write records space during initialization.");
     }
 
     fclose(file);
@@ -382,7 +389,7 @@ bool FileManager::writeRecordToSlot(const NVMeFileDesc& desc, uint64_t slot_inde
     return fwrite(&desc, sizeof(NVMeFileDesc), 1, log_file_handle_) == 1;
 }
 
-bool FileManager::createFile(const std::string& filename, NVMeFileDesc& out_desc) {
+bool FileManager::createFile(const std::string& filename, NVMeFileDesc& out_desc, size_t file_size) {
     if (filename.length() >= 16) return false;
 
     std::lock_guard<std::mutex> lock(mtx_);
@@ -402,7 +409,7 @@ bool FileManager::createFile(const std::string& filename, NVMeFileDesc& out_desc
     new_desc.slot_index = slot;
     new_desc.create_time = now;
     new_desc.modify_time = now;
-    new_desc.size = 0;
+    new_desc.size = file_size;
 
     if (!writeRecordToSlot(new_desc, slot)) {
         std::cerr << "Error: Failed to write new record to log file." << std::endl;

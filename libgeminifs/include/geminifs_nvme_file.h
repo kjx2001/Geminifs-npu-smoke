@@ -67,7 +67,7 @@ public:
     FileManager(FileManager&&) = delete;
     FileManager& operator=(FileManager&&) = delete;
 
-    bool createFile(const std::string& filename, NVMeFileDesc& out_desc);
+    bool createFile(const std::string& filename, NVMeFileDesc& out_desc, size_t file_size = 0);
     bool deleteFile(const std::string& filename);
     bool getFileByFilename(const std::string& filename, NVMeFileDesc& out_desc) const;
     std::vector<std::string> getAllFilenames() const;
