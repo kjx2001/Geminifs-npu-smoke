@@ -212,3 +212,110 @@ void printSystemOverview(const system_overview& sys) {
         std::cout << pci_bdf_to_string(bdf) << std::endl;
     }
 }
+
+// 动态调整文件描述符限制
+bool increase_fd_limit(rlim_t desired_limit) {
+    struct rlimit rlim;
+    
+    // 获取当前限制
+    if (getrlimit(RLIMIT_NOFILE, &rlim) != 0) {
+        std::cerr << "Failed to get current rlimit: " << strerror(errno) << std::endl;
+        return false;
+    }
+    
+    std::cout << "Current limits: soft=" << rlim.rlim_cur 
+              << ", hard=" << rlim.rlim_max << std::endl;
+    
+    // 如果当前软限制已经满足需求，直接返回成功
+    if (rlim.rlim_cur >= desired_limit) {
+        std::cout << "Current soft limit (" << rlim.rlim_cur 
+                  << ") already meets or exceeds desired limit (" << desired_limit << ")" << std::endl;
+        return true;
+    }
+    
+    // 首先尝试将软限制提高到硬限制
+    if (rlim.rlim_cur < rlim.rlim_max) {
+        rlim_t new_soft = std::min(desired_limit, rlim.rlim_max);
+        rlim.rlim_cur = new_soft;
+        
+        std::cout << "Attempting to increase soft limit to " << new_soft << "..." << std::endl;
+        
+        if (setrlimit(RLIMIT_NOFILE, &rlim) == 0) {
+            std::cout << "Successfully increased soft limit to " << new_soft << std::endl;
+            if (new_soft >= desired_limit) {
+                return true;
+            }
+        } else {
+            std::cerr << "Failed to increase soft limit: " << strerror(errno) << std::endl;
+        }
+    }
+    
+    // 如果仍然不够，尝试同时提高硬限制（需要特权）
+    if (rlim.rlim_max < desired_limit) {
+        std::cout << "Attempting to increase hard limit to " << desired_limit << "..." << std::endl;
+        
+        rlim.rlim_cur = desired_limit;
+        rlim.rlim_max = desired_limit;
+        
+        if (setrlimit(RLIMIT_NOFILE, &rlim) == 0) {
+            std::cout << "Successfully increased both soft and hard limits to " << desired_limit << std::endl;
+            return true;
+        } else {
+            std::cerr << "Failed to increase hard limit (may need root privileges): " << strerror(errno) << std::endl;
+            
+            // 回退到只设置软限制到硬限制
+            if (getrlimit(RLIMIT_NOFILE, &rlim) == 0) {
+                rlim.rlim_cur = rlim.rlim_max;
+                if (setrlimit(RLIMIT_NOFILE, &rlim) == 0) {
+                    std::cout << "Fallback: Set soft limit to hard limit (" << rlim.rlim_max << ")" << std::endl;
+                    return rlim.rlim_max >= desired_limit;
+                }
+            }
+        }
+    }
+    
+    return false;
+}
+
+// 显示当前文件描述符限制
+void show_fd_limits() {
+    struct rlimit rlim;
+    if (getrlimit(RLIMIT_NOFILE, &rlim) == 0) {
+        std::cout << "File descriptor limits: soft=" << rlim.rlim_cur 
+                  << ", hard=" << rlim.rlim_max << std::endl;
+    }
+}
+
+// 自动配置文件描述符限制
+void auto_configure_fd_limits(int num_files_to_open) {
+    std::cout << "\n=== Configuring File Descriptor Limits ===" << std::endl;
+    
+    // 显示当前限制
+    show_fd_limits();
+    
+    // 根据要打开的文件数量计算需要的限制
+    // num_files_to_open + 一些余量用于系统文件描述符 (stdin, stdout, stderr, 日志文件等)
+    rlim_t required_limit = static_cast<rlim_t>(num_files_to_open) + 100;
+    
+    std::cout << "Planning to open " << num_files_to_open << " files" << std::endl;
+    std::cout << "Required limit for operation: " << required_limit << " file descriptors" << std::endl;
+    
+    // 尝试设置更高的限制 (推荐值)
+    rlim_t recommended_limit = std::max(required_limit, (rlim_t)65536);
+    
+    std::cout << "Attempting to set recommended limit: " << recommended_limit << std::endl;
+    
+    if (increase_fd_limit(recommended_limit)) {
+        std::cout << "✓ File descriptor limit configured successfully!" << std::endl;
+    } else {
+        std::cout << "⚠ Warning: Could not achieve recommended limit." << std::endl;
+        std::cout << "   Operation may fail if trying to open too many files simultaneously." << std::endl;
+        std::cout << "   Consider running with elevated privileges or adjusting system limits." << std::endl;
+        std::cout << "   Quick fix: sudo ulimit -n 65536 && your_program" << std::endl;
+    }
+    
+    // 显示最终限制
+    std::cout << "Final limits:" << std::endl;
+    show_fd_limits();
+    std::cout << std::endl;
+}

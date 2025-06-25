@@ -140,6 +140,7 @@ int main() {
 #include <algorithm>  // For std::find_if
 #include <unistd.h>   // For close()
 
+
 FileManager::FileManager(const std::string& log_path, size_t persistence_threshold)
     : log_file_path_(log_path),
       dirty_bitmap_(MAX_RECORDS, false),
@@ -152,7 +153,7 @@ FileManager::FileManager(const std::string& log_path, size_t persistence_thresho
     FILE* file = fopen(log_file_path_.c_str(), "rb");
     if (file == nullptr) {
         // File doesn't exist
-        std::cout << "Log file does not exist. Creating new file..." << std::endl;
+        nvme_layer_debug("Log file does not exist. Creating new file...\n");
         need_initialize = true;
     } else {
         // File exists, check if it's valid
@@ -164,17 +165,17 @@ FileManager::FileManager(const std::string& log_path, size_t persistence_thresho
         
         if (file_size == 0) {
             // File is empty
-            std::cout << "Log file is empty. Reinitializing..." << std::endl;
+            nvme_layer_debug("Log file is empty. Reinitializing...\n");
             need_initialize = true;
         } else if (file_size < static_cast<long>(sizeof(LogHeader))) {
             // File too small to contain a valid header
-            std::cout << "Log file is too small to contain valid header. Reinitializing..." << std::endl;
+            nvme_layer_debug("Log file is too small to contain valid header. Reinitializing...\n");
             need_initialize = true;
         } else {
             // Try to read and validate header
             LogHeader temp_header;
             if (fread(&temp_header, sizeof(LogHeader), 1, file) != 1) {
-                std::cout << "Cannot read header from log file. Reinitializing..." << std::endl;
+                nvme_layer_debug("Cannot read header from log file. Reinitializing...\n");
                 need_initialize = true;
             } else if (temp_header.magic_num != MAGIC_NUMBER) {
                 std::cout << "Invalid magic number in log file. Expected: 0x" << std::hex << MAGIC_NUMBER 
@@ -480,7 +481,7 @@ std::vector<std::string> FileManager::getAllFilenames() const {
 void FileManager::registerOpenFile(host_fd_t fd, const std::string& filename, size_t hdr_size) {
     std::lock_guard<std::mutex> lock(open_files_mtx_);
     open_files_.emplace_back(fd, filename, hdr_size);
-    std::cout << "Registered open file: " << filename << " (fd: " << fd << ", size: " << hdr_size << ")" << std::endl;
+    // std::cout << "Registered open file: " << filename << " (fd: " << fd << ", size: " << hdr_size << ")" << std::endl;
 }
 
 bool FileManager::unregisterOpenFile(host_fd_t fd) {
@@ -489,7 +490,7 @@ bool FileManager::unregisterOpenFile(host_fd_t fd) {
                           [fd](const OpenFileHandle& handle) { return handle.fd == fd; });
     
     if (it != open_files_.end()) {
-        std::cout << "Unregistered open file: " << it->filename << " (fd: " << fd << ")" << std::endl;
+        // std::cout << "Unregistered open file: " << it->filename << " (fd: " << fd << ")" << std::endl;
         open_files_.erase(it);
         return true;
     }
@@ -500,7 +501,7 @@ void FileManager::closeAllOpenFiles() {
     std::lock_guard<std::mutex> lock(open_files_mtx_);
     
     for (const auto& handle : open_files_) {
-        std::cout << "Auto-closing file: " << handle.filename << " (fd: " << handle.fd << ")" << std::endl;
+        // std::cout << "Auto-closing file: " << handle.filename << " (fd: " << handle.fd << ")" << std::endl;
         
         // Close the file descriptor first
         if (handle.fd->fd > 0) {

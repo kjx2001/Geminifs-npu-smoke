@@ -3,6 +3,7 @@
 
 #include <vector>
 #include <string>
+#include <sys/resource.h>
 #include "geminifs.h"
 
 
@@ -52,4 +53,9 @@ std::vector<std::string> split(const std::string& s, char delimiter);
 system_overview parseSystemOverview(const std::string& filepath);
 void printSystemOverview(const system_overview& sys);
 int calculate_pci_distance(const PCI_BDF& bdf1, const PCI_BDF& bdf2);
+
+// File descriptor limit management functions
+bool increase_fd_limit(rlim_t desired_limit);
+void auto_configure_fd_limits(int num_files_to_open = 1000);
+
 #endif

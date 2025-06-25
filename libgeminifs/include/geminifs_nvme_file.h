@@ -10,6 +10,7 @@
 #include <memory>
 #include <cstdio> // For FILE*
 
+
 constexpr size_t BITMAP_SIZE_BYTES = 128 * 1024; // 128 KB
 constexpr size_t BITS_PER_BYTE = 8;
 constexpr size_t MAX_RECORDS = BITMAP_SIZE_BYTES * BITS_PER_BYTE; // 1,048,576 records
@@ -107,5 +108,13 @@ private:
     size_t persistence_threshold_;
     size_t pending_writes_count_;
 };
+
+#ifdef NVME_LAYER_DEBUG
+#define nvme_layer_debug(fmt, ...) \
+    printf("[DEBUG][%s:%d]: " fmt "", __func__, __LINE__, ##__VA_ARGS__);
+#else
+#define nvme_layer_debug(fmt, ...) \
+
+#endif
 
 #endif 

@@ -15,6 +15,8 @@
 #include <string>
 #include <sys/types.h> 
 #include <sys/stat.h>
+#include <sys/resource.h>
+#include <dirent.h>
 #include <time.h>
 #include <unistd.h>
 #include <ctrl.h>
@@ -109,7 +111,7 @@ void * NVMeController::g_open(std::string filename, size_t file_size, uint32_t o
         o_flag |= O_HOST;
     }
     
-    geminifs_info("g_open: Opening file '%s' with size %zu bytes, flags 0x%x\n", 
+    geminifs_debug("g_open: Opening file '%s' with size %zu bytes, flags 0x%x\n", 
                   filename.c_str(), file_size, o_flag);
     
     // Check if file exists in the file_manager log
@@ -119,7 +121,7 @@ void * NVMeController::g_open(std::string filename, size_t file_size, uint32_t o
     void* result_fd = nullptr;
     
     if (file_exists_in_log) {
-        geminifs_info("g_open: File '%s' found in log at slot %u\n", 
+        geminifs_debug("g_open: File '%s' found in log at slot %u\n", 
                       filename.c_str(), file_desc.slot_index);
         
         // Check if the file size matches the requested size
@@ -156,14 +158,14 @@ void * NVMeController::g_open(std::string filename, size_t file_size, uint32_t o
             return nullptr;
         }
     } else {
-        geminifs_info("g_open: File '%s' not found in log, creating new file\n", filename.c_str());
+        geminifs_debug("g_open: File '%s' not found in log, creating new file\n", filename.c_str());
         
         // File doesn't exist in log, check if physical file exists
         std::filesystem::path file_path = controller->dev_mount_path;
         file_path = file_path / filename;
         
         if (std::filesystem::exists(file_path)) {
-            geminifs_info("g_open: Physical file exists but not in log, recreating and adjusting size\n");
+            geminifs_debug("g_open: Physical file exists but not in log, recreating and adjusting size\n");
             // Remove existing physical file as required by spec
             std::filesystem::remove(file_path);
         }
@@ -187,7 +189,7 @@ void * NVMeController::g_open(std::string filename, size_t file_size, uint32_t o
                 return nullptr;
             }
             
-            geminifs_info("g_open: Created new file '%s' with log slot %u\n", 
+            geminifs_debug("g_open: Created new file '%s' with log slot %u\n", 
                           filename.c_str(), new_desc.slot_index);
         } else if (o_flag & O_DEVICE) {
             // Create for device-side operations
@@ -196,7 +198,7 @@ void * NVMeController::g_open(std::string filename, size_t file_size, uint32_t o
         }
     }
     
-    geminifs_info("g_open: Successfully opened file '%s', returning fd %p\n", 
+    geminifs_debug("g_open: Successfully opened file '%s', returning fd %p\n", 
                   filename.c_str(), result_fd);
     
     return result_fd;
@@ -253,7 +255,55 @@ host_fd_t NVMeController::host_file_create_managed(int block_size, size_t file_s
     // Create the physical file
     int fd = open(file_path.c_str(), O_RDWR | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
     if (fd < 0) {
+        int error_code = errno;
+        const char* error_msg = strerror(error_code);
+        
+        // Provide detailed error information
         geminifs_error("host_file_create_managed: Failed to create file '%s'\n", file_path.c_str());
+        geminifs_error("  Error code: %d (%s)\n", error_code, error_msg);
+        
+        // Check for common file descriptor limit issues
+        if (error_code == EMFILE) {
+            geminifs_error("  EMFILE: Too many open files by this process. Current process has reached its file descriptor limit.\n");
+            geminifs_error("  Solution: Increase per-process file descriptor limit with 'ulimit -n <number>' or close unused files.\n");
+        } else if (error_code == ENFILE) {
+            geminifs_error("  ENFILE: Too many open files in system. System-wide file descriptor limit reached.\n");
+            geminifs_error("  Solution: Increase system-wide limits in /proc/sys/fs/file-max\n");
+        } else if (error_code == ENOSPC) {
+            geminifs_error("  ENOSPC: No space left on device.\n");
+        } else if (error_code == EACCES) {
+            geminifs_error("  EACCES: Permission denied.\n");
+        } else if (error_code == ENAMETOOLONG) {
+            geminifs_error("  ENAMETOOLONG: File name too long.\n");
+        } else if (error_code == ENOENT) {
+            geminifs_error("  ENOENT: Directory does not exist.\n");
+        }
+        
+        // Show current file descriptor usage information
+        char proc_fd_path[256];
+        snprintf(proc_fd_path, sizeof(proc_fd_path), "/proc/%d/fd", getpid());
+        
+        // Count current open file descriptors
+        int fd_count = 0;
+        DIR* fd_dir = opendir(proc_fd_path);
+        if (fd_dir) {
+            struct dirent* entry;
+            while ((entry = readdir(fd_dir)) != NULL) {
+                if (entry->d_name[0] >= '0' && entry->d_name[0] <= '9') {
+                    fd_count++;
+                }
+            }
+            closedir(fd_dir);
+            geminifs_error("  Current process has %d open file descriptors\n", fd_count);
+        }
+        
+        // Show current limits
+        struct rlimit rlim;
+        if (getrlimit(RLIMIT_NOFILE, &rlim) == 0) {
+            geminifs_error("  Current file descriptor limits: soft=%ld, hard=%ld\n", 
+                          (long)rlim.rlim_cur, (long)rlim.rlim_max);
+        }
+        
         free(hdr);
         return nullptr;
     }
@@ -487,7 +537,7 @@ static inline void *host_batch_create(std::vector<ControllerPtr> &ctrls, GPUPool
 
         for (uint32_t file_idx = 0; file_idx < nr_files; file_idx++) {
             std::filesystem::path file_path = dir_path / std::to_string(file_idx);
-            // geminifs_info("create file %s\n", file_path.c_str());
+            // geminifs_debug("create file %s\n", file_path.c_str());
             auto hdr = (struct geminiFS_hdr *)(
                                 (uintptr_t)host_fds_base + (file_idx * nr_device + idx) * hdr_size);
             host_create_geminifs_file(hdr, std::string(file_path).c_str(), block_size, file_size);
@@ -549,7 +599,7 @@ void *geminifs_host_file_create(ControllerPtr &ctrl, int block_size, size_t file
     std::filesystem::path dir_path = dev_mount_path;
     std::filesystem::create_directories(dir_path);
     std::filesystem::path file_path = dir_path / filename;
-    // geminifs_info("create file %s\n", file_path.c_str());
+    // geminifs_debug("create file %s\n", file_path.c_str());
     auto hdr = (struct geminiFS_hdr *)((uintptr_t)host_fd_base);
     host_create_geminifs_file(hdr, std::string(file_path).c_str(), block_size, file_size);
     geminifs_debug("hdr info: block_size %d, file_size %lu, first_block_base %ld, file_path %s\n", 
@@ -773,7 +823,7 @@ geminifs_batch_create(std::vector<ControllerPtr> &ctrls, GPUPoolId pool_id, int 
             gpu_file->prp_list_ioaddr_base = dma_info->ioaddr_base + 
                                                 (idx % dma__per_nvfile) * (nv_file_size / nvme_page_size) * sizeof(uint64_t);
             gpu_file->file_id = idx;
-            // geminifs_info("allocate %d gpu_file, file_id is: %lld\n", idx, gpu_file->file_id);
+            // geminifs_debug("allocate %d gpu_file, file_id is: %lld\n", idx, gpu_file->file_id);
         }
     });
 
@@ -820,7 +870,7 @@ geminifs_file_batch_create(std::vector<ControllerPtr> &ctrls, GPUPoolId pool_id,
             gpu_file->prp_list_ioaddr_base = dma_info->ioaddr_base + 
                                                 (idx % dma__per_nvfile) * (nv_file_size / nvme_page_size) * sizeof(uint64_t);
             gpu_file->file_id = idx;
-            // geminifs_info("allocate %d gpu_file, file_id is: %lld\n", idx, gpu_file->file_id);
+            // geminifs_debug("allocate %d gpu_file, file_id is: %lld\n", idx, gpu_file->file_id);
         }
     });
 
@@ -870,7 +920,7 @@ geminifs_file_create(std::vector<ControllerPtr> &ctrls, GPUPoolId pool_id, int n
             gpu_file->prp_list_ioaddr_base = dma_info->ioaddr_base + 
                                                 (idx % dma__per_nvfile) * (nv_file_size / nvme_page_size) * sizeof(uint64_t);
             gpu_file->file_id = idx;
-            // geminifs_info("allocate %d gpu_file, file_id is: %lld\n", idx, gpu_file->file_id);
+            // geminifs_debug("allocate %d gpu_file, file_id is: %lld\n", idx, gpu_file->file_id);
         }
     });
 
@@ -976,7 +1026,7 @@ static inline geminifs_metadata* __geminifs_init(struct geminifs_ctrl_params &ct
         // cuda_check_error(cudaSetDevice(ctrl_params.cudaDevice));
     }
 
-    geminifs_info("geminifs_init_fds_wrapper_cuda: current device %d, ctrl_params.cudaDevice %d\n", 
+    geminifs_debug("geminifs_init_fds_wrapper_cuda: current device %d, ctrl_params.cudaDevice %d\n", 
                         current_device, ctrl_params.cudaDevice);
     file_size = ROUND_UP(file_size, file_block_size);
     GPUPoolId this_pool_id = (GPUPoolId)time(NULL); //unique pool id
@@ -1029,7 +1079,7 @@ __geminifs_device_batch_xfer(GPUFilePool *global_pool,
     size_t nbytes__per_thread = std::max(nbytes / 32, GPU_PAGE_SIZE);
 
     int lane = my_lane_id();
-    geminifs_info("file_ids[blockIdx.x] %ld\n", file_ids[blockIdx.x]);
+    geminifs_debug("file_ids[blockIdx.x] %ld\n", file_ids[blockIdx.x]);
     auto file = global_pool->get_file(file_ids[blockIdx.x]);
     if (lane == 0) {
         file->scatter_ioaddrs(ioaddr, file_offset, nbytes);
@@ -1177,9 +1227,9 @@ __geminifs_device_batch_xfer(GPUFilePool *global_pool,
         return;
     }
     if (type == FILE_XFER_READ) {
-        // geminifs_info("read_in, file[%p]:this_thread_file_offset %ld, nbytes__per_thread %ld\n", file, this_thread_file_offset, nbytes__per_thread);
+        // geminifs_debug("read_in, file[%p]:this_thread_file_offset %ld, nbytes__per_thread %ld\n", file, this_thread_file_offset, nbytes__per_thread);
         file->read_in(this_thread_file_offset, nbytes__per_thread);
-        // geminifs_info("read_in done\n");
+        // geminifs_debug("read_in done\n");
     } else {
         file->write_out(this_thread_file_offset, nbytes__per_thread);
     }
@@ -1536,25 +1586,25 @@ static inline bool geminifs_device_xfer_wrapper_cuda(
     // const at::cuda::OptionalCUDAGuard device_guard(device_of(value_cache));
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    // geminifs_info("tensor info: key_cache.data_ptr() %p, value_cache.data_ptr() %p, block_nbytes %ld, key_file_offset %ld, value_file_offset %ld\n", 
+    // geminifs_debug("tensor info: key_cache.data_ptr() %p, value_cache.data_ptr() %p, block_nbytes %ld, key_file_offset %ld, value_file_offset %ld\n", 
     //                 key_cache.data_ptr(), value_cache.data_ptr(), block_nbytes, key_file_offset, value_file_offset);
 
     cuda::std::span<GPUFileId> file_ids = {(GPUFileId *)cached_file_ids.data_ptr(), (size_t)cached_file_ids.numel()};
     cuda::std::span<uint64_t> block_ids = {(uint64_t *)inner_block_ids.data_ptr(), (size_t)inner_block_ids.numel()};
     if (key_dma_ctx->dma_ptr->contiguous) {
-        // geminifs_info("key dma is contiguous, ready to transfer key\n");
+        // geminifs_debug("key dma is contiguous, ready to transfer key\n");
         __geminifs_device_batch_xfer<<<grid, block, 0, stream>>>
                         (pool, file_ids, block_ids, key_dma_ctx->dma_ptr->ioaddrs[0], 
                             block_nbytes, key_file_offset, type);
-        // geminifs_info("key transfer done\n");
+        // geminifs_debug("key transfer done\n");
     }
 
     if (value_dma_ctx->dma_ptr->contiguous) {
-        // geminifs_info("value dma is contiguous, ready to transfer value\n");
+        // geminifs_debug("value dma is contiguous, ready to transfer value\n");
         __geminifs_device_batch_xfer<<<grid, block, 0, stream>>>
                         (pool, file_ids, block_ids, value_dma_ctx->dma_ptr->ioaddrs[0], 
                             block_nbytes, value_file_offset, type);
-        // geminifs_info("value transfer done\n");
+        // geminifs_debug("value transfer done\n");
     }
 
     if (!key_dma_ctx->dma_ptr->contiguous) { // assert that ioaddrs is not null
@@ -1571,7 +1621,7 @@ static inline bool geminifs_device_xfer_wrapper_cuda(
                         block_nbytes, value_file_offset, type);
     }
     cudaDeviceSynchronize();
-    // geminifs_info("xfer done\n");
+    // geminifs_debug("xfer done\n");
     return true;
 }
 
@@ -1634,7 +1684,7 @@ bool geminifs_init_fds_wrapper_cuda(const torch::Tensor& file_meta,
     uint64_t file_size = file_meta_ptr[1];
     int64_t device_id = file_meta.device().index();
 
-    geminifs_info("geminifs_init_fds_wrapper_cuda: nr_files %ld, file_size %ld, device_id %ld\n", 
+    geminifs_debug("geminifs_init_fds_wrapper_cuda: nr_files %ld, file_size %ld, device_id %ld\n", 
                     nr_files, file_size, device_id);
 
     assert(nr_files > 0 && file_size > 0 && device_id >= 0);
