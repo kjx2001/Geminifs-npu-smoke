@@ -58,7 +58,20 @@ int main(int argc, char** argv) {
             // }
         }
 
+       if (nvme_controller->is_initialized()) {
+            std::cout << "✓ NVMeController is properly initialized" << std::endl;
+        } else {
+            std::cerr << "✗ NVMeController failed to initialize" << std::endl;
+            return 1;
+        }
+        
         // NVMeController will be automatically cleaned up when going out of scope
+        void* file_handle = nvme_controller->g_open("test_file", 16384, O_HOST);
+        if (file_handle == nullptr) {
+            std::cout << "g_open returned nullptr (expected if no actual device)" << std::endl;
+        } else {
+            std::cout << "✓ g_open succeeded" << std::endl;
+        }
         
         // Wait for user to type "end" to terminate the program
         std::cout << "\nProgram is running. Type 'end' to terminate and release resources:" << std::endl;
@@ -74,12 +87,13 @@ int main(int argc, char** argv) {
                 std::cout << "Invalid input. Please type 'end' to terminate the program." << std::endl;
             }
         }
-
+        nvme_controller.reset(); // Explicitly reset the controller to release resources
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;
         return 1;
     }
 
+    
     std::cout << "Program terminated successfully." << std::endl;
     return 0;
 }
