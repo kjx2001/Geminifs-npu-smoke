@@ -75,6 +75,9 @@ NVMeController::NVMeController(const nvme_ctrl_param& params) : is_initialized_(
 }
 
 NVMeController::~NVMeController() {
+    // Clean up device files first
+    cleanup_device_files();
+    
     if (file_manager) {
         // File manager will automatically clean up resources
         file_manager.reset();
@@ -152,10 +155,12 @@ void * NVMeController::g_open(std::string filename, size_t file_size, uint32_t o
                 }
             }
         } else if (o_flag & O_DEVICE) {
-            // Open for device-side operations - create GPU file descriptor
-            // For device operations, we need to create a GPU file pool if not already created
-            geminifs_error("g_open: O_DEVICE flag not yet fully implemented for single file operations\n");
-            return nullptr;
+            // Open for device-side operations - open existing file and copy to GPU
+            result_fd = device_file_open_managed(filename, file_size);
+            if (result_fd == nullptr) {
+                geminifs_error("g_open: Failed to open device file '%s'\n", filename.c_str());
+                return nullptr;
+            }
         }
     } else {
         geminifs_debug("g_open: File '%s' not found in log, creating new file\n", filename.c_str());
@@ -193,8 +198,24 @@ void * NVMeController::g_open(std::string filename, size_t file_size, uint32_t o
                           filename.c_str(), new_desc.slot_index);
         } else if (o_flag & O_DEVICE) {
             // Create for device-side operations
-            geminifs_error("g_open: O_DEVICE flag not yet fully implemented for single file operations\n");
-            return nullptr;
+            result_fd = device_file_create_managed(controller->page_size, file_size, filename);
+            if (result_fd == nullptr) {
+                geminifs_error("g_open: Failed to create device file '%s'\n", filename.c_str());
+                return nullptr;
+            }
+            
+            // Create file record in log
+            NVMeFileDesc new_desc;
+            if (!file_manager->createFile(filename, new_desc, file_size)) {
+                geminifs_error("g_open: Failed to create file record in log for '%s'\n", filename.c_str());
+                // Clean up the created device file
+                device_file_close_managed((dev_fd_t)result_fd);
+                std::filesystem::remove(file_path);
+                return nullptr;
+            }
+            
+            geminifs_debug("g_open: Created new device file '%s' with log slot %u\n", 
+                          filename.c_str(), new_desc.slot_index);
         }
     }
     
@@ -255,56 +276,8 @@ host_fd_t NVMeController::host_file_create_managed(int block_size, size_t file_s
     // Create the physical file
     int fd = open(file_path.c_str(), O_RDWR | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
     if (fd < 0) {
-        int error_code = errno;
-        const char* error_msg = strerror(error_code);
-        
         // Provide detailed error information
         geminifs_error("host_file_create_managed: Failed to create file '%s'\n", file_path.c_str());
-        geminifs_error("  Error code: %d (%s)\n", error_code, error_msg);
-        
-        // Check for common file descriptor limit issues
-        if (error_code == EMFILE) {
-            geminifs_error("  EMFILE: Too many open files by this process. Current process has reached its file descriptor limit.\n");
-            geminifs_error("  Solution: Increase per-process file descriptor limit with 'ulimit -n <number>' or close unused files.\n");
-        } else if (error_code == ENFILE) {
-            geminifs_error("  ENFILE: Too many open files in system. System-wide file descriptor limit reached.\n");
-            geminifs_error("  Solution: Increase system-wide limits in /proc/sys/fs/file-max\n");
-        } else if (error_code == ENOSPC) {
-            geminifs_error("  ENOSPC: No space left on device.\n");
-        } else if (error_code == EACCES) {
-            geminifs_error("  EACCES: Permission denied.\n");
-        } else if (error_code == ENAMETOOLONG) {
-            geminifs_error("  ENAMETOOLONG: File name too long.\n");
-        } else if (error_code == ENOENT) {
-            geminifs_error("  ENOENT: Directory does not exist.\n");
-        }
-        
-        // Show current file descriptor usage information
-        char proc_fd_path[256];
-        snprintf(proc_fd_path, sizeof(proc_fd_path), "/proc/%d/fd", getpid());
-        
-        // Count current open file descriptors
-        int fd_count = 0;
-        DIR* fd_dir = opendir(proc_fd_path);
-        if (fd_dir) {
-            struct dirent* entry;
-            while ((entry = readdir(fd_dir)) != NULL) {
-                if (entry->d_name[0] >= '0' && entry->d_name[0] <= '9') {
-                    fd_count++;
-                }
-            }
-            closedir(fd_dir);
-            geminifs_error("  Current process has %d open file descriptors\n", fd_count);
-        }
-        
-        // Show current limits
-        struct rlimit rlim;
-        if (getrlimit(RLIMIT_NOFILE, &rlim) == 0) {
-            geminifs_error("  Current file descriptor limits: soft=%ld, hard=%ld\n", 
-                          (long)rlim.rlim_cur, (long)rlim.rlim_max);
-        }
-        
-        free(hdr);
         return nullptr;
     }
     
@@ -406,56 +379,208 @@ void NVMeController::host_file_close_managed(host_fd_t fd) {
     free(fd);
 }
 
-
-// std::vector<ControllerPtr> geminifs_nvme_host_open_ctrls(struct geminifs_ctrl_params *ctrl_params) {
-//     std::vector<ControllerPtr> ctrls;
+/**
+ * NVMeController member function to create a device file with host-to-device mapping
+ */
+dev_fd_t NVMeController::device_file_create_managed(int block_size, size_t file_size, const std::string& filename) {
+    // Check if controller is properly initialized
+    if (!is_initialized()) {
+        geminifs_error("device file create managed: NVMeController is not properly initialized\n");
+        return nullptr;
+    }
     
-//     // Check if SNVM control device exists
-//     if (!check_snvme_control_exists()) {
-//         geminifs_error("Failed to initialize controllers: SNVM kernel module not loaded\n");
-//         return ctrls;  // Return empty vector to indicate error
-//     }
-
-//     // Check if Sys config file exists  
-//     if (!check_sys_config_exists()) {
-//         geminifs_error("Failed to initialize controllers: SNVM kernel module not loaded\n");
-//         return ctrls;  // Return empty vector to indicate error
-//     }
+    // First create the host file
+    host_fd_t host_fd = host_file_create_managed(block_size, file_size, filename);
+    if (host_fd == nullptr) {
+        geminifs_error("device file create managed: Failed to create host file '%s'\n", filename.c_str());
+        return nullptr;
+    }
     
-//     std::filesystem::create_directories(ctrl_params->mount_path);
-//     std::filesystem::path mount_path(ctrl_params->mount_path);
+    // Calculate header size
+    size_t hdr_size = ROUND_UP(sizeof(struct geminiFS_hdr) + 
+                               sizeof(nvme_ofst_t) * (file_size / block_size), block_size);
+    
+    // Copy host file descriptor to device
+    dev_fd_t device_fd = copy_host_fd_to_device(host_fd, hdr_size);
+    if (device_fd == nullptr) {
+        geminifs_error("device file create managed: Failed to copy host file to device for '%s'\n", filename.c_str());
+        // Clean up the host file
+        host_file_close_managed(host_fd);
+        return nullptr;
+    }
+    
+    // Store the mapping for management
+    {
+        std::lock_guard<std::mutex> lock(device_files_mtx_);
+        device_files_.emplace_back(host_fd, device_fd, hdr_size, filename);
+    }
+    
+    geminifs_debug("device file create managed: Created device file '%s' with device_fd %p\n", 
+                   filename.c_str(), device_fd);
+    
+    return device_fd;
+}
 
-//     for (size_t idx = 0; idx < ctrl_params->pci_addr.size(); idx++){
-//         std::filesystem::path this_mount_path = mount_path / 
-//                                     ("cuda" + std::to_string(ctrl_params->cudaDevice) + '-' + std::to_string(idx));
-//         if (!std::filesystem::exists(this_mount_path)) {
-//             std::filesystem::create_directories(this_mount_path);
-//         }
-//         auto ctrl = new Controller(
-//             snvme_control_path,
-//             ctrl_params->pci_addr[idx].c_str(),
-//             this_mount_path,
-//             ctrl_params->ns_id,
-//             ctrl_params->cudaDevice,
-//             ctrl_params->queueDepth,
-//             ctrl_params->numQueues);
-//         nvm_info("Opening controller %ld: pci addr %s, mount path %s", 
-//                             idx, ctrl_params->pci_addr[idx].c_str(), this_mount_path.c_str());  
-//         ctrls.push_back(std::shared_ptr<Controller>(ctrl));
-//     }
+/**
+ * NVMeController private function to open an existing file as a device file
+ */
+dev_fd_t NVMeController::device_file_open_managed(const std::string& filename, size_t file_size) {
+    // Check if controller is properly initialized
+    if (!is_initialized()) {
+        geminifs_error("device file open managed: NVMeController is not properly initialized\n");
+        return nullptr;
+    }
+    
+    // Build file path
+    std::filesystem::path file_path = controller->dev_mount_path;
+    file_path = file_path / filename;
+    
+    // Check if physical file exists
+    if (!std::filesystem::exists(file_path)) {
+        geminifs_error("device file open managed: Physical file '%s' not found\n", file_path.c_str());
+        return nullptr;
+    }
+    
+    // Open the host file
+    host_fd_t host_fd = host_file_open_managed(file_path.string(), O_RDWR);
+    if (host_fd == nullptr) {
+        geminifs_error("device file open managed: Failed to open host file '%s'\n", file_path.c_str());
+        return nullptr;
+    }
+    
+    // Validate file size
+    if (host_fd->virtual_space_size != file_size) {
+        geminifs_error("device file open managed: File size mismatch. Expected %zu, got %zu\n", 
+                       file_size, host_fd->virtual_space_size);
+        host_file_close_managed(host_fd);
+        return nullptr;
+    }
+    
+    // Calculate header size
+    size_t hdr_size = ROUND_UP(sizeof(struct geminiFS_hdr) + 
+                               sizeof(nvme_ofst_t) * host_fd->nr_l1, host_fd->first_block_base);
+    
+    // Copy host file descriptor to device
+    dev_fd_t device_fd = copy_host_fd_to_device(host_fd, hdr_size);
+    if (device_fd == nullptr) {
+        geminifs_error("device file open managed: Failed to copy host file to device for '%s'\n", filename.c_str());
+        host_file_close_managed(host_fd);
+        return nullptr;
+    }
+    
+    // Store the mapping for management
+    {
+        std::lock_guard<std::mutex> lock(device_files_mtx_);
+        device_files_.emplace_back(host_fd, device_fd, hdr_size, filename);
+    }
+    
+    geminifs_debug("device file open managed: Opened device file '%s' with device_fd %p\n", 
+                   filename.c_str(), device_fd);
+    
+    return device_fd;
+}
 
-// #ifdef DEBUG
-//     for (size_t idx = 0; idx < ctrl_params->pci_addr.size(); idx++) {
-//       auto ctrl = ctrls[idx].get();
-//       nvm_debug("Opening controller %d: dev path %s, mount path %s", idx,
-//                ctrl->dev_path, ctrl->dev_mount_path);
-//     }
-// #endif
+/**
+ * NVMeController private function to close a device file and clean up resources
+ */
+void NVMeController::device_file_close_managed(dev_fd_t device_fd) {
+    // Check if controller is properly initialized
+    if (!is_initialized()) {
+        geminifs_error("device file close managed: NVMeController is not properly initialized\n");
+        return;
+    }
+    
+    std::lock_guard<std::mutex> lock(device_files_mtx_);
+    
+    // Find the device file handle
+    auto it = std::find_if(device_files_.begin(), device_files_.end(),
+                          [device_fd](const DeviceFileHandle& handle) {
+                              return handle.device_fd == device_fd;
+                          });
+    
+    if (it != device_files_.end()) {
+        geminifs_debug("device file close managed: Closing device file '%s'\n", it->filename.c_str());
+        
+        // Free device memory
+        cudaError_t err = cudaFree(device_fd);
+        if (err != cudaSuccess) {
+            geminifs_error("device file close managed: Failed to free device memory: %s\n", 
+                          cudaGetErrorString(err));
+        }
+        
+        // Close host file
+        host_file_close_managed(it->host_fd);
+        
+        // Remove from tracking
+        device_files_.erase(it);
+    } else {
+        geminifs_error("device file close managed: Device file descriptor %p not found\n", device_fd);
+    }
+}
 
-//     return std::move(ctrls);
-// }
+/**
+ * NVMeController private helper function to copy host file descriptor to device memory
+ */
+dev_fd_t NVMeController::copy_host_fd_to_device(host_fd_t host_fd, size_t hdr_size) {
+    void* device_fd = nullptr;
+    
+    // Allocate device memory
+    cudaError_t err = cudaMalloc(&device_fd, hdr_size);
+    if (err != cudaSuccess) {
+        geminifs_error("copy host fd to device: Failed to allocate device memory: %s\n", 
+                      cudaGetErrorString(err));
+        return nullptr;
+    }
+    
+    // Copy header from host to device
+    err = cudaMemcpy(device_fd, host_fd, hdr_size, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        geminifs_error("copy host fd to device: Failed to copy memory to device: %s\n", 
+                      cudaGetErrorString(err));
+        cudaFree(device_fd);
+        return nullptr;
+    }
+    
+    // Synchronize to ensure copy is complete
+    err = cudaStreamSynchronize(0);
+    if (err != cudaSuccess) {
+        geminifs_error("copy host fd to device: Failed to synchronize stream: %s\n", 
+                      cudaGetErrorString(err));
+        cudaFree(device_fd);
+        return nullptr;
+    }
+    
+    geminifs_debug("copy host fd to device: Successfully copied %zu bytes to device %p\n", 
+                   hdr_size, device_fd);
+    
+    return device_fd;
+}
 
+/**
+ * NVMeController private helper function to clean up all device files
+ */
+void NVMeController::cleanup_device_files() {
+    std::lock_guard<std::mutex> lock(device_files_mtx_);
+    
+    geminifs_debug("cleanup device files: Cleaning up %zu device files\n", device_files_.size());
+    
+    for (auto& handle : device_files_) {
+        geminifs_debug("cleanup device files: Cleaning up device file '%s'\n", handle.filename.c_str());
+        
+        // Free device memory
+        if (handle.device_fd != nullptr) {
+            cudaError_t err = cudaFree(handle.device_fd);
+            if (err != cudaSuccess) {
+                geminifs_error("cleanup device files: Failed to free device memory for '%s': %s\n", 
+                              handle.filename.c_str(), cudaGetErrorString(err));
+            }
+        }
+    }
+    
+    device_files_.clear();
+}
 
+    
 // Global helper functions for checking system components
 static inline bool check_snvme_control_exists() {
     if (access(snvme_control_path, F_OK) != 0) {
@@ -583,41 +708,41 @@ static inline void *host_batch_create(std::vector<ControllerPtr> &ctrls, GPUPool
  * 
  * @return Pointer to the created file structure in host memory and in GPU memory, or nullptr on failure
  */
-void *geminifs_host_file_create(ControllerPtr &ctrl, int block_size, size_t file_size, std::string filename) {
-    assert(file_size % block_size == 0);
+// dev_fd_t *geminifs_host_file_create(ControllerPtr &ctrl, int block_size, size_t file_size, std::string filename) {
+//     assert(file_size % block_size == 0);
 
-    auto nvpage_size = ctrl->page_size;
-    assert(block_size % nvpage_size == 0);
+//     auto nvpage_size = ctrl->page_size;
+//     assert(block_size % nvpage_size == 0);
 
-    void *host_fd_base;
-    auto hdr_size = ROUND_UP(sizeof(struct geminiFS_hdr) + 
-                                    sizeof(nvme_ofst_t) * (file_size / block_size), block_size);
+//     void *host_fd_base;
+//     auto hdr_size = ROUND_UP(sizeof(struct geminiFS_hdr) + 
+//                                     sizeof(nvme_ofst_t) * (file_size / block_size), block_size);
 
-    cuda_check_error(cudaMallocHost(&host_fd_base, hdr_size));
+//     cuda_check_error(cudaMallocHost(&host_fd_base, hdr_size));
     
-    std::filesystem::path dev_mount_path(ctrl->dev_mount_path);
-    std::filesystem::path dir_path = dev_mount_path;
-    std::filesystem::create_directories(dir_path);
-    std::filesystem::path file_path = dir_path / filename;
-    // geminifs_debug("create file %s\n", file_path.c_str());
-    auto hdr = (struct geminiFS_hdr *)((uintptr_t)host_fd_base);
-    host_create_geminifs_file(hdr, std::string(file_path).c_str(), block_size, file_size);
-    geminifs_debug("hdr info: block_size %d, file_size %lu, first_block_base %ld, file_path %s\n", 
-                    hdr->block_bit, hdr->virtual_space_size, hdr->first_block_base, file_path.c_str());
-    /*create the uuid and update the file info */
+//     std::filesystem::path dev_mount_path(ctrl->dev_mount_path);
+//     std::filesystem::path dir_path = dev_mount_path;
+//     std::filesystem::create_directories(dir_path);
+//     std::filesystem::path file_path = dir_path / filename;
+//     // geminifs_debug("create file %s\n", file_path.c_str());
+//     auto hdr = (struct geminiFS_hdr *)((uintptr_t)host_fd_base);
+//     host_create_geminifs_file(hdr, std::string(file_path).c_str(), block_size, file_size);
+//     geminifs_debug("hdr info: block_size %d, file_size %lu, first_block_base %ld, file_path %s\n", 
+//                     hdr->block_bit, hdr->virtual_space_size, hdr->first_block_base, file_path.c_str());
+//     /*create the uuid and update the file info */
     
-    /* */
-    void *dev_fd_base;
-    cuda_check_error(cudaMalloc(&dev_fd_base, hdr_size));
-    cuda_check_error(cudaMemcpy(dev_fd_base, host_fd_base, hdr_size, cudaMemcpyHostToDevice));
-    cuda_check_error(cudaStreamSynchronize(0));
-    cuda_check_error(cudaFreeHost(host_fd_base));
+//     /* */
+//     void *dev_fd_base;
+//     cuda_check_error(cudaMalloc(&dev_fd_base, hdr_size));
+//     cuda_check_error(cudaMemcpy(dev_fd_base, host_fd_base, hdr_size, cudaMemcpyHostToDevice));
+//     cuda_check_error(cudaStreamSynchronize(0));
+//     cuda_check_error(cudaFreeHost(host_fd_base));
 
-    geminifs_debug("geminifs_batch_create: allocated %ld bytes for device fds base\n", 
-                    hdr_size);
+//     geminifs_debug("geminifs_batch_create: allocated %ld bytes for device fds base\n", 
+//                     hdr_size);
 
-    return dev_fd_base;
-}
+//     return dev_fd_base;
+// }
 
 
 // /**

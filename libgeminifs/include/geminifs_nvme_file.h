@@ -18,6 +18,9 @@ constexpr size_t MAX_RECORDS = BITMAP_SIZE_BYTES * BITS_PER_BYTE; // 1,048,576 r
 // Forward declaration
 struct LogHeader;
 
+
+
+/*host file*/
 // Forward declaration for host_fd_t
 typedef struct geminiFS_hdr* host_fd_t;
 

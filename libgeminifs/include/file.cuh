@@ -183,6 +183,138 @@ public:
     }
 };
 
+// class Device_NVMe_File{
+// private:
+//     Controller *ctrl; // represent one NVMe controller
+//     struct geminiFS_hdr *hdr;  // static header for get NVMeFile cls
+//     friend class GPUFile;
+
+
+//     // need optimized use extend tree
+//     // va: 0 -> file size (except for the header)
+//     __forceinline__ __device__ nvme_ofst_t __get_nvmeofst(vaddr_t va) {
+//         assert(hdr != nullptr);
+//         uint64_t l1_idx = va >> hdr->block_bit;
+//         return l1_idx < hdr->nr_l1 ? hdr->l1[l1_idx] : 0;
+//     }
+
+//         /*
+//     * @brief: transfer data between NVMe and GPU memory
+//     * @param buf_ioaddrs: the buffer of GPU memory, aligned with nvme page size
+//     * @param file_offset: the offset of the file
+//     * @param nbytes: the number of bytes to transfer
+//     * @param type: the type of transfer
+//     */                                   
+//     __forceinline__ __device__ void __xfer(size_t file_offset, size_t nbytes, FileXferType type) {
+//         auto nvme_page_size = this->nvme_page_size;
+//         auto file_block_size = this->block_size;
+
+//         auto queue_acquire_helper = this->queue_acquire_helper;
+//         auto nr_nvpage__per_block = file_block_size / nvme_page_size;
+//         auto nr_blocks = nbytes / file_block_size;
+//         assert(file_block_size % nvme_page_size == 0);
+
+//         assert(nbytes % file_block_size == 0);
+//         assert(file_offset % nvme_page_size == 0);
+
+//         auto metadata_offset = file_offset / nvme_page_size;
+//         //Todo: fix bug cids may same within different requests
+//         auto cur_cids = this->cids + metadata_offset;
+//         auto cur_sq_poss = this->sq_poss + metadata_offset;
+//         auto cur_nvme_cmds = this->nvme_cmds + metadata_offset;
+//         auto cur_buf_ioaddrs = this->prp_list_vaddr_base__of_cur_file + metadata_offset;
+//         auto cur_prp_list_addr = this->prp_list_ioaddr_base__of_cur_file + metadata_offset * sizeof(uint64_t);
+
+//         vaddr_t va = file_offset;
+//         size_t nr_nvme_cmds = 0;
+//         for (int blocks_idx = 0; blocks_idx < nr_blocks; blocks_idx ++){
+//             vaddr_t fileblock_va = va + blocks_idx * file_block_size;
+//             nvme_ofst_t nvme_ofst = __get_nvmeofst(fileblock_va);
+//             uint64_t ioaddr = cur_buf_ioaddrs[blocks_idx * nr_nvpage__per_block];
+//             // geminifs_info("fileblock_va %lx, nvme_ofst %lx, ioaddr %lx\n", fileblock_va, nvme_ofst, ioaddr);
+//             if (nr_nvme_cmds != 0 &&
+//                 (cur_nvme_cmds[nr_nvme_cmds - 1].nvme_ofst +
+//                 cur_nvme_cmds[nr_nvme_cmds - 1].size == nvme_ofst)) {
+//                 cur_nvme_cmds[nr_nvme_cmds - 1].size += file_block_size;
+//             } else {
+//                 cur_nvme_cmds[nr_nvme_cmds].nvme_ofst = nvme_ofst;
+//                 cur_nvme_cmds[nr_nvme_cmds].ioaddr = ioaddr;
+//                 cur_nvme_cmds[nr_nvme_cmds].size = file_block_size;
+//                 nr_nvme_cmds++;
+//             }
+//         }
+
+//         int prp_list_offset = 0;
+//         int queue = queue_acquire_helper->acquire_queue();
+//         for (int cmd_idx = 0; cmd_idx < nr_nvme_cmds; cmd_idx++) {
+//             uint64_t prp2 = 0;
+//             if (cur_nvme_cmds[cmd_idx].size == nvme_page_size){
+//                 prp2 = 0;
+//             } else if (cur_nvme_cmds[cmd_idx].size == 2 * nvme_page_size) {
+//                 prp2 = cur_buf_ioaddrs[prp_list_offset + 1];
+//                 geminifs_debug("prp1 %lx, prp2 %lx\n", cur_buf_ioaddrs[prp_list_offset], prp2);
+//             } else { // > 2 * nvme_page_size
+//                 prp2 = cur_prp_list_addr + prp_list_offset * sizeof(uint64_t) + __WORD__;
+//             }
+ 
+//             // geminifs_info("nvme_ofst %lx, ioaddr %lx, prp2 %lx, size %ld\n", 
+//                 // cur_nvme_cmds[cmd_idx].nvme_ofst, cur_nvme_cmds[cmd_idx].ioaddr, prp2, cur_nvme_cmds[cmd_idx].size);
+
+//             queue_acquire_helper->issue_nvme_cmd(ctrl, queue,
+//                 cur_nvme_cmds[cmd_idx].nvme_ofst,
+//                 cur_nvme_cmds[cmd_idx].ioaddr,
+//                 prp2, // fixme
+//                 cur_nvme_cmds[cmd_idx].size,
+//                 this->hqps_block_size_log,
+//                 type == FILE_XFER_READ ? NVM_IO_READ : NVM_IO_WRITE,
+//                 cur_cids + cmd_idx, cur_sq_poss + cmd_idx);
+//             // prp_list_offset += (cur_nvme_cmds[cmd_idx].size / nvme_page_size) * sizeof(uint64_t);
+//             prp_list_offset += cur_nvme_cmds[cmd_idx].size / nvme_page_size;
+//         }
+
+//         for (int cmd_idx = 0; cmd_idx < nr_nvme_cmds; cmd_idx++) {
+//             queue_acquire_helper->poll(ctrl, queue, cur_cids[cmd_idx], cur_sq_poss[cmd_idx]);
+//         }
+//         queue_acquire_helper->release_queue(queue);
+
+//     }
+
+//     __forceinline__ __device__ void __xfer(FileXferType type) {
+//         this-> __xfer( 0, file_size, type);
+//     }
+
+// public:
+
+//     uint64_t prp_list_ioaddr_base__of_cur_file;
+//     uint64_t *prp_list_vaddr_base__of_cur_file;
+//     struct nvme_cmd__addr *nvme_cmds;
+//     size_t max_nvme_cmds;
+//     size_t nvme_page_size;
+//     size_t block_size;
+//     size_t file_size;
+
+//     uint16_t *cids;
+//     uint16_t *sq_poss;
+//     int hqps_block_size_log;
+//     QueueAcquireHelper *queue_acquire_helper;
+
+//     __forceinline__ __device__ NVMeFile(Controller * ctrl_, 
+//                                         struct geminiFS_hdr *hdr_): ctrl(ctrl_), hdr(hdr_) { }
+
+//     __forceinline__ __device__ bool check_file_status(void) {
+//         return this->ctrl != nullptr && this->hdr != nullptr && 
+//                 this->nvme_cmds != nullptr && this->cids != nullptr && this->sq_poss != nullptr;
+//     }
+
+//     __forceinline__ __device__ void print_file_info(void){
+//         geminifs_info("NVMeFile: %p, ctrl %p, hdr %p, file_size %ld, block_size %ld\n", 
+//             this, this->ctrl, this->hdr, this->file_size, this->block_size);
+//         geminifs_info("nvme_cmds %p, max_nvme_cmds %ld, nvme_page_size %ld\n", 
+//             this->nvme_cmds, this->max_nvme_cmds, this->nvme_page_size);
+//         geminifs_info("cids %p, sq_poss %p\n", this->cids, this->sq_poss);
+//     }
+// };
+
 class GPUFile : public File{
 private:
     NVMeFile *files;
