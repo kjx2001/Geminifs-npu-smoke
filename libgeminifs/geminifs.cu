@@ -49,9 +49,8 @@
 #include "geminifs.cuh"
 
 
-/*-------------------------metadata--------------------------------*/
-static std::unordered_map<int, struct geminifs_metadata *> global_metadata;
-static std::unordered_map<uint64_t, geminifs_dma *> global_dam_ctx;
+
+
 
 static char snvme_control_path[] = "/dev/snvm_control";
 static char sys_config_path[] = "/mnt/sys_GPU_NVMe_topology.json";
@@ -622,21 +621,7 @@ static void clean_geminifs() {
     host_close_all();
 }
 
-__host__ struct geminifs_metadata* geminifs_get_metadata(int device_id) {
-    auto it = global_metadata.find(device_id);
-    if (it != global_metadata.end()) {
-        return it->second;
-    }
-    return nullptr;
-}
 
-__host__ struct geminifs_dma* geminifs_get_dma(const torch::Tensor &tensor) {
-    auto it = global_dam_ctx.find((uintptr_t)tensor.data_ptr());
-    if (it != global_dam_ctx.end()) {
-        return it->second;
-    }
-    return nullptr;
-}
 
 static inline void *host_batch_create(std::vector<ControllerPtr> &ctrls, GPUPoolId pool_id,
                                         int block_size, int nr_files, size_t file_size) {
@@ -685,89 +670,6 @@ static inline void *host_batch_create(std::vector<ControllerPtr> &ctrls, GPUPool
 }
 
 
-/**
- * Creates a file on the host with specified parameters
- * 
- * @param ctrl        NVMe controller pointers to manage storage devices
- * @param block_size   Size of each file block/page (must be power of 2, e.g. 4KB)
- * @param file_size    Total size of the file to create (must be multiple of block_size)
- * @param filename    Total size of the file to create (must be multiple of block_size)
- * 
- * Requirements:
- * - file_size must be divisible by block_size (file_size % block_size == 0)
- * - block_size must be a power of 2 and >= NVMe page size
- * - block_size is typically 4KB (4096 bytes)
- * 
- * Example usage:
- * ```cpp
- * size_t block_size = 4096;  // 4KB blocks
- * size_t file_size = 1048576; // 1MB file (must be multiple of block_size)
- * filename = "example_file";
- * void* file_ptr = geminifs_host_file_create(controllers, block_size, file_size);
- * ```
- * 
- * @return Pointer to the created file structure in host memory and in GPU memory, or nullptr on failure
- */
-// dev_fd_t *geminifs_host_file_create(ControllerPtr &ctrl, int block_size, size_t file_size, std::string filename) {
-//     assert(file_size % block_size == 0);
-
-//     auto nvpage_size = ctrl->page_size;
-//     assert(block_size % nvpage_size == 0);
-
-//     void *host_fd_base;
-//     auto hdr_size = ROUND_UP(sizeof(struct geminiFS_hdr) + 
-//                                     sizeof(nvme_ofst_t) * (file_size / block_size), block_size);
-
-//     cuda_check_error(cudaMallocHost(&host_fd_base, hdr_size));
-    
-//     std::filesystem::path dev_mount_path(ctrl->dev_mount_path);
-//     std::filesystem::path dir_path = dev_mount_path;
-//     std::filesystem::create_directories(dir_path);
-//     std::filesystem::path file_path = dir_path / filename;
-//     // geminifs_debug("create file %s\n", file_path.c_str());
-//     auto hdr = (struct geminiFS_hdr *)((uintptr_t)host_fd_base);
-//     host_create_geminifs_file(hdr, std::string(file_path).c_str(), block_size, file_size);
-//     geminifs_debug("hdr info: block_size %d, file_size %lu, first_block_base %ld, file_path %s\n", 
-//                     hdr->block_bit, hdr->virtual_space_size, hdr->first_block_base, file_path.c_str());
-//     /*create the uuid and update the file info */
-    
-//     /* */
-//     void *dev_fd_base;
-//     cuda_check_error(cudaMalloc(&dev_fd_base, hdr_size));
-//     cuda_check_error(cudaMemcpy(dev_fd_base, host_fd_base, hdr_size, cudaMemcpyHostToDevice));
-//     cuda_check_error(cudaStreamSynchronize(0));
-//     cuda_check_error(cudaFreeHost(host_fd_base));
-
-//     geminifs_debug("geminifs_batch_create: allocated %ld bytes for device fds base\n", 
-//                     hdr_size);
-
-//     return dev_fd_base;
-// }
-
-
-// /**
-//  * open a file on the host with specified parameters
-//  * 
-//  * @param ctrl        NVMe controller pointers to manage storage devices
-//  * @param file_size    Total size of the file to create
-//  * geminiFS allow allow different file size for different files, but the file size must be multiple of block_size
-//  * @param filename    filename of the file to open, it will check the file exists in the controller's mount path
-//  * 
-//  * Requirements:
-//  * - file_size must be divisible by block_size (file_size % block_size == 0)
-//  * - block_size must be a power of 2 and >= NVMe page size
-//  * - block_size is typically 4KB (4096 bytes)
-//  * 
-//  * Example usage:
-//  * ```cpp
-//  * size_t block_size = 4096;  // 4KB blocks
-//  * size_t file_size = 1048576; // 1MB file (must be multiple of block_size)
-//  * filename = "example_file";
-//  * void* file_ptr = geminifs_host_file_create(controllers, block_size, file_size);
-//  * ```
-//  * 
-//  * @return Pointer to the created file structure in host memory and in GPU memory, or nullptr on failure
-//  */
 
 
 static 
@@ -836,69 +738,7 @@ NVMeFile *device_batch_open(std::vector<ControllerPtr> &ctrls, GPUPoolId pool_id
 
 }
 
-// static 
-// NVMeFile *Geminifs_host_file_open(ControllerPtr &ctrl,size_t block_size, 
-//                             int nr_files, size_t file_size) {
-    
-//     NVMeFile *files;
 
-//     void **ctrl_ptrs;
-
-//     // cuda_check_error(cudaSetDevice(cudaDevice));
-//     void *dev_fds_base = host_batch_create(ctrls, pool_id, block_size, nr_files, file_size);
-//     size_t nvme_page_size = ctrls[0]->page_size;
-//     size_t per_file_size = file_size / ctrls.size();
-//     size_t hdr_size = ROUND_UP(sizeof(struct geminiFS_hdr) + sizeof(nvme_ofst_t) * (file_size / block_size), block_size);
-//     size_t max_nvme_cmds = file_size / nvme_page_size;
-//     size_t nr_device = ctrls.size();
-//     size_t total_cnt = nr_files * nr_device;
-    
-//     cuda_check_error(cudaMalloc(&files, sizeof(NVMeFile) * total_cnt));
-//     cuda_check_error(cudaMalloc(&total_cids, sizeof(uint16_t) * max_nvme_cmds * total_cnt));
-//     cuda_check_error(cudaMalloc(&total_sq_poss, sizeof(uint16_t) * max_nvme_cmds * total_cnt));
-//     cuda_check_error(cudaMalloc(&total_nvme_cmds, sizeof(struct nvme_cmd__addr) * max_nvme_cmds * total_cnt));
-//     cuda_check_error(cudaMalloc(&queue_acquire_helper, sizeof(QueueAcquireHelper) * nr_device));
-//     cuda_check_error(cudaMallocManaged(&ctrl_ptrs, sizeof(void *) * nr_device));
-
-//     for (int dev_idx = 0; dev_idx < nr_device; dev_idx++) {
-//         auto *dev_ctrl = ctrls[dev_idx]->d_ctrl_ptr;
-//         ctrl_ptrs[dev_idx] = dev_ctrl;
-//     }
-
-//     // assume that all the devices have the same block size
-//     auto block_log = ctrls[0]->h_qps[0]->block_size_log;
-//     auto nr_queues = ctrls[0]->n_qps;
-
-//     RUN_ON_DEVICE({
-//         for (int dev_idx = 0; dev_idx < nr_device; dev_idx++) {
-//             auto q_helper = queue_acquire_helper + dev_idx;
-//             new (q_helper) QueueAcquireHelper(nr_queues);
-//         }
-//         for (int file_idx = 0; file_idx < nr_files; file_idx ++){    
-//             for (int dev_idx = 0; dev_idx < nr_device; dev_idx++) {
-//                 auto q_helper = queue_acquire_helper + dev_idx;
-//                 auto this_file = files + file_idx * nr_device + dev_idx;
-//                 auto dev_ctrl = (Controller *)ctrl_ptrs[dev_idx];
-//                 auto *hdr = (struct geminiFS_hdr *)((uintptr_t)dev_fds_base  
-//                                                         + (file_idx * nr_device + dev_idx) * hdr_size);
-//                 new (this_file) NVMeFile(dev_ctrl, hdr);
-//                 this_file->max_nvme_cmds = max_nvme_cmds;
-//                 this_file->nvme_cmds = total_nvme_cmds + (file_idx * nr_device + dev_idx) * max_nvme_cmds;
-//                 this_file->cids = total_cids + (file_idx * nr_device + dev_idx) * max_nvme_cmds;
-//                 this_file->sq_poss = total_sq_poss + (file_idx * nr_device + dev_idx) * max_nvme_cmds;
-//                 this_file->hqps_block_size_log = block_log;
-//                 this_file->queue_acquire_helper = q_helper;
-//                 this_file->file_size = per_file_size;
-//                 this_file->nvme_page_size = dev_ctrl->page_size;
-//                 this_file->block_size = block_size;
-//             }
-//         }
-//     })
-//     cudaFree(ctrl_ptrs);
-
-//     return files;
-
-// }
 struct DMAInfo{
     uint64_t *vaddr;
     uint64_t ioaddr_base;
@@ -1071,7 +911,6 @@ ControllerPtr NVMeController::open_single_controller(const std::string& pci_addr
         params.cudaDevice, 
         params.queueDepth, 
         params.numQueues);
-        
     return ctrl;
 }
 
@@ -1144,7 +983,7 @@ static inline geminifs_metadata* __geminifs_init(struct geminifs_ctrl_params &ct
 
     // check current device 
     int current_device;
-    cuda_check_error(cudaGetDevice(&current_device));
+    cuda_check_error(cuda_getDevice(&current_device));
     if (current_device != ctrl_params.cudaDevice) {
         geminifs_warn("geminifs_init_fds_wrapper_cuda: current device %d is not the same as ctrl_params.cudaDevice %d\n", 
                         current_device, ctrl_params.cudaDevice);
@@ -1387,56 +1226,7 @@ static inline bool is_ptr_aligned(const void* ptr, size_t alignment = GPU_PAGE_S
 }
 
 
-/*----------------------ops wrapper-------------------*/
-bool geminifs_get_dma_wrapper_cuda(const torch::Tensor& tensor) {
-    if (!is_device_pointer(tensor.data_ptr())) {
-        geminifs_error("geminifs_pin_memory_wrapper_cuda: tensor data pointer is not a device pointer\n");
-        return false;
-    }
 
-    if (!is_ptr_aligned(tensor.data_ptr())) {
-        geminifs_error("geminifs_pin_memory_wrapper_cuda: tensor data pointer %p is not aligned to GPU_PAGE_SIZE\n", tensor.data_ptr());
-        return false;
-    }
-
-    auto tensor_size = tensor.numel() * tensor.element_size();
-    if (!is_aligned(tensor_size)) {
-        geminifs_error("geminifs_pin_memory_wrapper_cuda: tensor size %ld is not aligned to GPU_PAGE_SIZE\n", tensor.numel() * tensor.element_size());
-        return false;
-    }
-    
-    struct geminifs_metadata *metadata;
-    if ((metadata = geminifs_get_metadata(tensor.device().index())) == nullptr) {
-        geminifs_error("geminifs_pin_memory_wrapper_cuda: device %d has not been initialized\n", tensor.device().index());
-        return false;
-    }
-
-    DmaPtr dma_ptr = getDeviceDma(metadata->ctrls[0].get()->ctrl, 
-                                    tensor.data_ptr(), tensor_size, tensor.device().index());
-    if (dma_ptr == nullptr) {
-        geminifs_error("geminifs_pin_memory_wrapper_cuda: failed to get DMA pointer for tensor\n");
-        return false;
-    }
-
-    uint64_t *ioaddrs = nullptr;
-    if (!dma_ptr->contiguous){ // if the ioaddr of dma is not contiguous, we need to allocate a device buffer
-        cuda_check_error(cudaMalloc(&ioaddrs, sizeof(uint64_t) * dma_ptr->n_ioaddrs));
-        cuda_check_error(cudaMemcpy(ioaddrs, dma_ptr->ioaddrs, sizeof(uint64_t) * dma_ptr->n_ioaddrs, cudaMemcpyHostToDevice));    
-    }
-
-    geminifs_debug("geminifs_get_dma_wrapper_cuda: tensor data pointer %p, size %ld, ioaddr %lx, n_ioaddrs %ld, contiguous %d\n", 
-                    tensor.data_ptr(), tensor_size, dma_ptr->ioaddrs[0], dma_ptr->n_ioaddrs, dma_ptr->contiguous);
-
-    global_dam_ctx[(uint64_t)tensor.data_ptr()] = new geminifs_dma{
-        .ioaddrs = ioaddrs,
-        .dma_ptr = dma_ptr
-    };
-    return true;
-}
-
-__host__ bool geminifs_create_dma(const torch::Tensor& tensor) {
-    return geminifs_get_dma_wrapper_cuda(tensor);
-}
 
 static inline bool __geimifs_device_one_layer_xfer(
     const torch::Tensor &cached_file_ids,   //shape = [num_cached_files,]
@@ -1594,61 +1384,9 @@ static inline bool geminifs_device_mutiple_layer_xfer(
         }
     }
 
-    // Wait for all recorded events to complete
-    // This ensures all transfers are finished on the GPU before the function returns
-    // for (int i = 0; i < num_layers; ++i) {
-    //     cudaError_t err = cudaEventSynchronize(completion_events[i]);
-    //     if (err != cudaSuccess) {
-    //         geminifs_error("geminifs_device_mutiple_layer_xfer: Failed to synchronize CUDA event %d: %s\n", i, cudaGetErrorString(err));
-    //         // Clean up all events before returning
-    //         for (auto& event : completion_events) {
-    //             if (event) cudaEventDestroy(event);
-    //         }
-    //         return false;
-    //     }
-    //     // Destroy the event after it's synchronized and no longer needed
-    //     err = cudaEventDestroy(completion_events[i]);
-    //     if (err != cudaSuccess) {
-    //         geminifs_error("geminifs_device_mutiple_layer_xfer: Failed to destroy CUDA event %d: %s\n", i, cudaGetErrorString(err));
-    //         // This might not be a fatal error, but good to log
-    //     }
-    // }
 
     return true; // All transfers are guaranteed to be complete on the GPU
 }
-// static inline bool geminifs_device_mutiple_layer_xfer(
-//     const torch::Tensor &cached_file_ids,   //shape = [num_cached_files,]
-//     const torch::Tensor &inner_block_ids,  // shape = [num_cached_files,]
-//     const std::vector<torch::Tensor> &key_caches, // shape = List[num_layers, max_num_block, block_size, num_heads, head_size]
-//     const std::vector<torch::Tensor> &value_caches, // shape = List[num_layers, max_num_block, block_size, num_heads, head_size]
-//     int64_t start_layer_idx, int64_t num_layers,
-//     enum FileXferType type) {
-    
-//     assert(num_layers > 0);
-//     assert(key_caches.size() == num_layers);
-//     assert(value_caches.size() == num_layers);
-//     assert(cached_file_ids.numel() == inner_block_ids.numel());
-    
-//     auto device = key_caches[0].device().index();
-//     struct geminifs_metadata *metadata;
-//     if ((metadata = geminifs_get_metadata(device)) == nullptr) {
-//         geminifs_error("geminifs_device_xfer_wrapper_cuda: device %d has not been initialized\n", device);
-//         return false;
-//     }
-
-//     for (int i = 0; i < num_layers; i++) {
-//         cudaStream_t stream;
-
-//         stream = metadata->streams[i % 32];
-
-//         // stream = at::cuda::getCurrentCUDAStream();
-
-//         __geimifs_device_one_layer_xfer(cached_file_ids, inner_block_ids, key_caches[i], value_caches[i], i + start_layer_idx, type, metadata, stream);
-//     }
-    
-
-//     return true;
-// }
 
 
 static inline bool geminifs_device_xfer_wrapper_cuda(
@@ -1777,7 +1515,7 @@ bool geminifs_device_mutiple_layer_read_wrapper_cuda(
                                         const torch::Tensor &inner_block_ids,  // shape = [num_cached_files,]
                                         const std::vector<torch::Tensor> &key_caches, // shape = List[num_layers, max_num_block, block_size, num_heads, head_size]
                                         const std::vector<torch::Tensor> &value_caches, // shape = List[num_layers, max_num_block, block_size, num_heads, head_size]
-                                        int64_t start_layer_idx, int64_t num_layers) {
+                                        ints64_t start_layer_idx, int64_t num_layers) {
     return geminifs_device_mutiple_layer_xfer(cached_file_ids, inner_block_ids, 
                                             key_caches, value_caches, 
                                             start_layer_idx, num_layers, FILE_XFER_READ);
@@ -1842,15 +1580,8 @@ bool geminifs_init_fds_wrapper_cuda(const torch::Tensor& file_meta,
     return true;
 }
 
-/*To do list*/
-// 1. init geminifs_ctrl
-// 2, init files
-// 3.
-/*----------------------For test-------------------*/
 
-bool geminifs_get_dma_wrapper_cuda_test(const torch::Tensor& tensor) {
-    return geminifs_get_dma_wrapper_cuda(tensor);
-}
+
 
 bool geminifs_init_fds_wrapper_cuda_test(int64_t nr_files, int64_t file_size, int64_t device_id, 
                                             const std::string& mount_path, const std::string& pcie_addr){
@@ -1882,4 +1613,149 @@ bool geminifs_device_xfer_wrapper_test2(
     return geminifs_device_mutiple_layer_xfer(cached_file_ids, inner_block_ids, 
                                             key_caches, value_caches,
                                             start_layer_idx, num_layers, type);
+}
+
+/**
+ * Create and register a GPU controller for a specific device
+ */
+__host__ GPUControllerPtr geminifs_create_gpu_controller(int device_id, const std::string& mount_base_path) {
+    auto gpu_controller = std::make_shared<GPUController>(device_id, mount_base_path);
+    
+    if (!gpu_controller->isInitialized()) {
+        geminifs_error("geminifs_create_gpu_controller: Failed to initialize GPU controller for device %d\n", device_id);
+        return nullptr;
+    }
+    
+    // Register with the global registry
+    auto& registry = GPUControllerRegistry::getInstance();
+    if (!registry.registerGPUController(device_id, gpu_controller)) {
+        geminifs_error("geminifs_create_gpu_controller: Failed to register GPU controller for device %d\n", device_id);
+        return nullptr;
+    }
+    
+    geminifs_debug("geminifs_create_gpu_controller: Successfully created and registered GPU controller for device %d\n", device_id);
+    return gpu_controller;
+}
+
+/**
+ * Get GPU controller for a specific device
+ */
+__host__ GPUControllerPtr geminifs_get_gpu_controller(int device_id) {
+    auto& registry = GPUControllerRegistry::getInstance();
+    return registry.getGPUController(device_id);
+}
+
+/**
+ * Add an NVMe controller to a GPU controller
+ */
+__host__ bool geminifs_add_nvme_to_gpu(int device_id, const nvme_ctrl_param& params) {
+    auto gpu_controller = geminifs_get_gpu_controller(device_id);
+    if (!gpu_controller) {
+        geminifs_error("geminifs_add_nvme_to_gpu: No GPU controller found for device %d\n", device_id);
+        return false;
+    }
+    
+    // Create NVMe controller
+    auto nvme_controller = std::make_shared<NVMeController>(params);
+    if (!nvme_controller->is_initialized()) {
+        geminifs_error("geminifs_add_nvme_to_gpu: Failed to initialize NVMe controller\n");
+        return false;
+    }
+    
+    // Add to GPU controller
+    if (!gpu_controller->addNVMeController(nvme_controller)) {
+        geminifs_error("geminifs_add_nvme_to_gpu: Failed to add NVMe controller to GPU %d\n", device_id);
+        return false;
+    }
+    
+    geminifs_debug("geminifs_add_nvme_to_gpu: Successfully added NVMe controller to GPU %d\n", device_id);
+    return true;
+}
+
+/**
+ * Register tensor memory with GPU controller
+ */
+__host__ bool geminifs_register_tensor_with_gpu(const torch::Tensor& tensor) {
+    int device_id = tensor.device().index();
+    auto gpu_controller = geminifs_get_gpu_controller(device_id);
+    
+    if (!gpu_controller) {
+        geminifs_error("geminifs_register_tensor_with_gpu: No GPU controller found for device %d\n", device_id);
+        return false;
+    }
+    
+    return gpu_controller->registerTensorMemory(tensor);
+}
+
+/**
+ * Unregister tensor memory from GPU controller
+ */
+__host__ bool geminifs_unregister_tensor_from_gpu(const torch::Tensor& tensor) {
+    int device_id = tensor.device().index();
+    auto gpu_controller = geminifs_get_gpu_controller(device_id);
+    
+    if (!gpu_controller) {
+        geminifs_error("geminifs_unregister_tensor_from_gpu: No GPU controller found for device %d\n", device_id);
+        return false;
+    }
+    
+    return gpu_controller->unregisterTensorMemory(tensor.data_ptr());
+}
+
+/**
+ * Get DMA context from GPU controller
+ */
+__host__ struct geminifs_dma* geminifs_get_tensor_dma_from_gpu(const torch::Tensor& tensor) {
+    int device_id = tensor.device().index();
+    auto gpu_controller = geminifs_get_gpu_controller(device_id);
+    
+    if (!gpu_controller) {
+        geminifs_error("geminifs_get_tensor_dma_from_gpu: No GPU controller found for device %d\n", device_id);
+        return nullptr;
+    }
+    
+    return gpu_controller->getDMAContext(tensor.data_ptr());
+}
+
+/**
+ * Open file using GPU controller
+ */
+__host__ void* geminifs_gpu_open_file(int device_id, const std::string& filename, size_t file_size, uint32_t o_flag, size_t controller_index = 0) {
+    auto gpu_controller = geminifs_get_gpu_controller(device_id);
+    if (!gpu_controller) {
+        geminifs_error("geminifs_gpu_open_file: No GPU controller found for device %d\n", device_id);
+        return nullptr;
+    }
+    
+    return gpu_controller->openFile(filename, file_size, o_flag, controller_index);
+}
+
+/**
+ * Cleanup all GPU controllers
+ */
+__host__ void geminifs_cleanup_all_gpu_controllers() {
+    auto& registry = GPUControllerRegistry::getInstance();
+    registry.clearAll();
+    geminifs_debug("geminifs_cleanup_all_gpu_controllers: Cleaned up all GPU controllers\n");
+}
+
+/**
+ * Get PRP list info for a registered tensor
+ */
+__host__ const prp_list_info* geminifs_get_tensor_prp_info(const torch::Tensor& tensor) {
+    int device_id = tensor.device().index();
+    auto gpu_controller = geminifs_get_gpu_controller(device_id);
+    
+    if (!gpu_controller) {
+        geminifs_error("geminifs_get_tensor_prp_info: No GPU controller found for device %d\n", device_id);
+        return nullptr;
+    }
+    
+    auto dma_ctx = gpu_controller->getDMAContext(tensor.data_ptr());
+    if (!dma_ctx) {
+        geminifs_error("geminifs_get_tensor_prp_info: No DMA context found for tensor at %p\n", tensor.data_ptr());
+        return nullptr;
+    }
+    
+    return &dma_ctx->prp_info;
 }

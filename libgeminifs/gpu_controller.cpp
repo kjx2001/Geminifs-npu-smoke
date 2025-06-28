@@ -1,9 +1,248 @@
 #include "geminifs.cuh"
 #include "geminifs_helper.h"
+#include "geminifs_mem.h"
 #include "utils.cuh"
 #include "buffer.h"
 #include <cuda_runtime.h>
 #include <cassert>
+#include <filesystem>
+#include <cstring>
+#include <algorithm>
+
+// === PRPContext Implementation ===
+
+void PRPContext::cleanup() {
+    if (prp_pages) {
+        for (size_t i = 0; i < num_prp_pages; ++i) {
+            if (prp_pages[i]) {
+                cudaFree(prp_pages[i]);
+                prp_pages[i] = nullptr;
+            }
+        }
+        delete[] prp_pages;
+        prp_pages = nullptr;
+    }
+    
+    if (prp_page_addrs) {
+        delete[] prp_page_addrs;
+        prp_page_addrs = nullptr;
+    }
+    
+    num_prp_pages = 0;
+    data_size = 0;
+    transfer_type = PRP_TYPE_SINGLE_PAGE;
+}
+
+bool PRPContext::allocatePRPPages(size_t num_pages) {
+    if (num_pages == 0) {
+        geminifs_error("PRP Context: Cannot allocate 0 pages\n");
+        return false;
+    }
+    
+    cleanup(); // 清理之前的分配
+    
+    // 分配页面指针数组
+    prp_pages = new void*[num_pages];
+    prp_page_addrs = new uint64_t[num_pages];
+    
+    if (!prp_pages || !prp_page_addrs) {
+        geminifs_error("PRP Context: Failed to allocate page arrays\n");
+        cleanup();
+        return false;
+    }
+    
+    // 初始化为空
+    memset(prp_pages, 0, sizeof(void*) * num_pages);
+    memset(prp_page_addrs, 0, sizeof(uint64_t) * num_pages);
+    
+    // 分配每个 PRP 页面
+    for (size_t i = 0; i < num_pages; ++i) {
+        cudaError_t err = cudaMalloc(&prp_pages[i], PRP_PAGE_SIZE);
+        if (err != cudaSuccess) {
+            geminifs_error("PRP Context: Failed to allocate PRP page %zu: %s\n", 
+                          i, cudaGetErrorString(err));
+            cleanup();
+            return false;
+        }
+        
+        // 清零页面
+        err = cudaMemset(prp_pages[i], 0, PRP_PAGE_SIZE);
+        if (err != cudaSuccess) {
+            geminifs_error("PRP Context: Failed to clear PRP page %zu: %s\n", 
+                          i, cudaGetErrorString(err));
+            cleanup();
+            return false;
+        }
+        
+        // 获取页面的设备地址 (这里简化处理，实际可能需要更复杂的地址获取)
+        prp_page_addrs[i] = reinterpret_cast<uint64_t>(prp_pages[i]);
+    }
+    
+    num_prp_pages = num_pages;
+    geminifs_debug("PRP Context: Successfully allocated %zu PRP pages\n", num_pages);
+    return true;
+}
+
+bool PRPContext::buildPRPList(const std::vector<uint64_t>& ioaddrs) {
+    if (ioaddrs.empty()) {
+        geminifs_error("PRP Context: Cannot build PRP list with empty ioaddrs\n");
+        return false;
+    }
+    
+    data_size = ioaddrs.size() * PRP_PAGE_SIZE;
+    
+    // 检查数据大小限制
+    if (data_size > MAX_TRANSFER_SIZE) {
+        geminifs_error("PRP Context: Data size %zu exceeds maximum transfer size %zu\n", 
+                      data_size, MAX_TRANSFER_SIZE);
+        return false;
+    }
+    
+    // 确定传输类型
+    if (data_size <= PRP_PAGE_SIZE) {
+        // 单页传输
+        transfer_type = PRP_TYPE_SINGLE_PAGE;
+        
+        if (!allocatePRPPages(1)) {
+            return false;
+        }
+        
+        // 创建 PRP 页面结构
+        PRPListPage host_page;
+        host_page.prp_entries[0] = ioaddrs[0];
+        host_page.transfer_type = PRP_TYPE_SINGLE_PAGE;
+        
+        // 复制到设备
+        cudaError_t err = cudaMemcpy(prp_pages[0], &host_page, sizeof(PRPListPage), cudaMemcpyHostToDevice);
+        if (err != cudaSuccess) {
+            geminifs_error("PRP Context: Failed to copy single page PRP to device: %s\n", 
+                          cudaGetErrorString(err));
+            return false;
+        }
+        
+        geminifs_debug("PRP Context: Built single page PRP list with ioaddr 0x%lx\n", ioaddrs[0]);
+        
+    } else if (data_size <= 2 * PRP_PAGE_SIZE) {
+        // 双页传输
+        transfer_type = PRP_TYPE_DUAL_PAGE;
+        
+        if (!allocatePRPPages(1)) {
+            return false;
+        }
+        
+        // 创建 PRP 页面结构
+        PRPListPage host_page;
+        host_page.prp_entries[0] = ioaddrs[0];
+        host_page.prp_entries[1] = ioaddrs.size() > 1 ? ioaddrs[1] : 0;
+        host_page.transfer_type = PRP_TYPE_DUAL_PAGE;
+        
+        // 复制到设备
+        cudaError_t err = cudaMemcpy(prp_pages[0], &host_page, sizeof(PRPListPage), cudaMemcpyHostToDevice);
+        if (err != cudaSuccess) {
+            geminifs_error("PRP Context: Failed to copy dual page PRP to device: %s\n", 
+                          cudaGetErrorString(err));
+            return false;
+        }
+        
+        geminifs_debug("PRP Context: Built dual page PRP list with ioaddrs 0x%lx, 0x%lx\n", 
+                      ioaddrs[0], ioaddrs.size() > 1 ? ioaddrs[1] : 0);
+        
+    } else {
+        // PRP List 传输
+        transfer_type = PRP_TYPE_LIST;
+        
+        // 计算需要的 PRP 页面数量
+        size_t total_entries = ioaddrs.size();
+        size_t pages_needed = (total_entries + PRP_ENTRIES_PER_PAGE - 1) / PRP_ENTRIES_PER_PAGE;
+        
+        if (!allocatePRPPages(pages_needed)) {
+            return false;
+        }
+        
+        // 构建多个 PRP 页面
+        size_t entry_index = 0;
+        for (size_t page_idx = 0; page_idx < pages_needed; ++page_idx) {
+            PRPListPage host_page;
+            
+            // 填充当前页面的 entries
+            size_t entries_in_this_page = std::min(PRP_ENTRIES_PER_PAGE, total_entries - entry_index);
+            
+            for (size_t i = 0; i < entries_in_this_page; ++i) {
+                host_page.prp_entries[i] = ioaddrs[entry_index + i];
+            }
+            
+            // 如果不是最后一页，最后一个 entry 指向下一个 PRP 页面
+            if (page_idx < pages_needed - 1) {
+                host_page.prp_entries[PRP_ENTRIES_PER_PAGE - 1] = prp_page_addrs[page_idx + 1];
+                entries_in_this_page--; // 最后一个 entry 用于链接，减少实际数据 entries
+            }
+            
+            host_page.transfer_type = PRP_TYPE_LIST;
+            
+            // 复制到设备
+            cudaError_t err = cudaMemcpy(prp_pages[page_idx], &host_page, sizeof(PRPListPage), cudaMemcpyHostToDevice);
+            if (err != cudaSuccess) {
+                geminifs_error("PRP Context: Failed to copy PRP list page %zu to device: %s\n", 
+                              page_idx, cudaGetErrorString(err));
+                return false;
+            }
+            
+            entry_index += entries_in_this_page;
+        }
+        
+        geminifs_debug("PRP Context: Built PRP list with %zu pages, %zu total entries\n", 
+                      pages_needed, total_entries);
+    }
+    
+    return true;
+}
+
+// === PRP 辅助函数实现 ===
+
+/**
+ * 创建 PRP 上下文
+ */
+PRPContext* createPRPContext(const std::vector<uint64_t>& ioaddrs) {
+    PRPContext* context = new PRPContext();
+    
+    if (!context->buildPRPList(ioaddrs)) {
+        delete context;
+        return nullptr;
+    }
+    
+    return context;
+}
+
+/**
+ * 获取 PRP 传输类型字符串
+ */
+const char* getPRPTransferTypeString(PRPTransferType type) {
+    switch (type) {
+        case PRP_TYPE_SINGLE_PAGE: return "Single Page";
+        case PRP_TYPE_DUAL_PAGE:   return "Dual Page";
+        case PRP_TYPE_LIST:        return "PRP List";
+        default:                   return "Unknown";
+    }
+}
+
+/**
+ * 验证 PRP 上下文
+ */
+bool validatePRPContext(const PRPContext* context) {
+    if (!context) {
+        return false;
+    }
+    
+    if (context->num_prp_pages == 0 || !context->prp_pages || !context->prp_page_addrs) {
+        return false;
+    }
+    
+    if (context->data_size > MAX_TRANSFER_SIZE) {
+        return false;
+    }
+    
+    return true;
+}
 
 // === GPUController Implementation ===
 
@@ -116,11 +355,9 @@ bool GPUController::unregisterTensorMemory(void* tensor_ptr) {
             return false;
         }
         
-        // Clean up DMA context
+        // Clean up DMA context (但不释放 CUDA 内存)
         geminifs_dma* dma_ctx = it->second;
-        if (dma_ctx->ioaddrs != nullptr) {
-            cudaFree(dma_ctx->ioaddrs);
-        }
+        // 注意: 不调用 cudaFree(dma_ctx->ioaddrs)，因为 CUDA 内存由应用进程管理
         delete dma_ctx;
         
         dma_contexts_.erase(it);
@@ -148,9 +385,8 @@ void GPUController::clearAllDMAContexts() {
     
     for (auto& pair : dma_contexts_) {
         geminifs_dma* dma_ctx = pair.second;
-        if (dma_ctx->ioaddrs != nullptr) {
-            cudaFree(dma_ctx->ioaddrs);
-        }
+        // 注意: 不调用 cudaFree，因为 CUDA 内存由应用进程管理
+        // PRP 上下文会在 geminifs_dma 的析构函数中自动清理
         delete dma_ctx;
     }
     
@@ -313,6 +549,11 @@ geminifs_dma* GPUController::createDMAContext(const torch::Tensor& tensor) {
         return nullptr;
     }
     
+    // 创建 geminifs_dma 结构
+    geminifs_dma* dma_ctx = new geminifs_dma();
+    dma_ctx->dma_ptr = dma_ptr;
+    
+    // 处理 ioaddrs
     uint64_t* ioaddrs = nullptr;
     if (!dma_ptr->contiguous) {
         // If the ioaddr of dma is not contiguous, allocate device buffer
@@ -320,6 +561,7 @@ geminifs_dma* GPUController::createDMAContext(const torch::Tensor& tensor) {
         if (err != cudaSuccess) {
             geminifs_error("GPU Controller: Failed to allocate device memory for ioaddrs: %s\n", 
                            cudaGetErrorString(err));
+            delete dma_ctx;
             return nullptr;
         }
         
@@ -329,17 +571,55 @@ geminifs_dma* GPUController::createDMAContext(const torch::Tensor& tensor) {
             geminifs_error("GPU Controller: Failed to copy ioaddrs to device: %s\n", 
                            cudaGetErrorString(err));
             cudaFree(ioaddrs);
+            delete dma_ctx;
             return nullptr;
         }
     }
+    dma_ctx->ioaddrs = ioaddrs;
     
-    geminifs_debug("GPU Controller: Created DMA context for tensor %p, size %ld, ioaddr %lx, n_ioaddrs %ld, contiguous %d\n", 
-                   tensor.data_ptr(), tensor_size, dma_ptr->ioaddrs[0], dma_ptr->n_ioaddrs, dma_ptr->contiguous);
+    // 创建 PRP 上下文
+    std::vector<uint64_t> ioaddr_vector;
     
-    return new geminifs_dma{
-        .ioaddrs = ioaddrs,
-        .dma_ptr = dma_ptr
-    };
+    // 将 DMA 地址复制到 vector 中
+    if (dma_ptr->contiguous && dma_ptr->n_ioaddrs > 0) {
+        // 连续内存，计算所有页面地址
+        uint64_t base_addr = dma_ptr->ioaddrs[0];
+        size_t num_pages = (tensor_size + PRP_PAGE_SIZE - 1) / PRP_PAGE_SIZE;
+        
+        for (size_t i = 0; i < num_pages; ++i) {
+            ioaddr_vector.push_back(base_addr + i * PRP_PAGE_SIZE);
+        }
+    } else {
+        // 非连续内存，使用所有提供的地址
+        for (size_t i = 0; i < dma_ptr->n_ioaddrs; ++i) {
+            ioaddr_vector.push_back(dma_ptr->ioaddrs[i]);
+        }
+    }
+    
+    // 检查数据大小限制
+    if (tensor_size > MAX_TRANSFER_SIZE) {
+        geminifs_error("GPU Controller: Tensor size %zu exceeds maximum transfer size %zu\n", 
+                      tensor_size, MAX_TRANSFER_SIZE);
+        delete dma_ctx;
+        return nullptr;
+    }
+    
+    // 创建 PRP 上下文
+    dma_ctx->prp_context = new PRPContext();
+    if (!dma_ctx->prp_context->buildPRPList(ioaddr_vector)) {
+        geminifs_error("GPU Controller: Failed to build PRP list for tensor\n");
+        delete dma_ctx;
+        return nullptr;
+    }
+    
+    geminifs_debug("GPU Controller: Created DMA context for tensor %p, size %zu, transfer_type: %s, "
+                   "ioaddr 0x%lx, n_ioaddrs %zu, contiguous %d, prp_pages %zu\n", 
+                   tensor.data_ptr(), tensor_size, 
+                   getPRPTransferTypeString(dma_ctx->prp_context->transfer_type),
+                   dma_ptr->ioaddrs[0], dma_ptr->n_ioaddrs, dma_ptr->contiguous,
+                   dma_ctx->prp_context->num_prp_pages);
+    
+    return dma_ctx;
 }
 
 // === GPUControllerRegistry Implementation ===
