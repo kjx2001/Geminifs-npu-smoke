@@ -14,6 +14,9 @@
 #define O_HOST      0x10000000  // Open for host-side operations
 #define O_DEVICE    0x20000000  // Open for device-side operations
 
+#define GPU_PAGE_SIZE 65536ul
+#define ROUND_UP(x, align)(((uint64_t) (x) + ((uint64_t)align - 1)) & ~((uint64_t)align - 1))
+
 typedef uint64_t vaddr_t;
 typedef uint64_t rawfile_ofst_t;
 typedef uint64_t nvme_ofst_t;
@@ -101,8 +104,8 @@ host_refine_nvmeofst(host_fd_t fd);
 extern void
 host_close_geminifs_file(host_fd_t fd);
 
-extern void
-host_close_all();
+// extern void
+// host_close_all();
 
 //-----------------host for device------------------
 extern dev_fd_t

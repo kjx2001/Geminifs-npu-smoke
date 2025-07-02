@@ -7,7 +7,7 @@ bool geminifs_init_fds_wrapper_cuda(const torch::Tensor& file_meta,
                                     const std::string& mount_path, 
                                     const std::string& pcie_addr);
 
-bool geminifs_get_dma_wrapper_cuda(const torch::Tensor& tensor);
+// bool geminifs_get_dma_wrapper_cuda(const torch::Tensor& tensor);
 
 bool batch_read_direct(const torch::Tensor& cached_file_ids,   //shape = [num_cached_files,]
                                         const torch::Tensor& inner_block_ids,  // shape = [num_cached_files,]

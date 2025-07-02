@@ -59,7 +59,7 @@ static __device__ void cuda_device_assert(cudaError_t code, const char *file, in
 #define __4KB__  4096ul
 #define __WORD__ 8
 #define MAX_BLOCK_SIZE __128KB__
-#define GPU_PAGE_SIZE 65536ul
+
 
 
 using cuda_device_lock = cuda::binary_semaphore<cuda::thread_scope_device>;
@@ -68,22 +68,6 @@ using FileGroupId = int32_t;
 using GPUFileId = uint64_t;
 using GPUPoolId = int32_t;
 
-#define geminifs_info(fmt, ...) \
-    printf("[INFO][%s:%d]: " fmt "", __func__, __LINE__, ##__VA_ARGS__);
 
-#define geminifs_error(fmt, ...) \
-    printf("[ERROR][%s:%d]: " fmt "", __func__, __LINE__, ##__VA_ARGS__);
-
-#define geminifs_warn(fmt, ...) \
-    printf("[WARN][%s:%d]: " fmt "", __func__, __LINE__, ##__VA_ARGS__);
-
-
-#ifdef DEBUG
-#define geminifs_debug(fmt, ...) \
-    printf("[DEBUG][%s:%d]: " fmt "", __func__, __LINE__, ##__VA_ARGS__);
-#else
-#define geminifs_debug(fmt, ...) \
-
-#endif
 
 #endif

@@ -14,8 +14,8 @@
 #include <stdint.h>
 #include <cuda/std/span>
 #include "helper.cuh"
-
-
+#include <cuda/atomic>
+#include "geminifs_helper.h"
 
 typedef enum FileXferType {
     FILE_XFER_READ = 0,
@@ -183,53 +183,53 @@ public:
     }
 };
 
-class Device_NVMe_File{
-private:
-    Controller *ctrl; // represent one NVMe controller
-    struct geminiFS_hdr *hdr;  // static header for get NVMeFile cls
-    friend class GPUFile;
+// class Device_NVMe_File{
+// private:
+//     Controller *ctrl; // represent one NVMe controller
+//     struct geminiFS_hdr *hdr;  // static header for get NVMeFile cls
+//     friend class GPUFile;
 
 
-    // need optimized use extend tree
-    // va: 0 -> file size (except for the header)
-    __forceinline__ __device__ nvme_ofst_t __get_nvmeofst(vaddr_t va) {
-        assert(hdr != nullptr);
-        uint64_t l1_idx = va >> hdr->block_bit;
-        return l1_idx < hdr->nr_l1 ? hdr->l1[l1_idx] : 0;
-    }
+//     // need optimized use extend tree
+//     // va: 0 -> file size (except for the header)
+//     __forceinline__ __device__ nvme_ofst_t __get_nvmeofst(vaddr_t va) {
+//         assert(hdr != nullptr);
+//         uint64_t l1_idx = va >> hdr->block_bit;
+//         return l1_idx < hdr->nr_l1 ? hdr->l1[l1_idx] : 0;
+//     }
 
 
-public:
+// public:
 
-    uint64_t prp_list_ioaddr_base__of_cur_file;
-    uint64_t *prp_list_vaddr_base__of_cur_file;
-    struct nvme_cmd__addr *nvme_cmds;
-    size_t max_nvme_cmds;
-    size_t nvme_page_size;
-    size_t block_size;
-    size_t file_size;
+//     uint64_t prp_list_ioaddr_base__of_cur_file;
+//     uint64_t *prp_list_vaddr_base__of_cur_file;
+//     struct nvme_cmd__addr *nvme_cmds;
+//     size_t max_nvme_cmds;
+//     size_t nvme_page_size;
+//     size_t block_size;
+//     size_t file_size;
 
-    uint16_t *cids;
-    uint16_t *sq_poss;
-    int hqps_block_size_log;
-    QueueAcquireHelper *queue_acquire_helper;
+//     uint16_t *cids;
+//     uint16_t *sq_poss;
+//     int hqps_block_size_log;
+//     QueueAcquireHelper *queue_acquire_helper;
 
-    __forceinline__ __device__ NVMeFile(Controller * ctrl_, 
-                                        struct geminiFS_hdr *hdr_): ctrl(ctrl_), hdr(hdr_) { }
+//     __forceinline__ __device__ Device_NVMe_File(Controller * ctrl_, 
+//                                         struct geminiFS_hdr *hdr_): ctrl(ctrl_), hdr(hdr_) { }
 
-    __forceinline__ __device__ bool check_file_status(void) {
-        return this->ctrl != nullptr && this->hdr != nullptr && 
-                this->nvme_cmds != nullptr && this->cids != nullptr && this->sq_poss != nullptr;
-    }
+//     __forceinline__ __device__ bool check_file_status(void) {
+//         return this->ctrl != nullptr && this->hdr != nullptr && 
+//                 this->nvme_cmds != nullptr && this->cids != nullptr && this->sq_poss != nullptr;
+//     }
 
-    __forceinline__ __device__ void print_file_info(void){
-        geminifs_info("NVMeFile: %p, ctrl %p, hdr %p, file_size %ld, block_size %ld\n", 
-            this, this->ctrl, this->hdr, this->file_size, this->block_size);
-        geminifs_info("nvme_cmds %p, max_nvme_cmds %ld, nvme_page_size %ld\n", 
-            this->nvme_cmds, this->max_nvme_cmds, this->nvme_page_size);
-        geminifs_info("cids %p, sq_poss %p\n", this->cids, this->sq_poss);
-    }
-};
+//     __forceinline__ __device__ void print_file_info(void){
+//         geminifs_info("NVMeFile: %p, ctrl %p, hdr %p, file_size %ld, block_size %ld\n", 
+//             this, this->ctrl, this->hdr, this->file_size, this->block_size);
+//         geminifs_info("nvme_cmds %p, max_nvme_cmds %ld, nvme_page_size %ld\n", 
+//             this->nvme_cmds, this->max_nvme_cmds, this->nvme_page_size);
+//         geminifs_info("cids %p, sq_poss %p\n", this->cids, this->sq_poss);
+//     }
+// };
 
 class GPUFile : public File{
 private:

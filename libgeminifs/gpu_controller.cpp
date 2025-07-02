@@ -1,14 +1,12 @@
-#include "geminifs.cuh"
 #include "geminifs_helper.h"
 #include "geminifs_mem.h"
-#include "utils.cuh"
 #include "buffer.h"
 #include <cuda_runtime.h>
 #include <cassert>
 #include <filesystem>
 #include <cstring>
 #include <algorithm>
-
+#include "gpu_controller.h"
 // === PRPContext Implementation ===
 
 void PRPContext::cleanup() {
@@ -197,21 +195,7 @@ bool PRPContext::buildPRPList(const std::vector<uint64_t>& ioaddrs) {
     return true;
 }
 
-// === PRP 辅助函数实现 ===
 
-/**
- * 创建 PRP 上下文
- */
-PRPContext* createPRPContext(const std::vector<uint64_t>& ioaddrs) {
-    PRPContext* context = new PRPContext();
-    
-    if (!context->buildPRPList(ioaddrs)) {
-        delete context;
-        return nullptr;
-    }
-    
-    return context;
-}
 
 /**
  * 获取 PRP 传输类型字符串
@@ -225,24 +209,7 @@ const char* getPRPTransferTypeString(PRPTransferType type) {
     }
 }
 
-/**
- * 验证 PRP 上下文
- */
-bool validatePRPContext(const PRPContext* context) {
-    if (!context) {
-        return false;
-    }
-    
-    if (context->num_prp_pages == 0 || !context->prp_pages || !context->prp_page_addrs) {
-        return false;
-    }
-    
-    if (context->data_size > MAX_TRANSFER_SIZE) {
-        return false;
-    }
-    
-    return true;
-}
+
 
 // === GPUController Implementation ===
 
@@ -291,9 +258,18 @@ void GPUController::cleanup() {
     // Clear all DMA contexts
     clearAllDMAContexts();
     
-    // Clear all NVMe controllers
+    // Reset and clear all NVMe controllers
     {
         std::lock_guard<std::mutex> lock(storage_mutex_);
+        
+        // Reset each NVMe controller before clearing
+        for (auto& nvme_controller : nvme_controllers_) {
+            if (nvme_controller) {
+                geminifs_debug("GPU Controller: Resetting NVMe controller\n");
+                nvme_controller.reset();
+            }
+        }
+        
         nvme_controllers_.clear();
     }
     

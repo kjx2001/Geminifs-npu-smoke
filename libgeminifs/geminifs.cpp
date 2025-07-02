@@ -19,6 +19,11 @@
 #include "geminifs.h"
 #include "nvm_error.h"
 
+// Definition of the global magic number
+union geminiFS_magic the_geminiFS_magic = {
+    .magic_cstr = {'g', 'e', 'm', 'i', 'n', 'i', 'f', 's'}
+};
+
 
 #define my_assert(code) do { \
     if (!(code)) { \
@@ -28,10 +33,6 @@
 } while(0)
 
 
-union geminiFS_magic
-the_geminiFS_magic = {
-  	.magic_cstr = {'g', 'e', 'm', 'i', 'n', 'i', 'f', 's'}
-};
 
 static int one_nr__of__binary_int(unsigned long long i) {
 	int count = 0;

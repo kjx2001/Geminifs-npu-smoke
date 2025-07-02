@@ -21,6 +21,9 @@
 #include "geminifs_helper.h"
 
 #include <fstream>  
+#include <map>
+#include <set>
+#include <sstream>
 #include "ioctl.h"
 
 using json = nlohmann::json;
@@ -318,4 +321,204 @@ void auto_configure_fd_limits(int num_files_to_open) {
     std::cout << "Final limits:" << std::endl;
     show_fd_limits();
     std::cout << std::endl;
+}
+
+// Memory alignment utility functions
+bool is_aligned(uint64_t value, size_t alignment) {
+    return (value & (alignment - 1)) == 0;
+}
+
+bool is_ptr_aligned(const void* ptr, size_t alignment) {
+    return is_aligned(reinterpret_cast<uint64_t>(ptr), alignment);
+}
+
+
+// Utility function to trim whitespace
+std::string trim(const std::string& str) {
+    size_t first = str.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) return "";
+    size_t last = str.find_last_not_of(" \t\r\n");
+    return str.substr(first, (last - first + 1));
+}
+
+// Parse system configuration file
+ParsedSystemConfig parse_system_config(const std::string& config_file_path) {
+    ParsedSystemConfig result;
+    result.valid = false;
+    
+    std::ifstream file(config_file_path);
+    if (!file.is_open()) {
+        result.error_message = "Cannot open config file: " + config_file_path;
+        return result;
+    }
+    
+    std::vector<GPUConfig> gpus;
+    std::vector<NVMeConfig> nvmes;
+    std::string line;
+    std::string current_section;
+    
+    GPUConfig current_gpu;
+    NVMeConfig current_nvme;
+    bool in_gpu_section = false;
+    bool in_nvme_section = false;
+    
+    while (std::getline(file, line)) {
+        line = trim(line);
+        
+        // Skip empty lines and comments
+        if (line.empty() || line[0] == '#' || line.substr(0, 2) == "//") {
+            continue;
+        }
+        
+        // Check for section headers
+        if (line[0] == '<' && line.back() == '>') {
+            // Save previous section data
+            if (in_gpu_section) {
+                gpus.push_back(current_gpu);
+                current_gpu = GPUConfig();
+            }
+            if (in_nvme_section) {
+                nvmes.push_back(current_nvme);
+                current_nvme = NVMeConfig();
+            }
+            
+            current_section = line.substr(1, line.length() - 2);
+            in_gpu_section = current_section.find("GPU") == 0;
+            in_nvme_section = current_section.find("NVMe") == 0;
+            continue;
+        }
+        
+        // Parse key-value pairs
+        size_t eq_pos = line.find('=');
+        if (eq_pos == std::string::npos) continue;
+        
+        std::string key = trim(line.substr(0, eq_pos));
+        std::string value = trim(line.substr(eq_pos + 1));
+        
+        // Remove quotes if present
+        if (value.length() >= 2 && value.front() == '"' && value.back() == '"') {
+            value = value.substr(1, value.length() - 2);
+        }
+        
+        // Parse GPU section
+        if (in_gpu_section) {
+            if (key == "mount_path") {
+                current_gpu.mount_path = value;
+            } else if (key == "cudaDevice") {
+                current_gpu.cudaDevice = std::stoi(value);
+            }
+        }
+        // Parse NVMe section
+        else if (in_nvme_section) {
+            if (key == "mount_path") {
+                current_nvme.mount_path = value;
+            } else if (key == "pci_addr") {
+                current_nvme.pci_addr = value;
+            } else if (key == "ns_id") {
+                current_nvme.ns_id = std::stoul(value);
+            } else if (key == "queueDepth") {
+                current_nvme.queueDepth = std::stoull(value);
+            } else if (key == "numQueues") {
+                current_nvme.numQueues = std::stoull(value);
+            } else if (key == "cudaDevice") {
+                current_nvme.cudaDevice = std::stoi(value);
+            }
+        }
+    }
+    
+    // Save last section data
+    if (in_gpu_section) {
+        gpus.push_back(current_gpu);
+    }
+    if (in_nvme_section) {
+        nvmes.push_back(current_nvme);
+    }
+    
+    file.close();
+    
+    // Validation: Check if we have at least one GPU and one NVMe
+    if (gpus.empty()) {
+        result.error_message = "No GPU configuration found in config file";
+        return result;
+    }
+    
+    if (nvmes.empty()) {
+        result.error_message = "No NVMe configuration found in config file";
+        return result;
+    }
+    
+    // Group NVMes by cudaDevice and match with GPUs
+    std::map<int, std::vector<NVMeConfig>> nvme_groups;
+    for (const auto& nvme : nvmes) {
+        nvme_groups[nvme.cudaDevice].push_back(nvme);
+    }
+    
+    // Create system groups
+    for (const auto& gpu : gpus) {
+        SystemConfigGroup group;
+        group.gpu = gpu;
+        
+        // Find NVMes belonging to this GPU
+        auto it = nvme_groups.find(gpu.cudaDevice);
+        if (it != nvme_groups.end()) {
+            group.nvmes = it->second;
+        }
+        
+        // Validate that NVMes in this group have unique pci_addr and mount_path
+        std::set<std::string> pci_addrs;
+        std::set<std::string> mount_paths;
+        
+        for (const auto& nvme : group.nvmes) {
+            if (pci_addrs.find(nvme.pci_addr) != pci_addrs.end()) {
+                result.error_message = "Duplicate pci_addr found in GPU group " + 
+                                       std::to_string(gpu.cudaDevice) + ": " + nvme.pci_addr;
+                return result;
+            }
+            pci_addrs.insert(nvme.pci_addr);
+            
+            if (mount_paths.find(nvme.mount_path) != mount_paths.end()) {
+                result.error_message = "Duplicate mount_path found in GPU group " + 
+                                       std::to_string(gpu.cudaDevice) + ": " + nvme.mount_path;
+                return result;
+            }
+            mount_paths.insert(nvme.mount_path);
+        }
+        
+        if (!group.nvmes.empty()) {
+            result.groups.push_back(group);
+        }
+    }
+    
+    // Final validation: ensure we have at least one valid group
+    if (result.groups.empty()) {
+        result.error_message = "No valid GPU-NVMe groups found. Each GPU must have at least one associated NVMe device with matching cudaDevice";
+        return result;
+    }
+    
+    result.valid = true;
+    return result;
+}
+
+// Convert parsed config to nvme_ctrl_param structures
+std::vector<nvme_ctrl_param> convert_to_nvme_ctrl_params(const ParsedSystemConfig& config) {
+    std::vector<nvme_ctrl_param> params;
+    
+    if (!config.valid) {
+        return params;
+    }
+    
+    for (const auto& group : config.groups) {
+        for (const auto& nvme : group.nvmes) {
+            nvme_ctrl_param param;
+            param.mount_path = nvme.mount_path;
+            param.pci_addr = nvme.pci_addr;
+            param.cudaDevice = nvme.cudaDevice;
+            param.ns_id = nvme.ns_id;
+            param.queueDepth = nvme.queueDepth;
+            param.numQueues = nvme.numQueues;
+            params.push_back(param);
+        }
+    }
+    
+    return params;
 }

@@ -6,7 +6,31 @@
 #include <sys/resource.h>
 #include "geminifs.h"
 
+// Configuration parsing structures
+struct GPUConfig {
+    std::string mount_path;
+    int cudaDevice;
+};
 
+struct NVMeConfig {
+    std::string mount_path;
+    std::string pci_addr;
+    uint32_t ns_id;
+    uint64_t queueDepth;
+    uint64_t numQueues;
+    int cudaDevice;
+};
+
+struct SystemConfigGroup {
+    GPUConfig gpu;
+    std::vector<NVMeConfig> nvmes;
+};
+
+struct ParsedSystemConfig {
+    std::vector<SystemConfigGroup> groups;
+    bool valid;
+    std::string error_message;
+};
 
 
 // PCI BDF地址结构体
@@ -57,5 +81,30 @@ int calculate_pci_distance(const PCI_BDF& bdf1, const PCI_BDF& bdf2);
 // File descriptor limit management functions
 bool increase_fd_limit(rlim_t desired_limit);
 void auto_configure_fd_limits(int num_files_to_open = 1000);
+
+// Memory alignment utility functions
+bool is_aligned(uint64_t value, size_t alignment = 65536ul);  // GPU_PAGE_SIZE = 65536ul
+bool is_ptr_aligned(const void* ptr, size_t alignment = 65536ul);
+
+ParsedSystemConfig parse_system_config(const std::string& config_file_path);
+std::vector<nvme_ctrl_param> convert_to_nvme_ctrl_params(const ParsedSystemConfig& config);
+
+#define geminifs_info(fmt, ...) \
+    printf("[INFO][%s:%d]: " fmt "", __func__, __LINE__, ##__VA_ARGS__);
+
+#define geminifs_error(fmt, ...) \
+    printf("[ERROR][%s:%d]: " fmt "", __func__, __LINE__, ##__VA_ARGS__);
+
+#define geminifs_warn(fmt, ...) \
+    printf("[WARN][%s:%d]: " fmt "", __func__, __LINE__, ##__VA_ARGS__);
+
+
+#ifdef DEBUG
+#define geminifs_debug(fmt, ...) \
+    printf("[DEBUG][%s:%d]: " fmt "", __func__, __LINE__, ##__VA_ARGS__);
+#else
+#define geminifs_debug(fmt, ...) \
+
+#endif
 
 #endif
