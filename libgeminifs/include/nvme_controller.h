@@ -55,8 +55,8 @@ public:
     dev_fd_t device_file_open_managed(const std::string& filename, size_t file_size);
     void device_file_close_managed(dev_fd_t device_fd);
     
-    // Clean up all files managed by this controller
-    bool device_file_clean_all_files_managed();
+    // delete up all files managed by this controller
+    bool device_file_delete_all_files_managed();
     
     // Check if controller is properly initialized
     bool is_initialized() const { return is_initialized_; }

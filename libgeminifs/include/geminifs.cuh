@@ -144,8 +144,8 @@ __host__ void* geminifs_gpu_open_file(int device_id, const std::string& filename
 __host__ void geminifs_cleanup_all_gpu_controllers();
 
 /**
- * Clean all files managed by a specific NVMe controller
+ * Delete all files managed by a specific NVMe controller
  */
-__host__ bool geminifs_nvme_clean_all_files(int device_id, size_t controller_index = 0);
+__host__ bool geminifs_nvme_delete_all_files(int device_id, size_t controller_index = 0);
 
 #endif

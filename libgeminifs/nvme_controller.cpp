@@ -558,37 +558,37 @@ bool NVMeController::check_sys_config_exists() {
  * 2. Delete each file from both the log and physical storage
  * 3. Close any open device file descriptors
  */
-bool NVMeController::device_file_clean_all_files_managed() {
+bool NVMeController::device_file_delete_all_files_managed() {
     // Check if controller is properly initialized
     if (!is_initialized()) {
-        geminifs_error("device_file_clean_all_files_managed: NVMeController is not properly initialized\n");
+        geminifs_error("device_file_delete_all_files_managed: NVMeController is not properly initialized\n");
         return false;
     }
     
     if (!file_manager) {
-        geminifs_error("device_file_clean_all_files_managed: FileManager is not available\n");
+        geminifs_error("device_file_delete_all_files_managed: FileManager is not available\n");
         return false;
     }
     
-    geminifs_debug("device_file_clean_all_files_managed: Starting cleanup for mount path '%s'\n", 
+    geminifs_debug("device_file_delete_all_files_managed: Starting cleanup for mount path '%s'\n", 
                    controller->dev_mount_path);
     
     // Get all filenames from the FileManager log
     std::vector<std::string> all_filenames = file_manager->getAllFilenames();
     
     if (all_filenames.empty()) {
-        geminifs_debug("device_file_clean_all_files_managed: No files found in log, cleanup complete\n");
+        geminifs_debug("device_file_delete_all_files_managed: No files found in log, cleanup complete\n");
         return true;
     }
     
-    geminifs_debug("device_file_clean_all_files_managed: Found %zu files to clean up\n", all_filenames.size());
+    geminifs_debug("device_file_delete_all_files_managed: Found %zu files to clean up\n", all_filenames.size());
     
     size_t files_deleted = 0;
     size_t files_failed = 0;
     
     // Process each file
     for (const auto& filename : all_filenames) {
-        geminifs_debug("device_file_clean_all_files_managed: Processing file '%s'\n", filename.c_str());
+        geminifs_debug("device_file_delete_all_files_managed: Processing file '%s'\n", filename.c_str());
         
         // Build full path to the physical file
         std::filesystem::path file_path = controller->dev_mount_path;
@@ -601,30 +601,30 @@ bool NVMeController::device_file_clean_all_files_managed() {
         if (std::filesystem::exists(file_path)) {
             try {
                 if (std::filesystem::remove(file_path)) {
-                    geminifs_debug("device_file_clean_all_files_managed: Successfully deleted physical file '%s'\n", 
+                    geminifs_debug("device_file_delete_all_files_managed: Successfully deleted physical file '%s'\n", 
                                    file_path.c_str());
                     physical_file_deleted = true;
                 } else {
-                    geminifs_error("device_file_clean_all_files_managed: Failed to delete physical file '%s'\n", 
+                    geminifs_error("device_file_delete_all_files_managed: Failed to delete physical file '%s'\n", 
                                    file_path.c_str());
                 }
             } catch (const std::filesystem::filesystem_error& e) {
-                geminifs_error("device_file_clean_all_files_managed: Exception while deleting physical file '%s': %s\n", 
+                geminifs_error("device_file_delete_all_files_managed: Exception while deleting physical file '%s': %s\n", 
                                file_path.c_str(), e.what());
             }
         } else {
-            geminifs_debug("device_file_clean_all_files_managed: Physical file '%s' does not exist\n", 
+            geminifs_debug("device_file_delete_all_files_managed: Physical file '%s' does not exist\n", 
                            file_path.c_str());
             physical_file_deleted = true; // Consider it as "successfully deleted" if it doesn't exist
         }
         
         // Delete the entry from FileManager log
         if (file_manager->deleteFile(filename)) {
-            geminifs_debug("device_file_clean_all_files_managed: Successfully deleted log entry for '%s'\n", 
+            geminifs_debug("device_file_delete_all_files_managed: Successfully deleted log entry for '%s'\n", 
                            filename.c_str());
             log_entry_deleted = true;
         } else {
-            geminifs_error("device_file_clean_all_files_managed: Failed to delete log entry for '%s'\n", 
+            geminifs_error("device_file_delete_all_files_managed: Failed to delete log entry for '%s'\n", 
                            filename.c_str());
         }
         
@@ -643,16 +643,16 @@ bool NVMeController::device_file_clean_all_files_managed() {
     cleanup_device_files();
     
     // Report results
-    geminifs_debug("device_file_clean_all_files_managed: Cleanup complete. "
+    geminifs_debug("device_file_delete_all_files_managed: Cleanup complete. "
                    "Successfully deleted: %zu, Failed: %zu, Total: %zu\n", 
                    files_deleted, files_failed, all_filenames.size());
     
     if (files_failed > 0) {
-        geminifs_error("device_file_clean_all_files_managed: %zu files could not be completely cleaned up\n", 
+        geminifs_error("device_file_delete_all_files_managed: %zu files could not be completely cleaned up\n", 
                        files_failed);
         return false;
     }
     
-    geminifs_debug("device_file_clean_all_files_managed: All files successfully cleaned up\n");
+    geminifs_debug("device_file_delete_all_files_managed: All files successfully cleaned up\n");
     return true;
 }

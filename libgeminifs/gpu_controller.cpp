@@ -533,6 +533,7 @@ geminifs_dma* GPUController::createDMAContext(const torch::Tensor& tensor) {
     uint64_t* ioaddrs = nullptr;
     if (!dma_ptr->contiguous) {
         // If the ioaddr of dma is not contiguous, allocate device buffer
+        geminifs_info("GPU Controller: Allocating device memory for non-contiguous ioaddrs\n");
         cudaError_t err = cudaMalloc(&ioaddrs, sizeof(uint64_t) * dma_ptr->n_ioaddrs);
         if (err != cudaSuccess) {
             geminifs_error("GPU Controller: Failed to allocate device memory for ioaddrs: %s\n", 

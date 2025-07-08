@@ -670,77 +670,77 @@ static inline bool is_device_pointer(const void* ptr, const char* error_msg = nu
 
 
 
-// static inline bool __geimifs_device_one_layer_xfer(
-//     const torch::Tensor &cached_file_ids,   //shape = [num_cached_files,]
-//     const torch::Tensor &inner_block_ids,  // shape = [num_cached_files,]
-//     const torch::Tensor &key_cache,         // shape = [max_num_block, block_size, num_heads, head_size]
-//     const torch::Tensor &value_cache,       // shape = [max_num_block, block_size, num_heads, head_size]
-//     int64_t start_layer_idx, enum FileXferType type,
-//     struct geminifs_metadata *metadata, 
-//     cudaStream_t stream) {
+static inline bool __geimifs_device_one_layer_xfer(
+    const torch::Tensor &cached_file_ids,   //shape = [num_cached_files,]
+    const torch::Tensor &inner_block_ids,  // shape = [num_cached_files,]
+    const torch::Tensor &key_cache,         // shape = [max_num_block, block_size, num_heads, head_size]
+    const torch::Tensor &value_cache,       // shape = [max_num_block, block_size, num_heads, head_size]
+    int64_t start_layer_idx, enum FileXferType type,
+    struct geminifs_metadata *metadata, 
+    cudaStream_t stream) {
     
-//     int max_num_block = key_cache.size(0);
-//     int block_size = key_cache.size(1);
-//     int num_heads = key_cache.size(2);
-//     int head_size = key_cache.size(3);
+    int max_num_block = key_cache.size(0);
+    int block_size = key_cache.size(1);
+    int num_heads = key_cache.size(2);
+    int head_size = key_cache.size(3);
     
-//     uint64_t block_nbytes = block_size * num_heads * head_size * key_cache.element_size();
-//     uint64_t layer_stride = 2 * block_nbytes;
-//     uint64_t key_file_offset = start_layer_idx * layer_stride;
-//     uint64_t value_file_offset = key_file_offset + block_nbytes;
+    uint64_t block_nbytes = block_size * num_heads * head_size * key_cache.element_size();
+    uint64_t layer_stride = 2 * block_nbytes;
+    uint64_t key_file_offset = start_layer_idx * layer_stride;
+    uint64_t value_file_offset = key_file_offset + block_nbytes;
 
-//     if (block_nbytes & (metadata->file_block_size - 1)) { // to avoid xfer to other page
-//         geminifs_error("block_nbytes %ld is not aligned to file block size\n", block_nbytes);
-//         return false;
-//     }
+    if (block_nbytes & (metadata->file_block_size - 1)) { // to avoid xfer to other page
+        geminifs_error("block_nbytes %ld is not aligned to file block size\n", block_nbytes);
+        return false;
+    }
 
-//     struct geminifs_dma *key_dma_ctx, *value_dma_ctx;
-//     if ((key_dma_ctx = geminifs_get_dma(key_cache)) == nullptr) {
-//         geminifs_error("geminifs_device_xfer_wrapper_cuda: key_cache.data_ptr() %p has not been initialized\n", key_cache.data_ptr());
-//         return false;
-//     }
+    struct geminifs_dma *key_dma_ctx, *value_dma_ctx;
+    if ((key_dma_ctx = geminifs_get_dma(key_cache)) == nullptr) {
+        geminifs_error("geminifs_device_xfer_wrapper_cuda: key_cache.data_ptr() %p has not been initialized\n", key_cache.data_ptr());
+        return false;
+    }
 
-//     if ((value_dma_ctx = geminifs_get_dma(value_cache)) == nullptr) {
-//         geminifs_error("geminifs_device_xfer_wrapper_cuda: value_cache.data_ptr() %p has not been initialized\n", value_cache.data_ptr());
-//         return false;
-//     }
+    if ((value_dma_ctx = geminifs_get_dma(value_cache)) == nullptr) {
+        geminifs_error("geminifs_device_xfer_wrapper_cuda: value_cache.data_ptr() %p has not been initialized\n", value_cache.data_ptr());
+        return false;
+    }
 
-//     dim3 grid(cached_file_ids.numel());
-//     dim3 block(32);
-//     const at::cuda::OptionalCUDAGuard device_guard(device_of(key_cache));
+    dim3 grid(cached_file_ids.numel());
+    dim3 block(32);
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(key_cache));
 
-//     cuda::std::span<GPUFileId> file_ids = {(GPUFileId *)cached_file_ids.data_ptr(), (size_t)cached_file_ids.numel()};
-//     cuda::std::span<uint64_t> block_ids = {(uint64_t *)inner_block_ids.data_ptr(), (size_t)inner_block_ids.numel()};
+    cuda::std::span<GPUFileId> file_ids = {(GPUFileId *)cached_file_ids.data_ptr(), (size_t)cached_file_ids.numel()};
+    cuda::std::span<uint64_t> block_ids = {(uint64_t *)inner_block_ids.data_ptr(), (size_t)inner_block_ids.numel()};
 
-//     auto * pool = metadata->global_pool.get();
-//     if (key_dma_ctx->dma_ptr->contiguous) {
-//         __geminifs_device_batch_xfer<<<grid, block, 0, stream>>>
-//                         (pool, file_ids, block_ids, key_dma_ctx->dma_ptr->ioaddrs[0], 
-//                             block_nbytes, key_file_offset, type);
-//     }
+    auto * pool = metadata->global_pool.get();
+    if (key_dma_ctx->dma_ptr->contiguous) {
+        __geminifs_device_batch_xfer<<<grid, block, 0, stream>>>
+                        (pool, file_ids, block_ids, key_dma_ctx->dma_ptr->ioaddrs[0], 
+                            block_nbytes, key_file_offset, type);
+    }
     
-//     if (value_dma_ctx->dma_ptr->contiguous) {
-//         __geminifs_device_batch_xfer<<<grid, block, 0, stream>>>
-//                         (pool, file_ids, block_ids, value_dma_ctx->dma_ptr->ioaddrs[0], 
-//                             block_nbytes, value_file_offset, type);
-//     }
+    if (value_dma_ctx->dma_ptr->contiguous) {
+        __geminifs_device_batch_xfer<<<grid, block, 0, stream>>>
+                        (pool, file_ids, block_ids, value_dma_ctx->dma_ptr->ioaddrs[0], 
+                            block_nbytes, value_file_offset, type);
+    }
     
-//     if (!key_dma_ctx->dma_ptr->contiguous) { // assert that ioaddrs is not null
-//         __geminifs_device_batch_xfer<<<grid, block, 0, stream>>>
-//                         (pool, file_ids, block_ids, 
-//                         {key_dma_ctx->ioaddrs, key_dma_ctx->dma_ptr->n_ioaddrs}, 
-//                         block_nbytes, key_file_offset, type);
-//     }   
+    if (!key_dma_ctx->dma_ptr->contiguous) { // assert that ioaddrs is not null
+        __geminifs_device_batch_xfer<<<grid, block, 0, stream>>>
+                        (pool, file_ids, block_ids, 
+                        {key_dma_ctx->ioaddrs, key_dma_ctx->dma_ptr->n_ioaddrs}, 
+                        block_nbytes, key_file_offset, type);
+    }   
     
-//     if (!value_dma_ctx->dma_ptr->contiguous) { // assert that ioaddrs is not null
-//         __geminifs_device_batch_xfer<<<grid, block, 0, stream>>>
-//                         (pool, file_ids, block_ids, 
-//                         {value_dma_ctx->ioaddrs, value_dma_ctx->dma_ptr->n_ioaddrs}, 
-//                         block_nbytes, value_file_offset, type);
-//     }
+    if (!value_dma_ctx->dma_ptr->contiguous) { // assert that ioaddrs is not null
+        __geminifs_device_batch_xfer<<<grid, block, 0, stream>>>
+                        (pool, file_ids, block_ids, 
+                        {value_dma_ctx->ioaddrs, value_dma_ctx->dma_ptr->n_ioaddrs}, 
+                        block_nbytes, value_file_offset, type);
+    }
 
-//     return true;
-// }
+    return true;
+}
 
 // static inline bool geminifs_device_mutiple_layer_xfer(
 //     const torch::Tensor& cached_file_ids,  // shape = [num_cached_files,]
@@ -1194,26 +1194,26 @@ __host__ void geminifs_cleanup_all_gpu_controllers() {
 /**
  * Clean all files managed by a specific NVMe controller
  */
-__host__ bool geminifs_nvme_clean_all_files(int device_id, size_t controller_index = 0) {
+__host__ bool geminifs_nvme_delete_all_files(int device_id, size_t controller_index) {
     auto gpu_controller = geminifs_get_gpu_controller(device_id);
     if (!gpu_controller) {
-        geminifs_error("geminifs_nvme_clean_all_files: No GPU controller found for device %d\n", device_id);
+        geminifs_error("geminifs_nvme_delete_all_files: No GPU controller found for device %d\n", device_id);
         return false;
     }
     
     auto nvme_controller = gpu_controller->getNVMeController(controller_index);
     if (!nvme_controller) {
-        geminifs_error("geminifs_nvme_clean_all_files: No NVMe controller found at index %zu for device %d\n", 
+        geminifs_error("geminifs_nvme_delete_all_files: No NVMe controller found at index %zu for device %d\n", 
                        controller_index, device_id);
         return false;
     }
     
-    bool success = nvme_controller->device_file_clean_all_files_managed();
+    bool success = nvme_controller->device_file_delete_all_files_managed();
     if (success) {
-        geminifs_debug("geminifs_nvme_clean_all_files: Successfully cleaned all files for device %d controller %zu\n", 
+        geminifs_debug("geminifs_nvme_delete_all_files: Successfully cleaned all files for device %d controller %zu\n", 
                        device_id, controller_index);
     } else {
-        geminifs_error("geminifs_nvme_clean_all_files: Failed to clean all files for device %d controller %zu\n", 
+        geminifs_error("geminifs_nvme_delete_all_files: Failed to clean all files for device %d controller %zu\n", 
                        device_id, controller_index);
     }
     
