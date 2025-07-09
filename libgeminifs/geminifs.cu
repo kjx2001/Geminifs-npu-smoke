@@ -46,7 +46,7 @@
 #include "file.cuh"
 #include "utils.cuh"
 #include "geminifs.cuh"
-#include "nvme_controller.h"
+#include "nvme_controller.cuh"
 #include "geminifs_helper.h"
 static char snvme_control_path[] = "/dev/snvm_control";
 static char sys_config_path[] = "/mnt/sys_GPU_NVMe_topology.json";
@@ -95,120 +95,8 @@ static inline bool check_sys_config_exists() {
 
 
 
-static inline void *host_batch_create(std::vector<ControllerPtr> &ctrls, GPUPoolId pool_id,
-                                        int block_size, int nr_files, size_t file_size) {
-    assert(file_size % block_size == 0);
-    assert(nr_files > 0);
-
-    auto nvpage_size = ctrls[0]->page_size;
-    assert(block_size % nvpage_size == 0);
-
-    void *host_fds_base;
-    auto hdr_size = ROUND_UP(sizeof(struct geminiFS_hdr) + 
-                                    sizeof(nvme_ofst_t) * (file_size / block_size), block_size);
-    auto nr_device = ctrls.size();
-    cuda_check_error(cudaMallocHost(&host_fds_base, hdr_size * nr_files * nr_device));
-    
-  
-    for (int idx = 0; idx < nr_device; idx++) {
-        // fixme
-        auto ctrl = ctrls[idx].get();
-        std::filesystem::path dev_mount_path(ctrl->dev_mount_path);
-        std::filesystem::path dir_path = dev_mount_path / std::to_string(pool_id) / std::to_string(idx);
-        std::filesystem::create_directories(dir_path);
-
-        for (uint32_t file_idx = 0; file_idx < nr_files; file_idx++) {
-            std::filesystem::path file_path = dir_path / std::to_string(file_idx);
-            // geminifs_debug("create file %s\n", file_path.c_str());
-            auto hdr = (struct geminiFS_hdr *)(
-                                (uintptr_t)host_fds_base + (file_idx * nr_device + idx) * hdr_size);
-            host_create_geminifs_file(hdr, std::string(file_path).c_str(), block_size, file_size);
-            geminifs_debug("hdr info: block_size %d, file_size %lu, first_block_base %ld, file_path %s\n", 
-                            hdr->block_bit, hdr->virtual_space_size, hdr->first_block_base, file_path.c_str());
-        }
-
-    }
-    
-    void *dev_fds_base;
-    cuda_check_error(cudaMalloc(&dev_fds_base, hdr_size * nr_files * nr_device));
-    cuda_check_error(cudaMemcpy(dev_fds_base, host_fds_base, hdr_size * nr_files * nr_device, cudaMemcpyHostToDevice));
-    cuda_check_error(cudaStreamSynchronize(0));
-    cuda_check_error(cudaFreeHost(host_fds_base));
-
-    geminifs_debug("geminifs_batch_create: allocated %ld bytes for device fds base\n", 
-                    hdr_size * nr_files * nr_device);
-
-    return dev_fds_base;
-}
 
 
-
-
-static 
-NVMeFile *device_batch_open(std::vector<ControllerPtr> &ctrls, GPUPoolId pool_id, size_t block_size, 
-                            int nr_files, size_t file_size, int cudaDevice) {
-    struct nvme_cmd__addr *total_nvme_cmds;
-    QueueAcquireHelper *queue_acquire_helper;
-    NVMeFile *files;
-    uint16_t *total_cids;
-    uint16_t *total_sq_poss;
-    void **ctrl_ptrs;
-
-    // cuda_check_error(cudaSetDevice(cudaDevice));
-    void *dev_fds_base = host_batch_create(ctrls, pool_id, block_size, nr_files, file_size);
-    size_t nvme_page_size = ctrls[0]->page_size;
-    size_t per_file_size = file_size / ctrls.size();
-    size_t hdr_size = ROUND_UP(sizeof(struct geminiFS_hdr) + sizeof(nvme_ofst_t) * (file_size / block_size), block_size);
-    size_t max_nvme_cmds = file_size / nvme_page_size;
-    size_t nr_device = ctrls.size();
-    size_t total_cnt = nr_files * nr_device;
-    
-    cuda_check_error(cudaMalloc(&files, sizeof(NVMeFile) * total_cnt));
-    cuda_check_error(cudaMalloc(&total_cids, sizeof(uint16_t) * max_nvme_cmds * total_cnt));
-    cuda_check_error(cudaMalloc(&total_sq_poss, sizeof(uint16_t) * max_nvme_cmds * total_cnt));
-    cuda_check_error(cudaMalloc(&total_nvme_cmds, sizeof(struct nvme_cmd__addr) * max_nvme_cmds * total_cnt));
-    cuda_check_error(cudaMalloc(&queue_acquire_helper, sizeof(QueueAcquireHelper) * nr_device));
-    cuda_check_error(cudaMallocManaged(&ctrl_ptrs, sizeof(void *) * nr_device));
-
-    for (int dev_idx = 0; dev_idx < nr_device; dev_idx++) {
-        auto *dev_ctrl = ctrls[dev_idx]->d_ctrl_ptr;
-        ctrl_ptrs[dev_idx] = dev_ctrl;
-    }
-
-    // assume that all the devices have the same block size
-    auto block_log = ctrls[0]->h_qps[0]->block_size_log;
-    auto nr_queues = ctrls[0]->n_qps;
-
-    RUN_ON_DEVICE({
-        for (int dev_idx = 0; dev_idx < nr_device; dev_idx++) {
-            auto q_helper = queue_acquire_helper + dev_idx;
-            new (q_helper) QueueAcquireHelper(nr_queues);
-        }
-        for (int file_idx = 0; file_idx < nr_files; file_idx ++){    
-            for (int dev_idx = 0; dev_idx < nr_device; dev_idx++) {
-                auto q_helper = queue_acquire_helper + dev_idx;
-                auto this_file = files + file_idx * nr_device + dev_idx;
-                auto dev_ctrl = (Controller *)ctrl_ptrs[dev_idx];
-                auto *hdr = (struct geminiFS_hdr *)((uintptr_t)dev_fds_base  
-                                                        + (file_idx * nr_device + dev_idx) * hdr_size);
-                new (this_file) NVMeFile(dev_ctrl, hdr);
-                this_file->max_nvme_cmds = max_nvme_cmds;
-                this_file->nvme_cmds = total_nvme_cmds + (file_idx * nr_device + dev_idx) * max_nvme_cmds;
-                this_file->cids = total_cids + (file_idx * nr_device + dev_idx) * max_nvme_cmds;
-                this_file->sq_poss = total_sq_poss + (file_idx * nr_device + dev_idx) * max_nvme_cmds;
-                this_file->hqps_block_size_log = block_log;
-                this_file->queue_acquire_helper = q_helper;
-                this_file->file_size = per_file_size;
-                this_file->nvme_page_size = dev_ctrl->page_size;
-                this_file->block_size = block_size;
-            }
-        }
-    })
-    cudaFree(ctrl_ptrs);
-
-    return files;
-
-}
 
 
 struct DMAInfo{
@@ -217,214 +105,13 @@ struct DMAInfo{
     DmaPtr dma_ptr;
 };
 
-__host__ GPUFile* 
-geminifs_batch_create(std::vector<ControllerPtr> &ctrls, GPUPoolId pool_id, int nr_files, 
-                        size_t block_size, size_t file_size, int cudaDevice){
-    
-    // cuda_check_error(cudaSetDevice(cudaDevice));
-    
-    auto nr_device = ctrls.size();
-    auto nv_file_size = file_size / nr_device;
-    auto nvme_page_size = ctrls[0].get()->page_size;
-    NVMeFile *nv_files = device_batch_open(ctrls, pool_id, block_size, nr_files, file_size, cudaDevice);
-
-    GPUFile * gpu_files__ptr;
-    void *dma_info__ptr;    
-
-    auto dma__per_nvfile = GPU_PAGE_SIZE / (sizeof(uint64_t) * nv_file_size / nvme_page_size);
-    auto total_dma_size = ROUND_UP(nr_files, dma__per_nvfile) / dma__per_nvfile;
-    cuda_check_error(cudaMalloc(&gpu_files__ptr, sizeof(GPUFile) * nr_files));
-    cuda_check_error(cudaMallocManaged(&dma_info__ptr, sizeof(struct DMAInfo) * total_dma_size));
-
-    for (auto idx = 0;idx < total_dma_size; idx ++) {
-        auto *dma_info = (struct DMAInfo *)((uintptr_t)dma_info__ptr + idx * sizeof(struct DMAInfo));
-        dma_info->dma_ptr = createDma(ctrls[idx % nr_device].get()->ctrl, 
-                                        GPU_PAGE_SIZE, cudaDevice);
-        dma_info->vaddr = (uint64_t *)dma_info->dma_ptr->vaddr;
-        dma_info->ioaddr_base = dma_info->dma_ptr->ioaddrs[0];
-    }
-
-    RUN_ON_DEVICE({
-        for (int idx = 0; idx < nr_files; idx++){
-            auto gpu_file = gpu_files__ptr + idx;
-            auto dma_info = (struct DMAInfo *)((uintptr_t)dma_info__ptr + 
-                                                    (idx / dma__per_nvfile) * sizeof(struct DMAInfo));
-
-            // auto dma_info = (struct DMAInfo *)((uintptr_t)dma_info__ptr + idx * sizeof(struct DMAInfo));
-            new (gpu_file)GPUFile(nv_files + idx * nr_device, nr_device, file_size);
-            // new (gpu_file)GPUFile(nv_files + idx * nr_device, static_cast<size_t>(file_size));
-            gpu_file->nvme_page_size = nvme_page_size;
-            gpu_file->block_size = block_size;
-            gpu_file->prp_list__of_total_pages_vaddr = dma_info->vaddr + 
-                                                        (idx % dma__per_nvfile) * (nv_file_size / nvme_page_size);
-            gpu_file->prp_list_ioaddr_base = dma_info->ioaddr_base + 
-                                                (idx % dma__per_nvfile) * (nv_file_size / nvme_page_size) * sizeof(uint64_t);
-            gpu_file->file_id = idx;
-            // geminifs_debug("allocate %d gpu_file, file_id is: %lld\n", idx, gpu_file->file_id);
-        }
-    });
-
-    return gpu_files__ptr;
-}
-
-__host__ GPUFile* 
-geminifs_file_batch_create(std::vector<ControllerPtr> &ctrls, GPUPoolId pool_id, int nr_files, 
-                        size_t block_size, size_t file_size, int cudaDevice){   
-    auto nr_device = ctrls.size();
-    auto nv_file_size = file_size / nr_device;
-    auto nvme_page_size = ctrls[0].get()->page_size;
-    NVMeFile *nv_files = device_batch_open(ctrls, pool_id, block_size, nr_files, file_size, cudaDevice);
-
-    GPUFile * gpu_files__ptr;
-    void *dma_info__ptr;    
-
-    auto dma__per_nvfile = GPU_PAGE_SIZE / (sizeof(uint64_t) * nv_file_size / nvme_page_size);
-    auto total_dma_size = ROUND_UP(nr_files, dma__per_nvfile) / dma__per_nvfile;
-    cuda_check_error(cudaMalloc(&gpu_files__ptr, sizeof(GPUFile) * nr_files));
-    cuda_check_error(cudaMallocManaged(&dma_info__ptr, sizeof(struct DMAInfo) * total_dma_size));
-
-    for (auto idx = 0;idx < total_dma_size; idx ++) {
-        auto *dma_info = (struct DMAInfo *)((uintptr_t)dma_info__ptr + idx * sizeof(struct DMAInfo));
-        dma_info->dma_ptr = createDma(ctrls[idx % nr_device].get()->ctrl, 
-                                        GPU_PAGE_SIZE, cudaDevice);
-        dma_info->vaddr = (uint64_t *)dma_info->dma_ptr->vaddr;
-        dma_info->ioaddr_base = dma_info->dma_ptr->ioaddrs[0];
-    }
-
-    RUN_ON_DEVICE({
-        for (int idx = 0; idx < nr_files; idx++){
-            auto gpu_file = gpu_files__ptr + idx;
-            auto dma_info = (struct DMAInfo *)((uintptr_t)dma_info__ptr + 
-                                                    (idx / dma__per_nvfile) * sizeof(struct DMAInfo));
-
-            // auto dma_info = (struct DMAInfo *)((uintptr_t)dma_info__ptr + idx * sizeof(struct DMAInfo));
-            new (gpu_file)GPUFile(nv_files + idx * nr_device, nr_device, file_size);
-            // new (gpu_file)GPUFile(nv_files + idx * nr_device, static_cast<size_t>(file_size));
-            gpu_file->nvme_page_size = nvme_page_size;
-            gpu_file->block_size = block_size;
-            gpu_file->prp_list__of_total_pages_vaddr = dma_info->vaddr + 
-                                                        (idx % dma__per_nvfile) * (nv_file_size / nvme_page_size);
-            gpu_file->prp_list_ioaddr_base = dma_info->ioaddr_base + 
-                                                (idx % dma__per_nvfile) * (nv_file_size / nvme_page_size) * sizeof(uint64_t);
-            gpu_file->file_id = idx;
-            // geminifs_debug("allocate %d gpu_file, file_id is: %lld\n", idx, gpu_file->file_id);
-        }
-    });
-
-    return gpu_files__ptr;
-}
-
-__host__ GPUFile* 
-geminifs_file_create(std::vector<ControllerPtr> &ctrls, GPUPoolId pool_id, int nr_files, 
-                        size_t block_size, size_t file_size, int cudaDevice){
-    
-    // cuda_check_error(cudaSetDevice(cudaDevice));
-    
-    auto nr_device = ctrls.size();
-    auto nv_file_size = file_size / nr_device;
-    auto nvme_page_size = ctrls[0].get()->page_size;
-    NVMeFile *nv_files = device_batch_open(ctrls, pool_id, block_size, nr_files, file_size, cudaDevice);
-
-    GPUFile * gpu_files__ptr;
-    void *dma_info__ptr;    
-
-    auto dma__per_nvfile = GPU_PAGE_SIZE / (sizeof(uint64_t) * nv_file_size / nvme_page_size);
-    auto total_dma_size = ROUND_UP(nr_files, dma__per_nvfile) / dma__per_nvfile;
-    cuda_check_error(cudaMalloc(&gpu_files__ptr, sizeof(GPUFile) * nr_files));
-    cuda_check_error(cudaMallocManaged(&dma_info__ptr, sizeof(struct DMAInfo) * total_dma_size));
-
-    for (auto idx = 0;idx < total_dma_size; idx ++) {
-        auto *dma_info = (struct DMAInfo *)((uintptr_t)dma_info__ptr + idx * sizeof(struct DMAInfo));
-        dma_info->dma_ptr = createDma(ctrls[idx % nr_device].get()->ctrl, 
-                                        GPU_PAGE_SIZE, cudaDevice);
-        dma_info->vaddr = (uint64_t *)dma_info->dma_ptr->vaddr;
-        dma_info->ioaddr_base = dma_info->dma_ptr->ioaddrs[0];
-    }
-
-    RUN_ON_DEVICE({
-        for (int idx = 0; idx < nr_files; idx++){
-            auto gpu_file = gpu_files__ptr + idx;
-            auto dma_info = (struct DMAInfo *)((uintptr_t)dma_info__ptr + 
-                                                    (idx / dma__per_nvfile) * sizeof(struct DMAInfo));
-
-            // auto dma_info = (struct DMAInfo *)((uintptr_t)dma_info__ptr + idx * sizeof(struct DMAInfo));
-            new (gpu_file)GPUFile(nv_files + idx * nr_device, nr_device, file_size);
-            // new (gpu_file)GPUFile(nv_files + idx * nr_device, static_cast<size_t>(file_size));
-            gpu_file->nvme_page_size = nvme_page_size;
-            gpu_file->block_size = block_size;
-            gpu_file->prp_list__of_total_pages_vaddr = dma_info->vaddr + 
-                                                        (idx % dma__per_nvfile) * (nv_file_size / nvme_page_size);
-            gpu_file->prp_list_ioaddr_base = dma_info->ioaddr_base + 
-                                                (idx % dma__per_nvfile) * (nv_file_size / nvme_page_size) * sizeof(uint64_t);
-            gpu_file->file_id = idx;
-            // geminifs_debug("allocate %d gpu_file, file_id is: %lld\n", idx, gpu_file->file_id);
-        }
-    });
-
-    return gpu_files__ptr;
-}
-
-std::vector<ControllerPtr> host_open_ctrls(struct geminifs_ctrl_params *ctrl_params){
-    
-
-    std::vector<ControllerPtr> ctrls;
-
-    // Check if SNVM control device exists
-    if (!check_snvme_control_exists()) {
-        geminifs_error("Failed to initialize controllers: SNVM kernel module not loaded\n");
-        return ctrls;  // Return empty vector to indicate error
-    }
-
-    // Check if Sys config file exists
-    if (!check_sys_config_exists()) {
-        geminifs_error("Failed to initialize controllers: SNVM kernel module not loaded\n");
-        return ctrls;  // Return empty vector to indicate error
-    }
-
-    std::filesystem::create_directories(ctrl_params->mount_path);
-    std::filesystem::path mount_path(ctrl_params->mount_path);
-
-    for (size_t idx = 0; idx < ctrl_params->pci_addr.size(); idx++){
-        std::filesystem::path this_mount_path = mount_path / 
-                                    ("cuda" + std::to_string(ctrl_params->cudaDevice) + '-' + std::to_string(idx));
-        if (!std::filesystem::exists(this_mount_path)) {
-            std::filesystem::create_directories(this_mount_path);
-        }
-        auto ctrl = new Controller(
-            snvme_control_path,
-            ctrl_params->pci_addr[idx].c_str(),
-            this_mount_path,
-            ctrl_params->ns_id,
-            ctrl_params->cudaDevice,
-            ctrl_params->queueDepth,
-            ctrl_params->numQueues);
-        nvm_info("Opening controller %ld: pci addr %s, mount path %s", 
-                            idx, ctrl_params->pci_addr[idx].c_str(), this_mount_path.c_str());  
-        ctrls.push_back(std::shared_ptr<Controller>(ctrl));
-    }
-
-#ifdef DEBUG
-    for (size_t idx = 0; idx < ctrl_params->pci_addr.size(); idx++) {
-      auto ctrl = ctrls[idx].get();
-      nvm_debug("Opening controller %d: dev path %s, mount path %s", idx,
-               ctrl->dev_path, ctrl->dev_mount_path);
-    }
-#endif
-
-    return std::move(ctrls);
-}
 
 
 
-void  geminifs_nvme_host_close_ctrls(std::vector<ControllerPtr> &ctrls)
-{
-    for (auto &ctrl : ctrls) {
-        if (ctrl) {
-            ctrl.reset();
-        }
-    }
-    ctrls.clear();
-}
+
+
+
+
 
 
 // static inline geminifs_metadata* __geminifs_init(struct geminifs_ctrl_params &ctrl_params, 
@@ -477,178 +164,178 @@ void  geminifs_nvme_host_close_ctrls(std::vector<ControllerPtr> &ctrls)
 // }
 
 
-/*----------------------Xfer-------------------*/
-__global__ void 
-__geminifs_device_batch_xfer(GPUFilePool *global_pool, 
-                            cuda::std::span<GPUFileId> file_ids,
-                            cuda::std::span<uint64_t> ioaddr,
-                            size_t file_offset, 
-                            size_t nbytes, enum FileXferType type){
-    size_t nr_block = gridDim.x;
-    size_t nr_thread_per_block = blockDim.x;
-    assert(nr_block == file_ids.size());
-    assert(nr_thread_per_block == 32);
-    assert(nbytes % GPU_PAGE_SIZE == 0);
+// /*----------------------Xfer-------------------*/
+// __global__ void 
+// __geminifs_device_batch_xfer(GPUFilePool *global_pool, 
+//                             cuda::std::span<GPUFileId> file_ids,
+//                             cuda::std::span<uint64_t> ioaddr,
+//                             size_t file_offset, 
+//                             size_t nbytes, enum FileXferType type){
+//     size_t nr_block = gridDim.x;
+//     size_t nr_thread_per_block = blockDim.x;
+//     assert(nr_block == file_ids.size());
+//     assert(nr_thread_per_block == 32);
+//     assert(nbytes % GPU_PAGE_SIZE == 0);
     
-    size_t nbytes__per_thread = std::max(nbytes / 32, GPU_PAGE_SIZE);
+//     size_t nbytes__per_thread = std::max(nbytes / 32, GPU_PAGE_SIZE);
 
-    int lane = my_lane_id();
-    geminifs_debug("file_ids[blockIdx.x] %ld\n", file_ids[blockIdx.x]);
-    auto file = global_pool->get_file(file_ids[blockIdx.x]);
-    if (lane == 0) {
-        file->scatter_ioaddrs(ioaddr, file_offset, nbytes);
-    }
+//     int lane = my_lane_id();
+//     geminifs_debug("file_ids[blockIdx.x] %ld\n", file_ids[blockIdx.x]);
+//     auto file = global_pool->get_file(file_ids[blockIdx.x]);
+//     if (lane == 0) {
+//         file->scatter_ioaddrs(ioaddr, file_offset, nbytes);
+//     }
 
-    __syncwarp();
-    size_t this_thread_file_offset = file_offset + lane * nbytes__per_thread;
-    if (lane * nbytes__per_thread  + nbytes__per_thread > nbytes) {
-        return;
-    }
+//     __syncwarp();
+//     size_t this_thread_file_offset = file_offset + lane * nbytes__per_thread;
+//     if (lane * nbytes__per_thread  + nbytes__per_thread > nbytes) {
+//         return;
+//     }
 
-    if (type == FILE_XFER_READ) {
-        file->read_in(this_thread_file_offset, nbytes__per_thread);
-    } else {
-        file->write_out(this_thread_file_offset, nbytes__per_thread);
-    }
-}
+//     if (type == FILE_XFER_READ) {
+//         file->read_in(this_thread_file_offset, nbytes__per_thread);
+//     } else {
+//         file->write_out(this_thread_file_offset, nbytes__per_thread);
+//     }
+// }
 
-__global__ void 
-__geminifs_device_batch_xfer_once(GPUFilePool *global_pool, 
-                            GPUFileId file_id, uint64_t ioaddr,
-                            size_t file_offset, size_t nbytes, 
-                            enum FileXferType type){
-    size_t nr_block = gridDim.x;
-    size_t nr_thread_per_block = blockDim.x;
-    assert(nr_block == 1);
-    assert(nr_thread_per_block == 32);
-    assert(nbytes % GPU_PAGE_SIZE == 0);
+// __global__ void 
+// __geminifs_device_batch_xfer_once(GPUFilePool *global_pool, 
+//                             GPUFileId file_id, uint64_t ioaddr,
+//                             size_t file_offset, size_t nbytes, 
+//                             enum FileXferType type){
+//     size_t nr_block = gridDim.x;
+//     size_t nr_thread_per_block = blockDim.x;
+//     assert(nr_block == 1);
+//     assert(nr_thread_per_block == 32);
+//     assert(nbytes % GPU_PAGE_SIZE == 0);
     
-    size_t nbytes__per_thread = std::max(nbytes / 32, GPU_PAGE_SIZE);
+//     size_t nbytes__per_thread = std::max(nbytes / 32, GPU_PAGE_SIZE);
 
-    int lane = my_lane_id();
-    auto file = global_pool->get_file(file_id);
-    if (lane == 0) {
-        file->scatter_ioaddrs(ioaddr, file_offset, nbytes);
-    }
+//     int lane = my_lane_id();
+//     auto file = global_pool->get_file(file_id);
+//     if (lane == 0) {
+//         file->scatter_ioaddrs(ioaddr, file_offset, nbytes);
+//     }
 
-    __syncwarp();
-    size_t this_thread_file_offset = file_offset + lane * nbytes__per_thread;
-    if (lane * nbytes__per_thread  + nbytes__per_thread > nbytes) {
-        return;
-    }
+//     __syncwarp();
+//     size_t this_thread_file_offset = file_offset + lane * nbytes__per_thread;
+//     if (lane * nbytes__per_thread  + nbytes__per_thread > nbytes) {
+//         return;
+//     }
 
-    if (type == FILE_XFER_READ) {
-        file->read_in(this_thread_file_offset, nbytes__per_thread);
-    } else {
-        file->write_out(this_thread_file_offset, nbytes__per_thread);
-    }
-}
+//     if (type == FILE_XFER_READ) {
+//         file->read_in(this_thread_file_offset, nbytes__per_thread);
+//     } else {
+//         file->write_out(this_thread_file_offset, nbytes__per_thread);
+//     }
+// }
 
-__global__ void 
-__geminifs_device_batch_xfer_once2(GPUFilePool *global_pool, 
-                            GPUFileId file_id, cuda::std::span<uint64_t> ioaddr,
-                            size_t file_offset, size_t nbytes, 
-                            enum FileXferType type){
-    size_t nr_block = gridDim.x;
-    size_t nr_thread_per_block = blockDim.x;
-    assert(nr_block == 1);
-    assert(nr_thread_per_block == 32);
-    assert(nbytes % GPU_PAGE_SIZE == 0);
+// __global__ void 
+// __geminifs_device_batch_xfer_once2(GPUFilePool *global_pool, 
+//                             GPUFileId file_id, cuda::std::span<uint64_t> ioaddr,
+//                             size_t file_offset, size_t nbytes, 
+//                             enum FileXferType type){
+//     size_t nr_block = gridDim.x;
+//     size_t nr_thread_per_block = blockDim.x;
+//     assert(nr_block == 1);
+//     assert(nr_thread_per_block == 32);
+//     assert(nbytes % GPU_PAGE_SIZE == 0);
     
-    size_t nbytes__per_thread = std::max(nbytes / 32, GPU_PAGE_SIZE);
+//     size_t nbytes__per_thread = std::max(nbytes / 32, GPU_PAGE_SIZE);
 
-    int lane = my_lane_id();
-    auto file = global_pool->get_file(file_id);
-    if (lane == 0) {
-        file->scatter_ioaddrs(ioaddr, file_offset, nbytes);
-    }
+//     int lane = my_lane_id();
+//     auto file = global_pool->get_file(file_id);
+//     if (lane == 0) {
+//         file->scatter_ioaddrs(ioaddr, file_offset, nbytes);
+//     }
 
-    __syncwarp();
-    size_t this_thread_file_offset = file_offset + lane * nbytes__per_thread;
-    if (lane * nbytes__per_thread  + nbytes__per_thread > nbytes) {
-        return;
-    }
+//     __syncwarp();
+//     size_t this_thread_file_offset = file_offset + lane * nbytes__per_thread;
+//     if (lane * nbytes__per_thread  + nbytes__per_thread > nbytes) {
+//         return;
+//     }
 
-    if (type == FILE_XFER_READ) {
-        file->read_in(this_thread_file_offset, nbytes__per_thread);
-    } else {
-        file->write_out(this_thread_file_offset, nbytes__per_thread);
-    }
-}
+//     if (type == FILE_XFER_READ) {
+//         file->read_in(this_thread_file_offset, nbytes__per_thread);
+//     } else {
+//         file->write_out(this_thread_file_offset, nbytes__per_thread);
+//     }
+// }
 
-__global__ void 
-__geminifs_device_batch_xfer(GPUFilePool *global_pool, 
-                            cuda::std::span<GPUFileId> file_ids,
-                            cuda::std::span<uint64_t> block_ids,
-                            cuda::std::span<uint64_t> ioaddr, 
-                            size_t per_chuck_size, // per_chuck_size = chuck_size * block_size
-                            size_t file_offset, enum FileXferType type){
-    size_t nr_block = gridDim.x;
-    size_t nr_thread_per_block = blockDim.x;
-    assert(nr_block == file_ids.size());
-    assert(nr_thread_per_block == 32);
-    assert(per_chuck_size % global_pool->file_block_size == 0);
+// __global__ void 
+// __geminifs_device_batch_xfer(GPUFilePool *global_pool, 
+//                             cuda::std::span<GPUFileId> file_ids,
+//                             cuda::std::span<uint64_t> block_ids,
+//                             cuda::std::span<uint64_t> ioaddr, 
+//                             size_t per_chuck_size, // per_chuck_size = chuck_size * block_size
+//                             size_t file_offset, enum FileXferType type){
+//     size_t nr_block = gridDim.x;
+//     size_t nr_thread_per_block = blockDim.x;
+//     assert(nr_block == file_ids.size());
+//     assert(nr_thread_per_block == 32);
+//     assert(per_chuck_size % global_pool->file_block_size == 0);
     
-    size_t nbytes__per_thread = std::max(per_chuck_size / 32, global_pool->file_block_size);
+//     size_t nbytes__per_thread = std::max(per_chuck_size / 32, global_pool->file_block_size);
 
-    int lane = my_lane_id();
-    auto file = global_pool->get_file(file_ids[blockIdx.x]);
-    if (lane == 0) {
-        // fixme
-        file->scatter_ioaddrs(ioaddr, file_offset, per_chuck_size);
-        // file
-    }
+//     int lane = my_lane_id();
+//     auto file = global_pool->get_file(file_ids[blockIdx.x]);
+//     if (lane == 0) {
+//         // fixme
+//         file->scatter_ioaddrs(ioaddr, file_offset, per_chuck_size);
+//         // file
+//     }
 
-    __syncwarp();
-    size_t this_thread_file_offset = file_offset + lane * nbytes__per_thread;
-    if (lane * nbytes__per_thread  + nbytes__per_thread > per_chuck_size) {
-        return;
-    }
+//     __syncwarp();
+//     size_t this_thread_file_offset = file_offset + lane * nbytes__per_thread;
+//     if (lane * nbytes__per_thread  + nbytes__per_thread > per_chuck_size) {
+//         return;
+//     }
 
-    if (type == FILE_XFER_READ) {
-        file->read_in(this_thread_file_offset, nbytes__per_thread);
-    } else {
-        file->write_out(this_thread_file_offset, nbytes__per_thread);
-    }
-}
+//     if (type == FILE_XFER_READ) {
+//         file->read_in(this_thread_file_offset, nbytes__per_thread);
+//     } else {
+//         file->write_out(this_thread_file_offset, nbytes__per_thread);
+//     }
+// }
 
 
-__global__ void 
-__geminifs_device_batch_xfer(GPUFilePool *global_pool, 
-                            cuda::std::span<GPUFileId> file_ids,
-                            cuda::std::span<uint64_t> block_ids,
-                            uint64_t ioaddr, size_t per_chuck_size, // per_chuck_size = chuck_size * block_size
-                            size_t file_offset, enum FileXferType type){
-    size_t nr_block = gridDim.x;
-    size_t nr_thread_per_block = blockDim.x;
-    assert(nr_block == file_ids.size());
-    assert(nr_thread_per_block == 32);
-    assert(per_chuck_size % global_pool->file_block_size == 0);
+// __global__ void 
+// __geminifs_device_batch_xfer(GPUFilePool *global_pool, 
+//                             cuda::std::span<GPUFileId> file_ids,
+//                             cuda::std::span<uint64_t> block_ids,
+//                             uint64_t ioaddr, size_t per_chuck_size, // per_chuck_size = chuck_size * block_size
+//                             size_t file_offset, enum FileXferType type){
+//     size_t nr_block = gridDim.x;
+//     size_t nr_thread_per_block = blockDim.x;
+//     assert(nr_block == file_ids.size());
+//     assert(nr_thread_per_block == 32);
+//     assert(per_chuck_size % global_pool->file_block_size == 0);
     
-    size_t nbytes__per_thread = std::max(per_chuck_size / 32, global_pool->file_block_size);
-    int lane = my_lane_id();
-    auto file = global_pool->get_file(file_ids[blockIdx.x]);
+//     size_t nbytes__per_thread = std::max(per_chuck_size / 32, global_pool->file_block_size);
+//     int lane = my_lane_id();
+//     auto file = global_pool->get_file(file_ids[blockIdx.x]);
     
-    if (lane == 0) {
-        auto this_block_ioaddr = ioaddr + block_ids[blockIdx.x] * per_chuck_size;
-        file->scatter_ioaddrs(this_block_ioaddr, file_offset, per_chuck_size);
-    }
-    __syncwarp();
+//     if (lane == 0) {
+//         auto this_block_ioaddr = ioaddr + block_ids[blockIdx.x] * per_chuck_size;
+//         file->scatter_ioaddrs(this_block_ioaddr, file_offset, per_chuck_size);
+//     }
+//     __syncwarp();
 
 
-    size_t this_thread_file_offset = file_offset + lane * nbytes__per_thread;
-    if (lane * nbytes__per_thread  + nbytes__per_thread > per_chuck_size) {
-        return;
-    }
-    if (type == FILE_XFER_READ) {
-        // geminifs_debug("read_in, file[%p]:this_thread_file_offset %ld, nbytes__per_thread %ld\n", file, this_thread_file_offset, nbytes__per_thread);
-        file->read_in(this_thread_file_offset, nbytes__per_thread);
-        // geminifs_debug("read_in done\n");
-    } else {
-        file->write_out(this_thread_file_offset, nbytes__per_thread);
-    }
-    global_pool->put_file(file_ids[blockIdx.x]);
-}
+//     size_t this_thread_file_offset = file_offset + lane * nbytes__per_thread;
+//     if (lane * nbytes__per_thread  + nbytes__per_thread > per_chuck_size) {
+//         return;
+//     }
+//     if (type == FILE_XFER_READ) {
+//         // geminifs_debug("read_in, file[%p]:this_thread_file_offset %ld, nbytes__per_thread %ld\n", file, this_thread_file_offset, nbytes__per_thread);
+//         file->read_in(this_thread_file_offset, nbytes__per_thread);
+//         // geminifs_debug("read_in done\n");
+//     } else {
+//         file->write_out(this_thread_file_offset, nbytes__per_thread);
+//     }
+//     global_pool->put_file(file_ids[blockIdx.x]);
+// }
 
 
 /**
@@ -670,77 +357,77 @@ static inline bool is_device_pointer(const void* ptr, const char* error_msg = nu
 
 
 
-static inline bool __geimifs_device_one_layer_xfer(
-    const torch::Tensor &cached_file_ids,   //shape = [num_cached_files,]
-    const torch::Tensor &inner_block_ids,  // shape = [num_cached_files,]
-    const torch::Tensor &key_cache,         // shape = [max_num_block, block_size, num_heads, head_size]
-    const torch::Tensor &value_cache,       // shape = [max_num_block, block_size, num_heads, head_size]
-    int64_t start_layer_idx, enum FileXferType type,
-    struct geminifs_metadata *metadata, 
-    cudaStream_t stream) {
+// static inline bool __geimifs_device_one_layer_xfer(
+//     const torch::Tensor &cached_file_ids,   //shape = [num_cached_files,]
+//     const torch::Tensor &inner_block_ids,  // shape = [num_cached_files,]
+//     const torch::Tensor &key_cache,         // shape = [max_num_block, block_size, num_heads, head_size]
+//     const torch::Tensor &value_cache,       // shape = [max_num_block, block_size, num_heads, head_size]
+//     int64_t start_layer_idx, enum FileXferType type,
+//     struct geminifs_metadata *metadata, 
+//     cudaStream_t stream) {
     
-    int max_num_block = key_cache.size(0);
-    int block_size = key_cache.size(1);
-    int num_heads = key_cache.size(2);
-    int head_size = key_cache.size(3);
+//     int max_num_block = key_cache.size(0);
+//     int block_size = key_cache.size(1);
+//     int num_heads = key_cache.size(2);
+//     int head_size = key_cache.size(3);
     
-    uint64_t block_nbytes = block_size * num_heads * head_size * key_cache.element_size();
-    uint64_t layer_stride = 2 * block_nbytes;
-    uint64_t key_file_offset = start_layer_idx * layer_stride;
-    uint64_t value_file_offset = key_file_offset + block_nbytes;
+//     uint64_t block_nbytes = block_size * num_heads * head_size * key_cache.element_size();
+//     uint64_t layer_stride = 2 * block_nbytes;
+//     uint64_t key_file_offset = start_layer_idx * layer_stride;
+//     uint64_t value_file_offset = key_file_offset + block_nbytes;
 
-    if (block_nbytes & (metadata->file_block_size - 1)) { // to avoid xfer to other page
-        geminifs_error("block_nbytes %ld is not aligned to file block size\n", block_nbytes);
-        return false;
-    }
+//     if (block_nbytes & (metadata->file_block_size - 1)) { // to avoid xfer to other page
+//         geminifs_error("block_nbytes %ld is not aligned to file block size\n", block_nbytes);
+//         return false;
+//     }
 
-    struct geminifs_dma *key_dma_ctx, *value_dma_ctx;
-    if ((key_dma_ctx = geminifs_get_dma(key_cache)) == nullptr) {
-        geminifs_error("geminifs_device_xfer_wrapper_cuda: key_cache.data_ptr() %p has not been initialized\n", key_cache.data_ptr());
-        return false;
-    }
+//     struct geminifs_dma *key_dma_ctx, *value_dma_ctx;
+//     if ((key_dma_ctx = geminifs_get_dma(key_cache)) == nullptr) {
+//         geminifs_error("geminifs_device_xfer_wrapper_cuda: key_cache.data_ptr() %p has not been initialized\n", key_cache.data_ptr());
+//         return false;
+//     }
 
-    if ((value_dma_ctx = geminifs_get_dma(value_cache)) == nullptr) {
-        geminifs_error("geminifs_device_xfer_wrapper_cuda: value_cache.data_ptr() %p has not been initialized\n", value_cache.data_ptr());
-        return false;
-    }
+//     if ((value_dma_ctx = geminifs_get_dma(value_cache)) == nullptr) {
+//         geminifs_error("geminifs_device_xfer_wrapper_cuda: value_cache.data_ptr() %p has not been initialized\n", value_cache.data_ptr());
+//         return false;
+//     }
 
-    dim3 grid(cached_file_ids.numel());
-    dim3 block(32);
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(key_cache));
+//     dim3 grid(cached_file_ids.numel());
+//     dim3 block(32);
+//     const at::cuda::OptionalCUDAGuard device_guard(device_of(key_cache));
 
-    cuda::std::span<GPUFileId> file_ids = {(GPUFileId *)cached_file_ids.data_ptr(), (size_t)cached_file_ids.numel()};
-    cuda::std::span<uint64_t> block_ids = {(uint64_t *)inner_block_ids.data_ptr(), (size_t)inner_block_ids.numel()};
+//     cuda::std::span<GPUFileId> file_ids = {(GPUFileId *)cached_file_ids.data_ptr(), (size_t)cached_file_ids.numel()};
+//     cuda::std::span<uint64_t> block_ids = {(uint64_t *)inner_block_ids.data_ptr(), (size_t)inner_block_ids.numel()};
 
-    auto * pool = metadata->global_pool.get();
-    if (key_dma_ctx->dma_ptr->contiguous) {
-        __geminifs_device_batch_xfer<<<grid, block, 0, stream>>>
-                        (pool, file_ids, block_ids, key_dma_ctx->dma_ptr->ioaddrs[0], 
-                            block_nbytes, key_file_offset, type);
-    }
+//     auto * pool = metadata->global_pool.get();
+//     if (key_dma_ctx->dma_ptr->contiguous) {
+//         __geminifs_device_batch_xfer<<<grid, block, 0, stream>>>
+//                         (pool, file_ids, block_ids, key_dma_ctx->dma_ptr->ioaddrs[0], 
+//                             block_nbytes, key_file_offset, type);
+//     }
     
-    if (value_dma_ctx->dma_ptr->contiguous) {
-        __geminifs_device_batch_xfer<<<grid, block, 0, stream>>>
-                        (pool, file_ids, block_ids, value_dma_ctx->dma_ptr->ioaddrs[0], 
-                            block_nbytes, value_file_offset, type);
-    }
+//     if (value_dma_ctx->dma_ptr->contiguous) {
+//         __geminifs_device_batch_xfer<<<grid, block, 0, stream>>>
+//                         (pool, file_ids, block_ids, value_dma_ctx->dma_ptr->ioaddrs[0], 
+//                             block_nbytes, value_file_offset, type);
+//     }
     
-    if (!key_dma_ctx->dma_ptr->contiguous) { // assert that ioaddrs is not null
-        __geminifs_device_batch_xfer<<<grid, block, 0, stream>>>
-                        (pool, file_ids, block_ids, 
-                        {key_dma_ctx->ioaddrs, key_dma_ctx->dma_ptr->n_ioaddrs}, 
-                        block_nbytes, key_file_offset, type);
-    }   
+//     if (!key_dma_ctx->dma_ptr->contiguous) { // assert that ioaddrs is not null
+//         __geminifs_device_batch_xfer<<<grid, block, 0, stream>>>
+//                         (pool, file_ids, block_ids, 
+//                         {key_dma_ctx->ioaddrs, key_dma_ctx->dma_ptr->n_ioaddrs}, 
+//                         block_nbytes, key_file_offset, type);
+//     }   
     
-    if (!value_dma_ctx->dma_ptr->contiguous) { // assert that ioaddrs is not null
-        __geminifs_device_batch_xfer<<<grid, block, 0, stream>>>
-                        (pool, file_ids, block_ids, 
-                        {value_dma_ctx->ioaddrs, value_dma_ctx->dma_ptr->n_ioaddrs}, 
-                        block_nbytes, value_file_offset, type);
-    }
+//     if (!value_dma_ctx->dma_ptr->contiguous) { // assert that ioaddrs is not null
+//         __geminifs_device_batch_xfer<<<grid, block, 0, stream>>>
+//                         (pool, file_ids, block_ids, 
+//                         {value_dma_ctx->ioaddrs, value_dma_ctx->dma_ptr->n_ioaddrs}, 
+//                         block_nbytes, value_file_offset, type);
+//     }
 
-    return true;
-}
+//     return true;
+// }
 
 // static inline bool geminifs_device_mutiple_layer_xfer(
 //     const torch::Tensor& cached_file_ids,  // shape = [num_cached_files,]

@@ -39,7 +39,7 @@ public:
     std::string mount_path;        // Mount path
     
     // GPU-side queue management helper
-    QueueAcquireHelper* d_queue_acquire_helper;
+    QueueAcquireHelper *d_queue_acquire_helper;
 
     NVMeController(const ControllerPtr& ctrl, std::unique_ptr<FileManager> fm, const std::string& path)
         : controller(ctrl), file_manager(std::move(fm)), mount_path(path), is_initialized_(false), d_queue_acquire_helper(nullptr) {}
@@ -67,68 +67,6 @@ public:
     // Check if controller is properly initialized
     bool is_initialized() const { return is_initialized_; }
 
-    // ============================================================================
-    // GPU Device-side NVMe I/O Interface (Member Functions)
-    // ============================================================================
-    
-    /**
-     * @brief GPU device-side read/write interface for NVMeController
-     * 
-     * This function is called from GPU kernels to perform direct NVMe I/O operations.
-     * It follows the workflow: __get_nvmeofst -> acquire_queue -> issue_nvme_cmd -> poll -> release_queue
-     * 
-     * @param device_fd Device file descriptor (GPU memory pointer to NVMeFile structure)
-     * @param file_offset File offset to read/write from (must be NVMe page aligned)
-     * @param length Number of bytes to transfer (must be NVMe page aligned)
-     * @param prp1 First PRP (Physical Region Page) address
-     * @param prp2 Second PRP address (0 for single page, or prp list addr for multi-page)
-     * @param type Transfer type: FILE_XFER_READ or FILE_XFER_WRITE
-     * @return 0 on success, negative error code on failure
-     */
-    __device__ int device_rw(
-        dev_fd_t device_fd,
-        size_t file_offset,
-        size_t length,
-        uint64_t prp1,
-        uint64_t prp2,
-        FileXferType type
-    );
-
-    /**
-     * @brief Convenience wrapper for GPU device-side read operations
-     * 
-     * @param device_fd Device file descriptor
-     * @param file_offset File offset to read from
-     * @param length Number of bytes to read
-     * @param prp1 First PRP address
-     * @param prp2 Second PRP address
-     * @return 0 on success, negative error code on failure
-     */
-    __device__ int device_read(
-        dev_fd_t device_fd,
-        size_t file_offset,
-        size_t length,
-        uint64_t prp1,
-        uint64_t prp2
-    );
-
-    /**
-     * @brief Convenience wrapper for GPU device-side write operations
-     * 
-     * @param device_fd Device file descriptor
-     * @param file_offset File offset to write to
-     * @param length Number of bytes to write
-     * @param prp1 First PRP address
-     * @param prp2 Second PRP address
-     * @return 0 on success, negative error code on failure
-     */
-    __device__ int device_write(
-        dev_fd_t device_fd,
-        size_t file_offset,
-        size_t length,
-        uint64_t prp1,
-        uint64_t prp2
-    );
 
 
 
