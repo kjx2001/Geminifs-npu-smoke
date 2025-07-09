@@ -1,4 +1,3 @@
-
 #ifndef __BENCHMARK_CTRL_H__
 #define __BENCHMARK_CTRL_H__
 
@@ -27,6 +26,8 @@
 #include <cuda/atomic>
 #include "file.h"
 #include "queue.h"
+
+// Forward declarations
 
 #define MAX_QUEUES 1024
 #define NVM_CTRL_IOQ_MINNUM    64
