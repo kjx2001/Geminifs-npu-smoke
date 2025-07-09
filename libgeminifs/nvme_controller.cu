@@ -5,11 +5,11 @@
 #include <cuda_runtime.h>
 #include <unistd.h>
 #include <cassert>
-#include <cuda_runtime.h>
 #include <sys/stat.h>
 #include <string.h>
 #include <errno.h>
-
+#include <filesystem>
+#include <fcntl.h>  // For fallocate
 // Static paths for system components
 static char snvme_control_path[] = "/dev/snvm_control";
 static char sys_config_path[] = "/mnt/sys_GPU_NVMe_topology.json";
@@ -42,62 +42,6 @@ __global__ void init_nvme_file_kernel(NVMe_File* d_nvme_file,
     }
 }
 
-// Helper function to create directories recursively
-static int create_directories(const std::string& path) {
-    if (path.empty()) return 0;
-    
-    // Check if directory already exists
-    struct stat st;
-    if (stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) {
-        return 0; // Directory already exists
-    }
-    
-    // Try to create the directory
-    if (mkdir(path.c_str(), 0755) == 0) {
-        return 0; // Successfully created
-    }
-    
-    // If failed and it's not because parent doesn't exist, return error
-    if (errno != ENOENT) {
-        return -1;
-    }
-    
-    // Find parent directory
-    size_t pos = path.find_last_of('/');
-    if (pos == std::string::npos || pos == 0) {
-        return -1; // Can't find parent or reached root
-    }
-    
-    // Recursively create parent
-    std::string parent = path.substr(0, pos);
-    if (create_directories(parent) != 0) {
-        return -1;
-    }
-    
-    // Try to create this directory again
-    return mkdir(path.c_str(), 0755);
-}
-
-// Helper function to check if file exists
-static bool file_exists(const std::string& path) {
-    struct stat st;
-    return stat(path.c_str(), &st) == 0;
-}
-
-// Helper function to remove file
-static bool remove_file(const std::string& path) {
-    return unlink(path.c_str()) == 0;
-}
-
-// Helper function to join paths
-static std::string join_path(const std::string& base, const std::string& filename) {
-    if (base.empty()) return filename;
-    if (base.back() == '/') {
-        return base + filename;
-    } else {
-        return base + "/" + filename;
-    }
-}
 
 
 NVMeController::NVMeController(const nvme_ctrl_param& params) : is_initialized_(false), d_queue_acquire_helper(nullptr) {
@@ -105,7 +49,7 @@ NVMeController::NVMeController(const nvme_ctrl_param& params) : is_initialized_(
     mount_path = params.mount_path;
     
     // Create mount directory if it doesn't exist
-    create_directories(mount_path);
+    std::filesystem::create_directories(mount_path);
     
     // Initialize single controller using the provided PCI address
     controller = open_single_controller(params.pci_addr, params);
@@ -210,9 +154,10 @@ void * NVMeController::g_open(std::string filename, size_t file_size, uint32_t o
     
     if (file_exists_in_log) {
         // File exists in log, check if physical file exists too
-        std::string file_path = join_path(controller->dev_mount_path, filename);
+        std::filesystem::path file_path = controller->dev_mount_path;
+        file_path = file_path / filename;
         
-        if (file_exists(file_path)) {
+        if (std::filesystem::exists(file_path)) {
             // Both exist, open existing file
             if (o_flag & O_HOST) {
                 result_fd = host_file_open_managed(file_path, O_RDWR);
@@ -240,12 +185,13 @@ void * NVMeController::g_open(std::string filename, size_t file_size, uint32_t o
     
     if (!file_exists_in_log) {
         // File doesn't exist in log, create new file
-        std::string file_path = join_path(controller->dev_mount_path, filename);
-        
-        if (file_exists(file_path)) {
+        std::filesystem::path file_path = controller->dev_mount_path;
+        file_path = file_path / filename;
+
+        if (std::filesystem::exists(file_path)) {
             geminifs_debug("g_open: Physical file exists but not in log, recreating and adjusting size\n");
             // Remove existing physical file as required by spec
-            remove_file(file_path);
+            std::filesystem::remove(file_path);
         }
         
         // Create new file
@@ -263,7 +209,7 @@ void * NVMeController::g_open(std::string filename, size_t file_size, uint32_t o
                 geminifs_error("g_open: Failed to create file record in log for '%s'\n", filename.c_str());
                 // Clean up the created file using managed close function
                 host_file_close_managed((host_fd_t)result_fd);
-                remove_file(file_path);
+                std::filesystem::remove(file_path);
                 return nullptr;
             }
             
@@ -283,7 +229,7 @@ void * NVMeController::g_open(std::string filename, size_t file_size, uint32_t o
                 geminifs_error("g_open: Failed to create file record in log for '%s'\n", filename.c_str());
                 // Clean up the created device file
                 device_file_close_managed((dev_fd_t)result_fd);
-                remove_file(file_path);
+                std::filesystem::remove(file_path);
                 return nullptr;
             }
             
@@ -334,17 +280,19 @@ host_fd_t NVMeController::host_file_create_managed(int block_size, size_t file_s
         return nullptr;
     }
     
-    std::string dir_path = controller->dev_mount_path;
-    create_directories(dir_path);
-    std::string file_path = join_path(dir_path, filename);
+    std::filesystem::path dev_mount_path(controller->dev_mount_path);
+    std::filesystem::path dir_path = dev_mount_path;
+    std::filesystem::create_directories(dir_path);
+    std::filesystem::path file_path = dir_path / filename;
     
     // Initialize header
     hdr->magic_num = the_geminiFS_magic.magic_num;
     hdr->virtual_space_size = file_size;
-    hdr->block_bit = one_nr__of__binary_int(block_size) - 1;
+    hdr->block_bit = one_nr__of__binary_int(block_size - 1) ;
     hdr->nr_l1 = file_size / block_size;
     hdr->first_block_base = ROUND_UP(sizeof(struct geminiFS_hdr) + sizeof(nvme_ofst_t) * hdr->nr_l1, block_size);
-    
+    // printf("host_file_create_managed: blck_bit %u, block_size %u, file_size %zu, hdr_size %zu\n", 
+    //        hdr->block_bit, block_size, file_size, hdr_size);
     // Open file
     int fd = open(file_path.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0666);
     if (fd < 0) {
@@ -353,14 +301,15 @@ host_fd_t NVMeController::host_file_create_managed(int block_size, size_t file_s
         return nullptr;
     }
     
-    // Set file size
-    if (ftruncate(fd, hdr_size + file_size) != 0) {
-        geminifs_error("host_file_create_managed: Failed to set file size\n");
+    // Set file size using fallocate to actually allocate space
+    if (fallocate(fd, 0, 0, hdr_size + file_size) != 0) {
+        geminifs_error("host_file_create_managed: Failed to allocate file space\n");
         close(fd);
         free(hdr);
         return nullptr;
     }
-    
+        // printf("host_file_create_managed: blck_bit %u, block_size %u, file_size %zu, hdr_size %zu\n", 
+        //    hdr->block_bit, block_size, file_size, hdr_size);
     // Write the header
     if (lseek(fd, 0, SEEK_SET) == (off_t)(-1)) {
         geminifs_error("host_file_create_managed: Failed to seek to beginning of file\n");
@@ -543,13 +492,15 @@ dev_fd_t NVMeController::device_file_open_managed(const std::string& filename, s
     }
     
     // Build file path
-    std::string file_path = join_path(controller->dev_mount_path, filename);
-    
+    std::filesystem::path file_path = controller->dev_mount_path;
+    file_path = file_path / filename;
+
     // Check if physical file exists
-    if (!file_exists(file_path)) {
+    if (!std::filesystem::exists(file_path)) {
         geminifs_error("device file open managed: Physical file '%s' not found\n", file_path.c_str());
         return nullptr;
     }
+    
     
     // Open the host file
     host_fd_t host_fd = host_file_open_managed(file_path, O_RDWR);
@@ -737,12 +688,13 @@ void NVMeController::cleanup_device_files() {
 
 ControllerPtr NVMeController::open_single_controller(const std::string& pci_addr, const nvme_ctrl_param& params) {
     // Create mount path for this specific controller
-    std::string this_mount_path = params.mount_path;
+    std::filesystem::path mount_path(params.mount_path);
+    std::filesystem::path this_mount_path = mount_path;
 
-    if (!file_exists(this_mount_path)) {
-        create_directories(this_mount_path);
+    if (!std::filesystem::exists(this_mount_path)) {
+        std::filesystem::create_directories(this_mount_path);
     }
-    
+
     // Create and initialize controller
     ControllerPtr ctrl = std::make_shared<Controller>(
         snvme_control_path, 
@@ -813,20 +765,26 @@ bool NVMeController::device_file_delete_all_files_managed() {
         geminifs_debug("device_file_delete_all_files_managed: Processing file '%s'\n", filename.c_str());
         
         // Build full path to the physical file
-        std::string file_path = join_path(controller->dev_mount_path, filename);
+        std::filesystem::path file_path = controller->dev_mount_path;
+        file_path = file_path / filename;
         
         bool physical_file_deleted = false;
         bool log_entry_deleted = false;
         
         // Try to delete the physical file if it exists
-        if (file_exists(file_path)) {
-            if (remove_file(file_path)) {
-                geminifs_debug("device_file_delete_all_files_managed: Successfully deleted physical file '%s'\n", 
-                               file_path.c_str());
-                physical_file_deleted = true;
-            } else {
-                geminifs_error("device_file_delete_all_files_managed: Failed to delete physical file '%s'\n", 
-                               file_path.c_str());
+        if (std::filesystem::exists(file_path)) {
+            try {
+                if (std::filesystem::remove(file_path)) {
+                    geminifs_debug("device_file_delete_all_files_managed: Successfully deleted physical file '%s'\n", 
+                                   file_path.c_str());
+                    physical_file_deleted = true;
+                } else {
+                    geminifs_error("device_file_delete_all_files_managed: Failed to delete physical file '%s'\n", 
+                                   file_path.c_str());
+                }
+            } catch (const std::filesystem::filesystem_error& e) {
+                geminifs_error("device_file_delete_all_files_managed: Exception while deleting physical file '%s': %s\n", 
+                               file_path.c_str(), e.what());
             }
         } else {
             geminifs_debug("device_file_delete_all_files_managed: Physical file '%s' does not exist\n", 
