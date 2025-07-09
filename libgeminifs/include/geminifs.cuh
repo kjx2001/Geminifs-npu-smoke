@@ -17,9 +17,9 @@
 #include <atomic>
 #include <filesystem>
 #include "nvme_file.h"
-#include "nvme_controller.h"
+#include "nvme_controller.cuh"
 #include "geminifs_mem.h"
-#include "gpu_controller.h"
+#include "gpu_controller.cuh"
 
 using ControllerPtr = std::shared_ptr<Controller>;
 

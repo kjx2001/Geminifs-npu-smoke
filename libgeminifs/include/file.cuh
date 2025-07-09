@@ -55,6 +55,7 @@ private:
     Controller *ctrl; // represent one NVMe controller
     struct geminiFS_hdr *hdr;  // static header for get NVMeFile cls
     friend class GPUFile;
+    friend class NVMeController;  // Allow NVMeController to access private members
 
 
     // need optimized use extend tree
@@ -180,6 +181,84 @@ public:
         geminifs_info("nvme_cmds %p, max_nvme_cmds %ld, nvme_page_size %ld\n", 
             this->nvme_cmds, this->max_nvme_cmds, this->nvme_page_size);
         geminifs_info("cids %p, sq_poss %p\n", this->cids, this->sq_poss);
+    }
+};
+
+
+class NVMe_File{
+
+private: 
+    Controller *ctrl; // represent one NVMe controller
+    struct geminiFS_hdr *hdr;  // static header for get NVMeFile cls
+   
+
+    __forceinline__ __device__ nvme_ofst_t __get_nvmeofst(vaddr_t va) {
+        assert(hdr != nullptr);
+        uint64_t l1_idx = va >> hdr->block_bit;
+        return l1_idx < hdr->nr_l1 ? hdr->l1[l1_idx] : 0;
+    }
+
+    __forceinline__ __device__ void nvme_xfer(size_t file_offset, size_t nbytes,
+         uint64_t prp1, uint64_t prp2, FileXferType type)
+    {
+        auto nvme_page_size = this->nvme_page_size;
+
+
+        auto queue_acquire_helper = this->queue_acquire_helper;
+        assert(nbytes % nvme_page_size == 0);
+        assert(file_offset % nvme_page_size == 0);
+        nvme_ofst_t nvme_ofst = __get_nvmeofst(file_offset);
+        uint64_t starting_lba = nvme_ofst >> hqps_block_size_log;
+        int queue = queue_acquire_helper->acquire_queue();
+        QueuePair* qp = &ctrl->d_qps[queue];
+
+        uint64_t n_blocks = nbytes >> hqps_block_size_log;
+        uint16_t cid;
+        uint16_t sq_pos;
+
+        queue_acquire_helper->issue_nvme_cmd(qp,
+            prp1,
+            prp2, // fixme
+            nbytes,
+            starting_lba,
+            type == FILE_XFER_READ ? NVM_IO_READ : NVM_IO_WRITE,
+            &cid);
+        queue_acquire_helper->poll(qp,cid);
+    }
+
+
+public:
+    void *parent;
+    size_t max_nvme_cmds;
+    size_t nvme_page_size;
+    size_t block_size;
+    size_t file_size;
+   
+    int hqps_block_size_log;
+    QueueAcquireHelper *queue_acquire_helper;
+
+    __forceinline__ __device__ NVMe_File(Controller * ctrl_, 
+                                        struct geminiFS_hdr *hdr_): ctrl(ctrl_), hdr(hdr_) { }
+
+
+    // Public method to get NVMe offset (wrapper for private __get_nvmeofst)
+    __forceinline__ __device__ nvme_ofst_t get_nvme_offset(vaddr_t va) const {
+        if (hdr != nullptr) {
+            uint64_t l1_idx = va >> hdr->block_bit;
+            return (l1_idx < hdr->nr_l1) ? hdr->l1[l1_idx] : 0;
+        }
+        return 0;
+    }
+    __forceinline__ __device__ void read_in(uint64_t prp1, uint64_t prp2 ,size_t file_offset, size_t nbytes,) {
+        nvme_xfer(file_offset, nbytes, prp1, prp2 ,FILE_XFER_READ);
+    }
+    __forceinline__ __device__ void write_out(uint64_t prp1, uint64_t prp2 , size_t file_offset, size_t nbytes) {
+        nvme_xfer(file_offset, nbytes, prp1, prp2 , FILE_XFER_WRITE);
+    }
+    __forceinline__ __device__ void print_file_info(void){
+        geminifs_info("NVMeFile: %p, ctrl %p, hdr %p, file_size %ld, block_size %ld\n", 
+            this, this->ctrl, this->hdr, this->file_size, this->block_size);
+        geminifs_info(" nvme_page_size %ld\n",this->nvme_page_size);
     }
 };
 
