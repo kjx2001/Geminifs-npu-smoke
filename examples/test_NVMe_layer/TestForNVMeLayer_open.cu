@@ -213,7 +213,7 @@ int main(int argc, char** argv) {
         
         // Test device file operations
         std::cout << "\n=== Testing Device File Operations ===" << std::endl;
-        const std::string device_test_filename = "device_test_file";
+        const std::string device_test_filename = "device_test";
         
         void* device_fd = nvme_controller->g_open(device_test_filename, FILE_SIZE, O_DEVICE);
         if (device_fd != nullptr) {

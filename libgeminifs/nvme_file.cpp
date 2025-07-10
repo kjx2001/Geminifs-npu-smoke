@@ -391,11 +391,17 @@ bool FileManager::writeRecordToSlot(const NVMeFileDesc& desc, uint64_t slot_inde
 }
 
 bool FileManager::createFile(const std::string& filename, NVMeFileDesc& out_desc, size_t file_size) {
-    if (filename.length() >= 16) return false;
+    if (filename.length() >= 16) {
+        std::cerr << "Error: Filename too long. Must be less than 16 characters." << std::endl;
+        return false;
+    }
 
     std::lock_guard<std::mutex> lock(mtx_);
 
-    if (filename_to_file_map_.count(filename)) return false;
+    if (filename_to_file_map_.count(filename)) {
+        std::cerr << "Error: File with name '" << filename << "' already exists." << std::endl;
+        return false;
+    }
 
     long slot = findNextFreeSlot();
     if (slot == -1) {
