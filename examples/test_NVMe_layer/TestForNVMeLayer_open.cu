@@ -26,6 +26,7 @@
 #include "geminifs_helper.h"
 #include "nvm_error.h"
 #include "utils.cuh"
+#include "backtrace.h"
 
 // 定义常量
 const int NUM_FILES = 100000;
@@ -61,6 +62,7 @@ void show_fd_limits() {
 
 int main(int argc, char** argv) {
 
+    setup_backtrace();
     // 在程序开始时自动配置文件描述符限制
     auto_configure_fd_limits(NUM_FILES);
     ParsedSystemConfig config = parse_system_config("/home/hzx/Geminifs/sys_config.ini");

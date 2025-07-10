@@ -7,12 +7,18 @@ set (CMAKE_CUDA_STANDARD 20)
 
 project (libnvm LANGUAGES CUDA C CXX)
 
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE "RelWithDebInfo" CACHE STRING "Choose the type of build." FORCE)
+endif()
 
 
 set (CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -gencode arch=compute_90,code=sm_90")
 
 find_package (Threads REQUIRED)
 find_package(CUDAToolkit 12.6 REQUIRED)
+find_package(PkgConfig)
+
+pkg_check_modules(UNWIND REQUIRED libunwind)
 
 enable_language(CUDA)
 include(CheckLanguage)
@@ -204,6 +210,12 @@ target_include_directories(libgeminifs PRIVATE "${libgeminifs_root}")
 target_link_libraries(libgeminifs PRIVATE libnvm CUDA::cudart "${TORCH_LIBRARIES}")
 # target_include_directories(libgeminifs PRIVATE "${libgeminifs_root}")
 # target_link_libraries(libgeminifs ${CUDA_LIBRARIES} libnvm )
+target_link_libraries(libgeminifs
+    PRIVATE
+    unwind
+    unwind-x86_64
+    dl
+)
 
 set_target_properties(libgeminifs PROPERTIES OUTPUT_NAME "geminifs")
 set_target_properties(libgeminifs PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
