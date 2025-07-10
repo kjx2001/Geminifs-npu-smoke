@@ -192,10 +192,22 @@ private:
     struct geminiFS_hdr *hdr;  // static header for get NVMeFile cls
    
 
-    __forceinline__ __device__ nvme_ofst_t __get_nvmeofst(vaddr_t va) {
-        assert(hdr != nullptr);
-        uint64_t l1_idx = va >> hdr->block_bit;
-        return l1_idx < hdr->nr_l1 ? hdr->l1[l1_idx] : 0;
+    __forceinline__ __device__ nvme_ofst_t __get_nvmeofst(vaddr_t va) const {
+        assert(hdr);
+        uint64_t blk_id = va >> hdr->block_bit;
+        uint64_t start_blk_id = 0;
+        uint64_t end_blk_id = 0;
+
+        for (size_t i = 0; i < hdr->extent_count; ++i) {
+            end_blk_id += hdr->extents[i].fe_length >> hdr->block_bit;
+            assert(blk_id < end_blk_id);
+            if (blk_id >= start_blk_id) {
+                return hdr->extents[i].fe_physical + ((blk_id - start_blk_id) << hdr->block_bit);
+            }
+            start_blk_id = end_blk_id;
+        }
+
+        assert(false && "Invalid virtual address for NVMe offset calculation");
     }
 
     __forceinline__ __device__ void nvme_xfer(size_t file_offset, size_t nbytes,
@@ -243,11 +255,7 @@ public:
 
     // Public method to get NVMe offset (wrapper for private __get_nvmeofst)
     __forceinline__ __device__ nvme_ofst_t get_nvme_offset(vaddr_t va) const {
-        if (hdr != nullptr) {
-            uint64_t l1_idx = va >> hdr->block_bit;
-            return (l1_idx < hdr->nr_l1) ? hdr->l1[l1_idx] : 0;
-        }
-        return 0;
+        return __get_nvmeofst(va);
     }
     __forceinline__ __device__ void read_in(uint64_t prp1, uint64_t prp2 ,size_t file_offset, size_t nbytes) {
         nvme_xfer(file_offset, nbytes, prp1, prp2 ,FILE_XFER_READ);

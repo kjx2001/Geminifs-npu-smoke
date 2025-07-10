@@ -66,3 +66,19 @@ set_target_properties(TestForNVMeLayer_rw PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
 )
+
+add_executable(TestForNVMeLayer_open TestForNVMeLayer_open.cu)
+
+# Link libraries
+target_link_libraries(TestForNVMeLayer_open PRIVATE
+    geminifs
+    nvm
+    CUDA::cudart
+    "${TORCH_LIBRARIES}"
+)
+
+# Set CUDA properties
+set_target_properties(TestForNVMeLayer_open PROPERTIES 
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+)

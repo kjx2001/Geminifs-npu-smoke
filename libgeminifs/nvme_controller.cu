@@ -270,8 +270,7 @@ host_fd_t NVMeController::host_file_create_managed(int block_size, size_t file_s
     auto nvpage_size = controller->page_size;
     assert(block_size % nvpage_size == 0);
 
-    auto hdr_size = ROUND_UP(sizeof(struct geminiFS_hdr) + 
-                                    sizeof(nvme_ofst_t) * (file_size / block_size), block_size);
+    auto hdr_size = ROUND_UP(GEMINI_HDR_MAX_SIZE, block_size);
 
     // Allocate host memory for the header
     struct geminiFS_hdr *hdr = (struct geminiFS_hdr *)malloc(hdr_size);
@@ -287,12 +286,10 @@ host_fd_t NVMeController::host_file_create_managed(int block_size, size_t file_s
     
     // Initialize header
     hdr->magic_num = the_geminiFS_magic.magic_num;
+    hdr->first_block_base = hdr_size;
     hdr->virtual_space_size = file_size;
-    hdr->block_bit = one_nr__of__binary_int(block_size - 1) ;
-    hdr->nr_l1 = file_size / block_size;
-    hdr->first_block_base = ROUND_UP(sizeof(struct geminiFS_hdr) + sizeof(nvme_ofst_t) * hdr->nr_l1, block_size);
-    // printf("host_file_create_managed: blck_bit %u, block_size %u, file_size %zu, hdr_size %zu\n", 
-    //        hdr->block_bit, block_size, file_size, hdr_size);
+    hdr->block_bit = __builtin_clzll(block_size); // Block size in bits
+
     // Open file
     int fd = open(file_path.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0666);
     if (fd < 0) {
@@ -304,22 +301,6 @@ host_fd_t NVMeController::host_file_create_managed(int block_size, size_t file_s
     // Set file size using fallocate to actually allocate space
     if (fallocate(fd, 0, 0, hdr_size + file_size) != 0) {
         geminifs_error("host_file_create_managed: Failed to allocate file space\n");
-        close(fd);
-        free(hdr);
-        return nullptr;
-    }
-        // printf("host_file_create_managed: blck_bit %u, block_size %u, file_size %zu, hdr_size %zu\n", 
-        //    hdr->block_bit, block_size, file_size, hdr_size);
-    // Write the header
-    if (lseek(fd, 0, SEEK_SET) == (off_t)(-1)) {
-        geminifs_error("host_file_create_managed: Failed to seek to beginning of file\n");
-        close(fd);
-        free(hdr);
-        return nullptr;
-    }
-    
-    if (write(fd, hdr, sizeof(*hdr)) != sizeof(*hdr)) {
-        geminifs_error("host_file_create_managed: Failed to write header to file\n");
         close(fd);
         free(hdr);
         return nullptr;
@@ -374,7 +355,7 @@ host_fd_t NVMeController::host_file_open_managed(const std::string& filepath, ui
     
     if (file_manager != nullptr) {
         // Calculate the size of the allocated header for registration
-        size_t hdr_size = ROUND_UP(sizeof(struct geminiFS_hdr) + sizeof(nvme_ofst_t) * result->nr_l1, result->first_block_base);
+        size_t hdr_size = result->first_block_base;
         file_manager->registerOpenFile(result, filepath, hdr_size);
     }
     
@@ -418,8 +399,7 @@ dev_fd_t NVMeController::device_file_create_managed(int block_size, size_t file_
     }
     
     // Calculate header size
-    size_t hdr_size = ROUND_UP(sizeof(struct geminiFS_hdr) + 
-                               sizeof(nvme_ofst_t) * (file_size / block_size), block_size);
+    size_t hdr_size = ROUND_UP(GEMINI_HDR_MAX_SIZE, block_size);
     
     // Copy host file descriptor to device
     dev_fd_t device_fd = copy_host_fd_to_device(host_fd, hdr_size);
@@ -518,8 +498,7 @@ dev_fd_t NVMeController::device_file_open_managed(const std::string& filename, s
     }
     
     // Calculate header size
-    size_t hdr_size = ROUND_UP(sizeof(struct geminiFS_hdr) + 
-                               sizeof(nvme_ofst_t) * host_fd->nr_l1, host_fd->first_block_base);
+    size_t hdr_size = host_fd->first_block_base;
     
     // Copy host file descriptor to device
     dev_fd_t device_fd = copy_host_fd_to_device(host_fd, hdr_size);
@@ -547,7 +526,7 @@ dev_fd_t NVMeController::device_file_open_managed(const std::string& filename, s
                                      file_size,
                                      controller->page_size,
                                      controller->blk_size,
-                                     ((Controller*)controller->d_ctrl_ptr)->blk_size_log);
+                                     controller->blk_size_log);
     
     // Check for any CUDA errors after initialization
     cuda_err = cudaDeviceSynchronize();

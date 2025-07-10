@@ -69,22 +69,18 @@ host_fd_t host_create_geminifs_file(const char *filename,
 
 	my_assert(virtual_space_size % block_size == 0);
 
-	auto nr_l1 = virtual_space_size / block_size;
-	auto hdr_size = ROUND_UP(sizeof(struct geminiFS_hdr) + sizeof(nvme_ofst_t) * nr_l1, block_size);
+	auto hdr_size = ROUND_UP(GEMINI_HDR_MAX_SIZE, block_size);
 
 	hdr = (struct geminiFS_hdr *)malloc(hdr_size);
 	hdr->magic_num = the_geminiFS_magic.magic_num;
+	hdr->first_block_base = hdr_size;
 	hdr->virtual_space_size = ROUND_UP(virtual_space_size, block_size);
 	hdr->block_bit = one_nr__of__binary_int(block_size - 1);
-	hdr->nr_l1 = nr_l1;
-	hdr->first_block_base = hdr_size;
 
 	fd = open(filename, O_RDWR | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
 	my_assert(0 <= fd);
 	my_assert(0 ==
 		fallocate(fd, 0, 0, hdr->first_block_base + hdr->virtual_space_size));
-	my_assert((off_t)(-1) != lseek(fd, 0, SEEK_SET));
-	my_assert(sizeof(*hdr) == write(fd, hdr, sizeof(*hdr)));
 	
 	hdr->fd = fd;
 
@@ -103,17 +99,14 @@ host_fd_t host_create_geminifs_file(void *buf,
 	my_assert(virtual_space_size % block_size == 0);
 
 	hdr->magic_num = the_geminiFS_magic.magic_num;
+	hdr->first_block_base = ROUND_UP(GEMINI_HDR_MAX_SIZE, block_size);
 	hdr->virtual_space_size = ROUND_UP(virtual_space_size, block_size);
 	hdr->block_bit = one_nr__of__binary_int(block_size - 1);
-	hdr->nr_l1 = hdr->virtual_space_size >> hdr->block_bit;
-	hdr->first_block_base = ROUND_UP(sizeof(struct geminiFS_hdr) + sizeof(nvme_ofst_t) * hdr->nr_l1, block_size);
 	
 	fd = open(filename, O_RDWR | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
 	my_assert(0 <= fd);
 	my_assert(0 ==
 		fallocate(fd, 0, 0, hdr->first_block_base + hdr->virtual_space_size));
-	my_assert((off_t)(-1) != lseek(fd, 0, SEEK_SET));
-	my_assert(sizeof(*hdr) == write(fd, hdr, sizeof(*hdr)));
 	
 	hdr->fd = fd;
 	host_refine_nvmeofst(hdr);
@@ -136,7 +129,7 @@ host_fd_t host_open_geminifs_file(const char *filename) {
 	my_assert(temp_hdr.magic_num == the_geminiFS_magic.magic_num);
 
 	// Calculate the actual size needed including the l1 array
-	size_t hdr_size = ROUND_UP(sizeof(struct geminiFS_hdr) + sizeof(nvme_ofst_t) * temp_hdr.nr_l1, temp_hdr.first_block_base);
+	size_t hdr_size = temp_hdr.first_block_base;
 	
 	// Allocate the correct amount of memory
 	struct geminiFS_hdr *hdr = (struct geminiFS_hdr *)malloc(hdr_size);
@@ -210,14 +203,16 @@ static inline struct fiemap *read_fiemap(int fd, u_int64_t fiemap_start, u_int64
     // fiemap->fm_flags = FIEMAP_FLAG_SYNC;
 
 	/* Find out how many extents there are */
-	if (ioctl(fd, FS_IOC_FIEMAP, fiemap) < 0) {
-		fprintf(stderr, "fiemap ioctl() FS_IOC_FIEMAP failed");
+	if (ioctl(fd, FS_IOC_FIEMAP, fiemap) != 0) {
+		fprintf(stderr, "fiemap ioctl() FS_IOC_FIEMAP failed\n");
 		goto fail_cleanup;
 	}
 
 	/* Nothing to process */
-	if (fiemap->fm_mapped_extents == 0)
+	if (fiemap->fm_mapped_extents == 0) {
+		fprintf(stderr, "extent count: %d\n", fiemap->fm_extent_count);
 		goto fail_cleanup;
+	}
 
 	/* Result fiemap have to hold all the extents for the hole file */
 
@@ -290,21 +285,29 @@ void host_refine_nvmeofst(host_fd_t fd) {
 	struct geminiFS_hdr *hdr = fd;
 	struct geminiFS_hdr *file_mmap = (struct geminiFS_hdr *)
 									mmap(NULL,
+										/* FIXME: if first_block_base is not aligned to page size, mmap may fail */
 										hdr->first_block_base,
 										PROT_WRITE | PROT_READ,
 										MAP_SHARED,
 										fd->fd,
 										0);
-	my_assert((void *) -1 != file_mmap);
-	size_t idx = 0;
+	my_assert(MAP_FAILED != file_mmap);
 	struct fiemap *mapping = read_fiemap(hdr->fd, hdr->first_block_base, hdr->virtual_space_size);
 	my_assert(NULL != mapping);
-	for (size_t i = 0; i < mapping->fm_mapped_extents; ++i) {
-		for (size_t j = 0; j < mapping->fm_extents[i].fe_length >> hdr->block_bit; ++j, ++idx) {
-			file_mmap->l1[idx] = mapping->fm_extents[i].fe_physical + (j << hdr->block_bit);
-			hdr->l1[idx] = file_mmap->l1[idx];
-		}
+	if (mapping->fm_mapped_extents > GEMINI_HDR_MAX_EXTENTS) {
+		fprintf(stderr, "FATAL: Allocated file has too many extents: %u, max allowed: %ld\n",
+				mapping->fm_mapped_extents, GEMINI_HDR_MAX_EXTENTS);
+		exit(EXIT_FAILURE);
 	}
+
+	file_mmap->magic_num = hdr->magic_num;
+	file_mmap->first_block_base = hdr->first_block_base;
+	file_mmap->virtual_space_size = hdr->virtual_space_size;
+	file_mmap->fd = hdr->fd;
+	file_mmap->block_bit = hdr->block_bit;
+	file_mmap->extent_count = mapping->fm_mapped_extents;
+	memcpy(file_mmap->extents, mapping->fm_extents,
+		   mapping->fm_mapped_extents * sizeof(struct fiemap_extent));
 
 	munmap(file_mmap, hdr->first_block_base);
 }

@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include <linux/fiemap.h>
 
 // GeminiFS specific file open flags
 #define O_HOST      0x10000000  // Open for host-side operations
@@ -23,13 +24,16 @@ typedef uint64_t nvme_ofst_t;
 
 struct geminiFS_hdr {
 	uint64_t magic_num;
+        rawfile_ofst_t first_block_base; /* or length of metadata */
 	uint64_t virtual_space_size; /* in bytes */
-	uint8_t block_bit; /* block_size, in the form of bit num */
-	uint64_t nr_l1;
-	rawfile_ofst_t first_block_base; /* or length of metadata */
 	int fd; /* dummy */
-	nvme_ofst_t l1[]; // Todo: use extend tree instead of flexible array member
+        uint8_t block_bit; /* block_size, in the form of bit num */
+        uint8_t extent_count;
+	struct fiemap_extent extents[];
 };
+
+#define GEMINI_HDR_MAX_SIZE (512)
+#define GEMINI_HDR_MAX_EXTENTS ((GEMINI_HDR_MAX_SIZE - sizeof(struct geminiFS_hdr)) / sizeof(struct fiemap_extent))
 
 extern union geminiFS_magic {
 	uint64_t magic_num;

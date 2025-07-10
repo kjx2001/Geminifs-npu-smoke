@@ -63,24 +63,50 @@ int main(int argc, char** argv) {
 
     // 在程序开始时自动配置文件描述符限制
     auto_configure_fd_limits(NUM_FILES);
+    ParsedSystemConfig config = parse_system_config("/home/hzx/Geminifs/sys_config.ini");
+    std::vector<nvme_ctrl_param> nvme_params;
+    if (config.valid) {
+        // 转换为nvme_ctrl_param格式
+        nvme_params = convert_to_nvme_ctrl_params(config);
+        
+        // 遍历所有配置组
+        for (const auto& group : config.groups) {
+            std::cout << "GPU " << group.gpu.cudaDevice << " mount: " << group.gpu.mount_path << std::endl;
+            for (const auto& nvme : group.nvmes) {
+                std::cout << "  NVMe: " << nvme.pci_addr << " -> " << nvme.mount_path << std::endl;
+            }
+        }
+    } else {
+        std::cerr << "Config parsing failed: " << config.error_message << std::endl;
+    }
 
     try {
-        // Create nvme_ctrl_param for a single NVMe controller
-        nvme_ctrl_param params = {
-            .mount_path = "/mnt/nvme_layer",
-            .pci_addr = "0000:50:00.0",  // Single PCI address
-            .cudaDevice = 0,
-            .ns_id = 1,
-            .queueDepth = 1024,
-            .numQueues = 64
-        };
+        SystemConfigGroup group = config.groups.at(0);
+
+        GPUControllerPtr gpu_controller_ = geminifs_create_gpu_controller(group.gpu.cudaDevice, group.gpu.mount_path);
+
+        // 检查是否有NVMe参数，并且第一个参数的pci_addr不为空
+        if (!nvme_params.empty() && !nvme_params.at(0).pci_addr.empty()) {
+            bool success = geminifs_add_nvme_to_gpu(group.gpu.cudaDevice, nvme_params.at(0));
+            if (success) {
+                std::cout << "Successfully added NVMe controller to GPU " << group.gpu.cudaDevice << std::endl;
+            } else {
+                std::cerr << "Failed to add NVMe controller to GPU " << group.gpu.cudaDevice << std::endl;
+            }
+        } else {
+            std::cerr << "No valid NVMe parameters found" << std::endl;
+        }
         
-        // Create NVMeController instance
-        auto nvme_controller = std::make_shared<NVMeController>(params);
+        auto gpu_controller = geminifs_get_gpu_controller(group.gpu.cudaDevice);
+        if (!gpu_controller) {
+            geminifs_error("geminifs_add_nvme_to_gpu: No GPU controller found for device %d\n", group.gpu.cudaDevice);
+            return false;
+        }
+        
+        NVMeControllerPtr nvme_controller =  gpu_controller->getNVMeController(0);
         
         std::cout << "NVMeController initialized successfully!" << std::endl;
         std::cout << "Mount path: " << nvme_controller->mount_path << std::endl;
-        std::cout << "Controller initialized for PCI: " << params.pci_addr << std::endl;
 
         // Use the controller and file manager
         if (nvme_controller->controller) {
