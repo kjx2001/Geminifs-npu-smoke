@@ -6,8 +6,11 @@ build/*
 third_pkgs/
 third_pkgs/*
 
+.venv/
+
 # IDE specific files
 .vscode/
 .idea/
+.ccls-cache/
 *.swp
 *~
