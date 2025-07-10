@@ -90,18 +90,18 @@ ParsedSystemConfig parse_system_config(const std::string& config_file_path);
 std::vector<nvme_ctrl_param> convert_to_nvme_ctrl_params(const ParsedSystemConfig& config);
 
 #define geminifs_info(fmt, ...) \
-    printf("[INFO][%s:%d]: " fmt "", __func__, __LINE__, ##__VA_ARGS__);
+    printf("[INFO][%s:%d] %s: " fmt "", __FILE__, __LINE__, __func__, ##__VA_ARGS__);
 
 #define geminifs_error(fmt, ...) \
-    printf("[ERROR][%s:%d]: " fmt "", __func__, __LINE__, ##__VA_ARGS__);
+    printf("[ERROR][%s:%d] %s: " fmt "", __FILE__, __LINE__, __func__, ##__VA_ARGS__);
 
 #define geminifs_warn(fmt, ...) \
-    printf("[WARN][%s:%d]: " fmt "", __func__, __LINE__, ##__VA_ARGS__);
+    printf("[WARN][%s:%d] %s: " fmt "", __FILE__, __LINE__, __func__, ##__VA_ARGS__);
 
 
 #ifdef DEBUG
 #define geminifs_debug(fmt, ...) \
-    printf("[DEBUG][%s:%d]: " fmt "", __func__, __LINE__, ##__VA_ARGS__);
+    printf("[DEBUG][%s:%d] %s: " fmt "", __FILE__, __LINE__, __func__, ##__VA_ARGS__);
 #else
 #define geminifs_debug(fmt, ...) \
 
