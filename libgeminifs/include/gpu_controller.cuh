@@ -13,6 +13,190 @@
 #include "geminifs_mem.h"
 
 /**
+ * PRP映射条目结构 (24字节)
+ */
+struct PRPMappingEntry {
+    uint32_t NVMe_dev;         // index of NVMe device (4字节)
+    uint32_t transfer_type; // NVMe cmd transfer type (4字节)
+    uint64_t prp1;          // PRP1
+    uint64_t prp2;          // PRP2 may be NULL
+    __device__ __host__ PRPMappingEntry() :  NVMe_dev(0), transfer_type(0), prp1(0), prp2(0)  {}
+    __device__ __host__ PRPMappingEntry(uint32_t NVMe_dev,uint32_t transfer_type,uint64_t p1, uint64_t p2 ) 
+        : NVMe_dev(0), transfer_type(0), prp1(p1), prp2(p2) {}
+};
+
+/**
+ * GPU端映射链表节点 (16字节)
+ */
+struct GPUMappingNode {
+    uint32_t entry_index;     // 4字节 - 在映射条目数组中的索引
+    uint32_t next_node;       // 4字节 - 下一个节点的索引 (链表)
+    uint64_t reserved;        // 8字节 - 保留字段，用于对齐
+    
+    __device__ __host__ GPUMappingNode() : entry_index(0xFFFFFFFF), next_node(0xFFFFFFFF), reserved(0) {}
+    __device__ __host__ GPUMappingNode(uint32_t entry_idx) : entry_index(entry_idx), next_node(0xFFFFFFFF), reserved(0) {}
+};
+
+
+/**
+ * GPU端哈希表条目 (16字节) - 支持链表
+ */
+struct GPUHashEntry {
+    uint64_t GPU_virtual_ptr;    // 8字节 - tensor指针 (作为key)
+    uint32_t first_node;         // 4字节 - 第一个映射节点的索引
+    uint32_t mapping_count;      // 4字节 - 该tensor的映射数量
+    
+    __device__ __host__ GPUHashEntry() : GPU_virtual_ptr(0), first_node(0xFFFFFFFF), mapping_count(0) {}
+};
+
+/**
+ * GPU内存映射管理器
+ */
+class GPUMemoryMapper {
+public:
+    static constexpr size_t MAX_MAPPINGS = 1024 * 1024;          // 1M个PRP映射条目
+    static constexpr size_t MAX_MAPPING_NODES = 4 * 1024 * 1024; // 2M个映射节点 (支持平均每个tensor 4个映射)
+    static constexpr size_t HASH_TABLE_SIZE = 512 * 1024;        // 512K个哈希槽位
+    static constexpr uint32_t INVALID_INDEX = 0xFFFFFFFF;
+    
+private:
+    // GPU内存指针
+    PRPMappingEntry* d_mapping_entries_;     // PRP映射条目数组
+    GPUMappingNode* d_mapping_nodes_;        // 映射节点数组 (用于链表)
+    GPUHashEntry* d_hash_table_;             // 哈希表
+    uint32_t* d_free_entry_list_;            // 空闲映射条目列表
+    uint32_t* d_free_node_list_;             // 空闲映射节点列表
+    uint32_t* d_free_entry_count_;           // 空闲映射条目计数器
+    uint32_t* d_free_node_count_;            // 空闲映射节点计数器
+    
+    // 主机端管理
+    mutable std::mutex mapper_mutex_;
+    bool is_initialized_;
+    int device_id_;
+    
+public:
+    GPUMemoryMapper(int device_id);
+    ~GPUMemoryMapper();
+    
+    /**
+     * 初始化GPU内存映射器
+     */
+    bool initialize();
+    
+    /**
+     * 清理所有资源
+     */
+    void cleanup();
+    
+    /**
+     * 添加单个映射到已存在的tensor
+     * @param tensor_ptr Tensor的GPU虚拟内存指针
+     * @param nvme_dev NVMe设备索引
+     * @param transfer_type 传输类型
+     * @param prp1 PRP1地址
+     * @param prp2 PRP2地址
+     * @return 成功返回true
+     */
+    bool addMapping(uint64_t tensor_ptr, uint32_t nvme_dev, uint32_t transfer_type, uint64_t prp1, uint64_t prp2);
+    
+    
+    /**
+     * 批量添加多个映射到同一个tensor
+     * @param tensor_ptr Tensor的GPU虚拟内存指针
+     * @param mappings 映射条目向量
+     * @return 成功返回true
+     */
+    bool addBatchMappings(uint64_t tensor_ptr, const std::vector<PRPMappingEntry>& mappings);
+ 
+    
+     /**
+     * 移除tensor的所有映射
+     * @param tensor_ptr Tensor的GPU虚拟内存指针
+     * @return 成功返回true
+     */
+    bool removeAllMappings(uint64_t tensor_ptr);
+
+    /**
+     * 移除tensor的特定映射
+     * @param tensor_ptr Tensor的GPU虚拟内存指针
+     * @param nvme_dev 要移除的NVMe设备索引
+     * @return 成功返回true
+     */
+    bool removeMapping(uint64_t tensor_ptr, uint32_t nvme_dev);
+    
+   /**
+     * 获取映射条目数组指针 (用于GPU kernel)
+     */
+    PRPMappingEntry* getMappingEntriesPtr() const { return d_mapping_entries_; }
+    
+    /**
+     * 获取映射节点数组指针 (用于GPU kernel)
+     */
+    GPUMappingNode* getMappingNodesPtr() const { return d_mapping_nodes_; }
+    
+    /**
+     * 获取哈希表指针 (用于GPU kernel)
+     */
+    GPUHashEntry* getHashTablePtr() const { return d_hash_table_; }
+    
+    /**
+     * 获取统计信息
+     */
+    std::tuple<uint32_t, uint32_t, uint32_t, uint32_t> getStats() const; // (used_entries, total_entries, used_nodes, total_nodes)
+};
+
+
+// === GPU mem to dma maping Implementation ===
+
+
+/**
+ * GPU端哈希函数
+ */
+__device__ __forceinline__ uint32_t gpu_hash(uint64_t key) {
+    // 使用FNV-1a哈希算法的简化版本
+    uint64_t hash = 14695981039346656037ULL;
+    hash ^= key;
+    hash *= 1099511628211ULL;
+    return static_cast<uint32_t>(hash % GPUMemoryMapper::HASH_TABLE_SIZE);
+}
+
+// === GPU设备端查找函数 ===
+
+/**
+ * GPU端查找tensor的所有PRP映射
+ * @param tensor_ptr Tensor的GPU虚拟内存指针
+ * @param hash_table 哈希表指针
+ * @param mapping_nodes 映射节点数组指针
+ * @param mapping_entries 映射条目数组指针
+ * @param results 输出的PRP映射条目数组 (调用者分配)
+ * @param max_results 最大结果数量
+ * @return 实际找到的映射数量
+ */
+__device__ uint32_t gpu_lookup_all_prp_mappings(uint64_t tensor_ptr,
+                                                GPUHashEntry* hash_table,
+                                                GPUMappingNode* mapping_nodes,
+                                                PRPMappingEntry* mapping_entries,
+                                                PRPMappingEntry* results,
+                                                uint32_t max_results);
+
+/**
+ * GPU端查找tensor的特定NVMe设备映射
+ * @param tensor_ptr Tensor的GPU虚拟内存指针
+ * @param nvme_dev 目标NVMe设备索引
+ * @param hash_table 哈希表指针
+ * @param mapping_nodes 映射节点数组指针
+ * @param mapping_entries 映射条目数组指针
+ * @param result 输出的PRP映射条目
+ * @return 找到返回true，未找到返回false
+ */
+__device__ bool gpu_lookup_specific_prp_mapping(uint64_t tensor_ptr,
+                                                uint32_t nvme_dev,
+                                                GPUHashEntry* hash_table,
+                                                GPUMappingNode* mapping_nodes,
+                                                PRPMappingEntry* mapping_entries,
+                                                PRPMappingEntry* result);
+
+/**
  * GPU Controller class for managing a single GPU device's memory and storage
  * Handles both GPU memory management and multiple NVMe controllers
  */
@@ -24,6 +208,7 @@ public:
      * @param mount_base_path Base mount path for all NVMe controllers under this GPU
      */
     GPUController(int device_id, const std::string& mount_base_path);
+    
     
     /**
      * Destructor - cleans up all resources
@@ -131,6 +316,8 @@ public:
      */
     bool isInitialized() const { return is_initialized_.load(); }
     
+    GPUMemoryMapper* getMemoryMapper() const { return memory_mapper_.get(); }
+
     /**
      * Get memory usage statistics
      * @return Pair of (used_memory, total_registered_tensors)
@@ -152,7 +339,7 @@ private:
     std::vector<NVMeControllerPtr> nvme_controllers_;                       // NVMe controllers
     mutable std::mutex storage_mutex_;                                      // Mutex for storage operations
     
-    // === Private Methods ===
+    std::unique_ptr<GPUMemoryMapper> memory_mapper_;
     
     /**
      * Initialize the GPU controller

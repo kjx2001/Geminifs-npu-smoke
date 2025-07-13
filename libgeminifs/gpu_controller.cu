@@ -7,6 +7,601 @@
 #include <cstring>
 #include <algorithm>
 #include "gpu_controller.cuh"
+
+
+
+__device__ uint32_t gpu_lookup_all_prp_mappings(uint64_t tensor_ptr,
+                                                GPUHashEntry* hash_table,
+                                                GPUMappingNode* mapping_nodes,
+                                                PRPMappingEntry* mapping_entries,
+                                                PRPMappingEntry* results,
+                                                uint32_t max_results) {
+    uint32_t hash_index = gpu_hash(tensor_ptr);
+    GPUHashEntry& hash_entry = hash_table[hash_index];
+    
+    // 检查是否找到对应的tensor
+    if (hash_entry.GPU_virtual_ptr != tensor_ptr || hash_entry.first_node == GPUMemoryMapper::INVALID_INDEX) {
+        return 0; // 未找到
+    }
+    
+    uint32_t found_count = 0;
+    uint32_t current_node = hash_entry.first_node;
+    
+    // 遍历映射链表
+    while (current_node != GPUMemoryMapper::INVALID_INDEX && found_count < max_results) {
+        GPUMappingNode& node = mapping_nodes[current_node];
+        
+        if (node.entry_index != GPUMemoryMapper::INVALID_INDEX) {
+            results[found_count] = mapping_entries[node.entry_index];
+            found_count++;
+        }
+        
+        current_node = node.next_node;
+    }
+    
+    return found_count;
+}
+
+__device__ bool gpu_lookup_specific_prp_mapping(uint64_t tensor_ptr,
+                                                uint32_t nvme_dev,
+                                                GPUHashEntry* hash_table,
+                                                GPUMappingNode* mapping_nodes,
+                                                PRPMappingEntry* mapping_entries,
+                                                PRPMappingEntry* result) {
+    uint32_t hash_index = gpu_hash(tensor_ptr);
+    GPUHashEntry& hash_entry = hash_table[hash_index];
+    
+    // 检查是否找到对应的tensor
+    if (hash_entry.GPU_virtual_ptr != tensor_ptr || hash_entry.first_node == GPUMemoryMapper::INVALID_INDEX) {
+        return false; // 未找到
+    }
+    
+    uint32_t current_node = hash_entry.first_node;
+    
+    // 遍历映射链表，查找特定的NVMe设备
+    while (current_node != GPUMemoryMapper::INVALID_INDEX) {
+        GPUMappingNode& node = mapping_nodes[current_node];
+        
+        if (node.entry_index != GPUMemoryMapper::INVALID_INDEX) {
+            PRPMappingEntry& entry = mapping_entries[node.entry_index];
+            if (entry.NVMe_dev == nvme_dev) {
+                *result = entry;
+                return true;
+            }
+        }
+        current_node = node.next_node;
+    }
+    
+    return false; // 未找到指定设备的映射
+}
+
+// === GPU mem mapper Implementation ===
+GPUMemoryMapper::GPUMemoryMapper(int device_id) 
+    : d_mapping_entries_(nullptr), d_mapping_nodes_(nullptr), d_hash_table_(nullptr), 
+      d_free_entry_list_(nullptr), d_free_node_list_(nullptr),
+      d_free_entry_count_(nullptr), d_free_node_count_(nullptr),
+      is_initialized_(false), device_id_(device_id) {
+}
+
+GPUMemoryMapper::~GPUMemoryMapper() {
+    cleanup();
+}
+
+bool GPUMemoryMapper::initialize() {
+    std::lock_guard<std::mutex> lock(mapper_mutex_);
+    
+    if (is_initialized_) {
+        return true;
+    }
+    
+    // 设置CUDA设备
+    cudaError_t err = cudaSetDevice(device_id_);
+    if (err != cudaSuccess) {
+        geminifs_error("GPU Memory Mapper: Failed to set device %d: %s\n", 
+                       device_id_, cudaGetErrorString(err));
+        return false;
+    }
+    
+    // 分配映射条目数组
+    err = cudaMalloc(&d_mapping_entries_, sizeof(PRPMappingEntry) * MAX_MAPPINGS);
+    if (err != cudaSuccess) {
+        geminifs_error("GPU Memory Mapper: Failed to allocate mapping entries: %s\n", 
+                       cudaGetErrorString(err));
+        return false;
+    }
+    
+    // 分配映射节点数组
+    err = cudaMalloc(&d_mapping_nodes_, sizeof(GPUMappingNode) * MAX_MAPPING_NODES);
+    if (err != cudaSuccess) {
+        geminifs_error("GPU Memory Mapper: Failed to allocate mapping nodes: %s\n", 
+                       cudaGetErrorString(err));
+        cleanup();
+        return false;
+    }
+    
+    // 分配哈希表
+    err = cudaMalloc(&d_hash_table_, sizeof(GPUHashEntry) * HASH_TABLE_SIZE);
+    if (err != cudaSuccess) {
+        geminifs_error("GPU Memory Mapper: Failed to allocate hash table: %s\n", 
+                       cudaGetErrorString(err));
+        cleanup();
+        return false;
+    }
+    
+    // 分配空闲条目列表
+    err = cudaMalloc(&d_free_entry_list_, sizeof(uint32_t) * MAX_MAPPINGS);
+    if (err != cudaSuccess) {
+        geminifs_error("GPU Memory Mapper: Failed to allocate free entry list: %s\n", 
+                       cudaGetErrorString(err));
+        cleanup();
+        return false;
+    }
+    
+    // 分配空闲节点列表
+    err = cudaMalloc(&d_free_node_list_, sizeof(uint32_t) * MAX_MAPPING_NODES);
+    if (err != cudaSuccess) {
+        geminifs_error("GPU Memory Mapper: Failed to allocate free node list: %s\n", 
+                       cudaGetErrorString(err));
+        cleanup();
+        return false;
+    }
+    
+    // 分配计数器
+    err = cudaMalloc(&d_free_entry_count_, sizeof(uint32_t));
+    if (err != cudaSuccess) {
+        geminifs_error("GPU Memory Mapper: Failed to allocate free entry counter: %s\n", 
+                       cudaGetErrorString(err));
+        cleanup();
+        return false;
+    }
+    
+    err = cudaMalloc(&d_free_node_count_, sizeof(uint32_t));
+    if (err != cudaSuccess) {
+        geminifs_error("GPU Memory Mapper: Failed to allocate free node counter: %s\n", 
+                       cudaGetErrorString(err));
+        cleanup();
+        return false;
+    }
+    
+    // 初始化所有数据结构
+    err = cudaMemset(d_hash_table_, 0, sizeof(GPUHashEntry) * HASH_TABLE_SIZE);
+    if (err != cudaSuccess) {
+        geminifs_error("GPU Memory Mapper: Failed to initialize hash table: %s\n", 
+                       cudaGetErrorString(err));
+        cleanup();
+        return false;
+    }
+    
+    err = cudaMemset(d_mapping_entries_, 0, sizeof(PRPMappingEntry) * MAX_MAPPINGS);
+    if (err != cudaSuccess) {
+        geminifs_error("GPU Memory Mapper: Failed to initialize mapping entries: %s\n", 
+                       cudaGetErrorString(err));
+        cleanup();
+        return false;
+    }
+    
+    err = cudaMemset(d_mapping_nodes_, 0, sizeof(GPUMappingNode) * MAX_MAPPING_NODES);
+    if (err != cudaSuccess) {
+        geminifs_error("GPU Memory Mapper: Failed to initialize mapping nodes: %s\n", 
+                       cudaGetErrorString(err));
+        cleanup();
+        return false;
+    }
+    
+    // 初始化空闲条目列表
+    std::vector<uint32_t> free_entry_indices(MAX_MAPPINGS);
+    for (uint32_t i = 0; i < MAX_MAPPINGS; ++i) {
+        free_entry_indices[i] = i;
+    }
+    
+    err = cudaMemcpy(d_free_entry_list_, free_entry_indices.data(), 
+                     sizeof(uint32_t) * MAX_MAPPINGS, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        geminifs_error("GPU Memory Mapper: Failed to initialize free entry list: %s\n", 
+                       cudaGetErrorString(err));
+        cleanup();
+        return false;
+    }
+    
+    // 初始化空闲节点列表
+    std::vector<uint32_t> free_node_indices(MAX_MAPPING_NODES);
+    for (uint32_t i = 0; i < MAX_MAPPING_NODES; ++i) {
+        free_node_indices[i] = i;
+    }
+    
+    err = cudaMemcpy(d_free_node_list_, free_node_indices.data(), 
+                     sizeof(uint32_t) * MAX_MAPPING_NODES, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        geminifs_error("GPU Memory Mapper: Failed to initialize free node list: %s\n", 
+                       cudaGetErrorString(err));
+        cleanup();
+        return false;
+    }
+    
+    // 初始化计数器
+    uint32_t initial_entry_count = MAX_MAPPINGS;
+    err = cudaMemcpy(d_free_entry_count_, &initial_entry_count, sizeof(uint32_t), cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        geminifs_error("GPU Memory Mapper: Failed to initialize free entry counter: %s\n", 
+                       cudaGetErrorString(err));
+        cleanup();
+        return false;
+    }
+    
+    uint32_t initial_node_count = MAX_MAPPING_NODES;
+    err = cudaMemcpy(d_free_node_count_, &initial_node_count, sizeof(uint32_t), cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        geminifs_error("GPU Memory Mapper: Failed to initialize free node counter: %s\n", 
+                       cudaGetErrorString(err));
+        cleanup();
+        return false;
+    }
+    
+    is_initialized_ = true;
+    geminifs_debug("GPU Memory Mapper: Successfully initialized for device %d\n", device_id_);
+    return true;
+}
+
+void GPUMemoryMapper::cleanup() {
+    if (d_mapping_entries_) {
+        cudaFree(d_mapping_entries_);
+        d_mapping_entries_ = nullptr;
+    }
+    
+    if (d_mapping_nodes_) {
+        cudaFree(d_mapping_nodes_);
+        d_mapping_nodes_ = nullptr;
+    }
+    
+    if (d_hash_table_) {
+        cudaFree(d_hash_table_);
+        d_hash_table_ = nullptr;
+    }
+    
+    if (d_free_entry_list_) {
+        cudaFree(d_free_entry_list_);
+        d_free_entry_list_ = nullptr;
+    }
+    
+    if (d_free_node_list_) {
+        cudaFree(d_free_node_list_);
+        d_free_node_list_ = nullptr;
+    }
+    
+    if (d_free_entry_count_) {
+        cudaFree(d_free_entry_count_);
+        d_free_entry_count_ = nullptr;
+    }
+    
+    if (d_free_node_count_) {
+        cudaFree(d_free_node_count_);
+        d_free_node_count_ = nullptr;
+    }
+    
+    is_initialized_ = false;
+}
+
+// CUDA kernel for adding mapping
+__global__ void kernel_add_mapping(uint64_t tensor_ptr, uint32_t nvme_dev, uint32_t transfer_type,
+                                  uint64_t prp1, uint64_t prp2,
+                                  GPUHashEntry* hash_table,
+                                  GPUMappingNode* mapping_nodes,
+                                  PRPMappingEntry* mapping_entries,
+                                  uint32_t* free_entry_list,
+                                  uint32_t* free_node_list,
+                                  uint32_t* free_entry_count,
+                                  uint32_t* free_node_count,
+                                  bool* success) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        *success = false;
+        
+        // 获取空闲条目索引
+        uint32_t old_entry_count = atomicSub(free_entry_count, 1);
+        if (old_entry_count == 0) {
+            atomicAdd(free_entry_count, 1); // 恢复计数
+            return;
+        }
+        
+        // 获取空闲节点索引
+        uint32_t old_node_count = atomicSub(free_node_count, 1);
+        if (old_node_count == 0) {
+            atomicAdd(free_entry_count, 1); // 恢复条目计数
+            atomicAdd(free_node_count, 1);  // 恢复节点计数
+            return;
+        }
+        
+        uint32_t entry_index = free_entry_list[old_entry_count - 1];
+        uint32_t node_index = free_node_list[old_node_count - 1];
+        
+        // 填充映射条目
+        mapping_entries[entry_index] = PRPMappingEntry(nvme_dev, transfer_type, prp1, prp2);
+        
+        // 填充映射节点
+        mapping_nodes[node_index] = GPUMappingNode(entry_index);
+        
+        // 计算哈希索引
+        uint32_t hash_index = gpu_hash(tensor_ptr);
+        GPUHashEntry& hash_entry = hash_table[hash_index];
+        
+        if (hash_entry.GPU_virtual_ptr == 0) {
+            // 新的tensor，创建新的哈希条目
+            hash_entry.GPU_virtual_ptr = tensor_ptr;
+            hash_entry.first_node = node_index;
+            hash_entry.mapping_count = 1;
+        } else if (hash_entry.GPU_virtual_ptr == tensor_ptr) {
+            // 已存在的tensor，添加到链表头
+            mapping_nodes[node_index].next_node = hash_entry.first_node;
+            hash_entry.first_node = node_index;
+            hash_entry.mapping_count++;
+        } else {
+            // 哈希冲突，使用线性探测
+            for (uint32_t i = 1; i < GPUMemoryMapper::HASH_TABLE_SIZE; ++i) {
+                uint32_t probe_index = (hash_index + i) % GPUMemoryMapper::HASH_TABLE_SIZE;
+                GPUHashEntry& probe_entry = hash_table[probe_index];
+                
+                if (probe_entry.GPU_virtual_ptr == 0) {
+                    // 找到空槽位
+                    probe_entry.GPU_virtual_ptr = tensor_ptr;
+                    probe_entry.first_node = node_index;
+                    probe_entry.mapping_count = 1;
+                    break;
+                } else if (probe_entry.GPU_virtual_ptr == tensor_ptr) {
+                    // 找到相同tensor的条目
+                    mapping_nodes[node_index].next_node = probe_entry.first_node;
+                    probe_entry.first_node = node_index;
+                    probe_entry.mapping_count++;
+                    break;
+                }
+            }
+        }
+        
+        *success = true;
+    }
+}
+
+// CUDA kernel for batch adding mappings
+__global__ void kernel_add_batch_mappings(uint64_t tensor_ptr, 
+                                          PRPMappingEntry* new_mappings,
+                                          uint32_t mapping_count,
+                                          GPUHashEntry* hash_table,
+                                          GPUMappingNode* mapping_nodes,
+                                          PRPMappingEntry* mapping_entries,
+                                          uint32_t* free_entry_list,
+                                          uint32_t* free_node_list,
+                                          uint32_t* free_entry_count,
+                                          uint32_t* free_node_count,
+                                          bool* success) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        *success = false;
+        
+        // 检查是否有足够的空闲资源
+        uint32_t available_entries = *free_entry_count;
+        uint32_t available_nodes = *free_node_count;
+        
+        if (available_entries < mapping_count || available_nodes < mapping_count) {
+            return; // 资源不足
+        }
+        
+        // 分配资源
+        uint32_t entry_start = atomicSub(free_entry_count, mapping_count);
+        uint32_t node_start = atomicSub(free_node_count, mapping_count);
+        
+        if (entry_start < mapping_count || node_start < mapping_count) {
+            // 恢复计数器并退出
+            atomicAdd(free_entry_count, mapping_count);
+            atomicAdd(free_node_count, mapping_count);
+            return;
+        }
+        
+        // 填充映射条目和节点
+        uint32_t first_node_idx = GPUMemoryMapper::INVALID_INDEX;
+        for (uint32_t i = 0; i < mapping_count; ++i) {
+            uint32_t entry_idx = free_entry_list[entry_start - 1 - i];
+            uint32_t node_idx = free_node_list[node_start - 1 - i];
+            
+            // 填充条目
+            mapping_entries[entry_idx] = new_mappings[i];
+            
+            // 构建链表
+            mapping_nodes[node_idx] = GPUMappingNode(entry_idx);
+            if (i == 0) {
+                first_node_idx = node_idx;
+            } else {
+                mapping_nodes[node_idx].next_node = first_node_idx;
+                first_node_idx = node_idx;
+            }
+        }
+        
+        // 更新哈希表
+        uint32_t hash_index = gpu_hash(tensor_ptr);
+        
+        // 线性探测找到合适的槽位
+        for (uint32_t i = 0; i < GPUMemoryMapper::HASH_TABLE_SIZE; ++i) {
+            uint32_t probe_index = (hash_index + i) % GPUMemoryMapper::HASH_TABLE_SIZE;
+            GPUHashEntry& entry = hash_table[probe_index];
+            
+            if (entry.GPU_virtual_ptr == 0) {
+                // 空槽位，创建新条目
+                entry.GPU_virtual_ptr = tensor_ptr;
+                entry.first_node = first_node_idx;
+                entry.mapping_count = mapping_count;
+                *success = true;
+                break;
+            } else if (entry.GPU_virtual_ptr == tensor_ptr) {
+                // 已存在的tensor，追加到链表
+                // 找到链表尾部
+                uint32_t current = entry.first_node;
+                while (mapping_nodes[current].next_node != GPUMemoryMapper::INVALID_INDEX) {
+                    current = mapping_nodes[current].next_node;
+                }
+                mapping_nodes[current].next_node = first_node_idx;
+                entry.mapping_count += mapping_count;
+                *success = true;
+                break;
+            }
+        }
+    }
+}
+
+bool GPUMemoryMapper::addMapping(uint64_t tensor_ptr, uint32_t nvme_dev, uint32_t transfer_type, uint64_t prp1, uint64_t prp2) {
+    if (!is_initialized_) {
+        geminifs_error("GPU Memory Mapper: Not initialized\n");
+        return false;
+    }
+    
+    std::lock_guard<std::mutex> lock(mapper_mutex_);
+    
+    // 分配设备端成功标志
+    bool* d_success;
+    cudaError_t err = cudaMalloc(&d_success, sizeof(bool));
+    if (err != cudaSuccess) {
+        geminifs_error("GPU Memory Mapper: Failed to allocate success flag: %s\n", 
+                       cudaGetErrorString(err));
+        return false;
+    }
+    
+    // 启动内核
+    kernel_add_mapping<<<1, 1>>>(tensor_ptr, nvme_dev, transfer_type, prp1, prp2,
+                                 d_hash_table_, d_mapping_nodes_, d_mapping_entries_,
+                                 d_free_entry_list_, d_free_node_list_,
+                                 d_free_entry_count_, d_free_node_count_, d_success);
+    
+    err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+        geminifs_error("GPU Memory Mapper: Kernel execution failed: %s\n", 
+                       cudaGetErrorString(err));
+        cudaFree(d_success);
+        return false;
+    }
+    
+    // 获取结果
+    bool success;
+    err = cudaMemcpy(&success, d_success, sizeof(bool), cudaMemcpyDeviceToHost);
+    cudaFree(d_success);
+    
+    if (err != cudaSuccess) {
+        geminifs_error("GPU Memory Mapper: Failed to copy result: %s\n", 
+                       cudaGetErrorString(err));
+        return false;
+    }
+    
+    if (success) {
+        geminifs_debug("GPU Memory Mapper: Added mapping for tensor 0x%lx -> NVMe %u, PRP1: 0x%lx, PRP2: 0x%lx\n",
+                       tensor_ptr, nvme_dev, prp1, prp2);
+    } else {
+        geminifs_error("GPU Memory Mapper: Failed to add mapping - no free space\n");
+    }
+    
+    return success;
+}
+
+bool GPUMemoryMapper::addBatchMappings(uint64_t tensor_ptr, const std::vector<PRPMappingEntry>& mappings) {
+    if (!is_initialized_) {
+        geminifs_error("GPU Memory Mapper: Not initialized\n");
+        return false;
+    }
+    
+    if (mappings.empty()) {
+        geminifs_warn("GPU Memory Mapper: Empty mappings provided\n");
+        return true;
+    }
+    
+    std::lock_guard<std::mutex> lock(mapper_mutex_);
+    
+    // 分配设备端内存
+    PRPMappingEntry* d_mappings;
+    bool* d_success;
+    
+    cudaError_t err = cudaMalloc(&d_mappings, sizeof(PRPMappingEntry) * mappings.size());
+    if (err != cudaSuccess) {
+        geminifs_error("GPU Memory Mapper: Failed to allocate device mappings: %s\n", 
+                       cudaGetErrorString(err));
+        return false;
+    }
+    
+    err = cudaMalloc(&d_success, sizeof(bool));
+    if (err != cudaSuccess) {
+        geminifs_error("GPU Memory Mapper: Failed to allocate success flag: %s\n", 
+                       cudaGetErrorString(err));
+        cudaFree(d_mappings);
+        return false;
+    }
+    
+    // 复制映射到设备
+    err = cudaMemcpy(d_mappings, mappings.data(), sizeof(PRPMappingEntry) * mappings.size(), 
+                     cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        geminifs_error("GPU Memory Mapper: Failed to copy mappings to device: %s\n", 
+                       cudaGetErrorString(err));
+        cudaFree(d_mappings);
+        cudaFree(d_success);
+        return false;
+    }
+    
+    // 启动内核
+    kernel_add_batch_mappings<<<1, 1>>>(tensor_ptr, d_mappings, static_cast<uint32_t>(mappings.size()),
+                                        d_hash_table_, d_mapping_nodes_, d_mapping_entries_,
+                                        d_free_entry_list_, d_free_node_list_,
+                                        d_free_entry_count_, d_free_node_count_, d_success);
+    
+    err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+        geminifs_error("GPU Memory Mapper: Kernel execution failed: %s\n", 
+                       cudaGetErrorString(err));
+        cudaFree(d_mappings);
+        cudaFree(d_success);
+        return false;
+    }
+    
+    // 获取结果
+    bool success;
+    err = cudaMemcpy(&success, d_success, sizeof(bool), cudaMemcpyDeviceToHost);
+    
+    cudaFree(d_mappings);
+    cudaFree(d_success);
+    
+    if (err != cudaSuccess) {
+        geminifs_error("GPU Memory Mapper: Failed to copy result: %s\n", 
+                       cudaGetErrorString(err));
+        return false;
+    }
+    
+    if (success) {
+        geminifs_debug("GPU Memory Mapper: Added %zu batch mappings for tensor 0x%lx\n",
+                       mappings.size(), tensor_ptr);
+    } else {
+        geminifs_error("GPU Memory Mapper: Failed to add batch mappings - insufficient resources\n");
+    }
+    
+    return success;
+}
+
+std::tuple<uint32_t, uint32_t, uint32_t, uint32_t> GPUMemoryMapper::getStats() const {
+    if (!is_initialized_) {
+        return std::make_tuple(0, 0, 0, 0);
+    }
+    
+    uint32_t free_entry_count, free_node_count;
+    
+    cudaError_t err = cudaMemcpy(&free_entry_count, d_free_entry_count_, sizeof(uint32_t), cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) {
+        geminifs_error("GPU Memory Mapper: Failed to get entry stats: %s\n", cudaGetErrorString(err));
+        return std::make_tuple(0, 0, 0, 0);
+    }
+    
+    err = cudaMemcpy(&free_node_count, d_free_node_count_, sizeof(uint32_t), cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) {
+        geminifs_error("GPU Memory Mapper: Failed to get node stats: %s\n", cudaGetErrorString(err));
+        return std::make_tuple(0, 0, 0, 0);
+    }
+    
+    uint32_t used_entries = MAX_MAPPINGS - free_entry_count;
+    uint32_t used_nodes = MAX_MAPPING_NODES - free_node_count;
+    
+    return std::make_tuple(used_entries, MAX_MAPPINGS, used_nodes, MAX_MAPPING_NODES);
+}
+ 
+
 // === PRPContext Implementation ===
 
 void PRPContext::cleanup() {
@@ -248,12 +843,28 @@ bool GPUController::initialize() {
     // Initialize containers
     dma_contexts_.clear();
     nvme_controllers_.clear();
+
+    // Initialize memory mapper
+    memory_mapper_ = std::make_unique<GPUMemoryMapper>(device_id_);
+    if (!memory_mapper_->initialize()) {
+        geminifs_error("GPU Controller: Failed to initialize memory mapper for device %d\n", device_id_);
+        return false;
+    }
+    
+    geminifs_debug("GPU Controller: Successfully initialized memory mapper for device %d\n", device_id_);
     
     return true;
 }
 
 void GPUController::cleanup() {
     geminifs_debug("GPU Controller: Cleaning up device %d\n", device_id_);
+    
+    // Cleanup memory mapper first (before clearing DMA contexts that might use it)
+    if (memory_mapper_) {
+        geminifs_debug("GPU Controller: Cleaning up memory mapper\n");
+        memory_mapper_->cleanup();
+        memory_mapper_.reset();
+    }
     
     // Clear all DMA contexts
     clearAllDMAContexts();
@@ -272,6 +883,7 @@ void GPUController::cleanup() {
         
         nvme_controllers_.clear();
     }
+
     
     is_initialized_.store(false);
 }
@@ -529,6 +1141,7 @@ geminifs_dma* GPUController::createDMAContext(const torch::Tensor& tensor) {
     geminifs_dma* dma_ctx = new geminifs_dma();
     dma_ctx->dma_ptr = dma_ptr;
     
+    // fixme: delete the ioaddrs in GPU HBM 
     // 处理 ioaddrs
     uint64_t* ioaddrs = nullptr;
     if (!dma_ptr->contiguous) {
