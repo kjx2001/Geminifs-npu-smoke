@@ -338,21 +338,7 @@ struct DMAInfo{
 // }
 
 
-/**
- * 检查指针是否为CUDA设备指针
- */
-static inline bool is_device_pointer(const void* ptr, const char* error_msg = nullptr) {
-    cudaPointerAttributes attrs;
-    cudaError_t err = cudaPointerGetAttributes(&attrs, ptr);
-    
-    bool is_device = (err == cudaSuccess && attrs.type == cudaMemoryTypeDevice);
-    
-    if (error_msg != nullptr && !is_device) {
-        TORCH_CHECK(false, error_msg);
-    }
-    
-    return is_device;
-}
+
 
 
 

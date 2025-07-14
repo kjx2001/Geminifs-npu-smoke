@@ -19,6 +19,7 @@ struct NVMeConfig {
     uint64_t queueDepth;
     uint64_t numQueues;
     int cudaDevice;
+    uint64_t maxIOsize;
 };
 
 struct SystemConfigGroup {
@@ -85,6 +86,9 @@ void auto_configure_fd_limits(int num_files_to_open = 1000);
 // Memory alignment utility functions
 bool is_aligned(uint64_t value, size_t alignment = 65536ul);  // GPU_PAGE_SIZE = 65536ul
 bool is_ptr_aligned(const void* ptr, size_t alignment = 65536ul);
+
+// CUDA device pointer utility functions
+bool is_device_pointer(const void* ptr, const char* error_msg = nullptr);
 
 ParsedSystemConfig parse_system_config(const std::string& config_file_path);
 std::vector<nvme_ctrl_param> convert_to_nvme_ctrl_params(const ParsedSystemConfig& config);

@@ -37,12 +37,13 @@ public:
     ControllerPtr controller;      // NVMe controller smart pointer
     std::unique_ptr<FileManager> file_manager; // File manager for this mount
     std::string mount_path;        // Mount path
+    uint64_t maxIOsize;            // Maximum I/O size
     
     // GPU-side queue management helper
     QueueAcquireHelper *d_queue_acquire_helper;
 
     NVMeController(const ControllerPtr& ctrl, std::unique_ptr<FileManager> fm, const std::string& path)
-        : controller(ctrl), file_manager(std::move(fm)), mount_path(path), is_initialized_(false), d_queue_acquire_helper(nullptr) {}
+        : controller(ctrl), file_manager(std::move(fm)), mount_path(path), maxIOsize(0), is_initialized_(false), d_queue_acquire_helper(nullptr) {}
 
     NVMeController(const nvme_ctrl_param& params);
     
@@ -90,6 +91,9 @@ private:
 
 // Smart pointer for NVMeController
 using NVMeControllerPtr = std::shared_ptr<NVMeController>;
+
+__device__
+void * nvme_controller_g_read(dev_fd_t device_fd, uint64_t prp1, uint64_t prp2, size_t file_offset, size_t nbytes);
 
 
 #endif // __NVME_CONTROLLER_H__

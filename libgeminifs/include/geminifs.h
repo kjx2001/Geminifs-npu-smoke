@@ -57,6 +57,7 @@ struct nvme_ctrl_param {
 	uint32_t ns_id;
 	uint64_t queueDepth;
 	uint64_t numQueues;
+	uint64_t maxIOsize;
 };
 
 typedef int fd_t;

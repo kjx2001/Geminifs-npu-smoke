@@ -26,6 +26,21 @@
 #include <sstream>
 #include "ioctl.h"
 
+// Include for PyTorch TORCH_CHECK macro
+#ifdef TORCH_CHECK
+// PyTorch is available
+#include <torch/torch.h>
+#else
+// Fallback definition for TORCH_CHECK when PyTorch is not available
+#define TORCH_CHECK(condition, message) \
+    do { \
+        if (!(condition)) { \
+            std::cerr << "Error: " << message << std::endl; \
+            std::abort(); \
+        } \
+    } while(0)
+#endif
+
 using json = nlohmann::json;
 
 // 计算两个PCI设备的距离
@@ -422,6 +437,8 @@ ParsedSystemConfig parse_system_config(const std::string& config_file_path) {
                 current_nvme.numQueues = std::stoull(value);
             } else if (key == "cudaDevice") {
                 current_nvme.cudaDevice = std::stoi(value);
+            } else if (key == "maxIOsize") {
+                current_nvme.maxIOsize = std::stoull(value);
             }
         }
     }
@@ -516,9 +533,29 @@ std::vector<nvme_ctrl_param> convert_to_nvme_ctrl_params(const ParsedSystemConfi
             param.ns_id = nvme.ns_id;
             param.queueDepth = nvme.queueDepth;
             param.numQueues = nvme.numQueues;
+            param.maxIOsize = nvme.maxIOsize;
             params.push_back(param);
         }
     }
     
     return params;
+}
+
+/**
+ * Check if a pointer is a CUDA device pointer
+ * @param ptr The pointer to check
+ * @param error_msg Optional error message. If provided and pointer is not a device pointer, TORCH_CHECK will be called
+ * @return Returns true if the pointer is a device pointer, false otherwise
+ */
+bool is_device_pointer(const void* ptr, const char* error_msg) {
+    cudaPointerAttributes attrs;
+    cudaError_t err = cudaPointerGetAttributes(&attrs, ptr);
+    
+    bool is_device = (err == cudaSuccess && attrs.type == cudaMemoryTypeDevice);
+    
+    if (error_msg != nullptr && !is_device) {
+        TORCH_CHECK(false, error_msg);
+    }
+    
+    return is_device;
 }

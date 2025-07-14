@@ -48,6 +48,15 @@ NVMeController::NVMeController(const nvme_ctrl_param& params) : is_initialized_(
     // Set mount path
     mount_path = params.mount_path;
     
+    // Set maximum I/O size
+    maxIOsize = params.maxIOsize;
+    
+    // Check if maxIOsize is within supported limits
+    if (maxIOsize > 1024) {
+        geminifs_error("NVMeController initialization failed: maxIOsize (%llu) exceeds maximum supported size (1024). Current system only supports up to 1MB NVMe I/O\n", maxIOsize);
+        throw std::runtime_error("maxIOsize exceeds supported limit of 1024");
+    }
+    
     // Create mount directory if it doesn't exist
     std::filesystem::create_directories(mount_path);
     
@@ -667,8 +676,8 @@ void NVMeController::cleanup_device_files() {
 
 ControllerPtr NVMeController::open_single_controller(const std::string& pci_addr, const nvme_ctrl_param& params) {
     // Create mount path for this specific controller
-    std::filesystem::path mount_path(params.mount_path);
-    std::filesystem::path this_mount_path = mount_path;
+    std::filesystem::path mount_path_param(params.mount_path);
+    std::filesystem::path this_mount_path = mount_path_param;
 
     if (!std::filesystem::exists(this_mount_path)) {
         std::filesystem::create_directories(this_mount_path);
@@ -811,3 +820,12 @@ bool NVMeController::device_file_delete_all_files_managed() {
 }
 
 // GPU device-side read/write interface using NVMeFile pointer
+
+
+__device__
+void * nvme_controller_g_read(dev_fd_t device_fd, uint64_t prp1, uint64_t prp2, size_t file_offset, size_t nbytes)
+{
+    auto *nvme_file = (NVMe_File*)device_fd;
+    // Call the read method on the NVMe_File instance
+    nvme_file->read_in(prp1, prp2, file_offset, nbytes);
+}
