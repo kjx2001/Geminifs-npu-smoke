@@ -1113,7 +1113,7 @@ bool GPUController::validateTensor(const torch::Tensor& tensor) const {
     
     return true;
 }
-
+// fixme: tensor 需要进一步按照文件粒度切分，然后再进一步切分
 geminifs_dma* GPUController::createDMAContext(const torch::Tensor& tensor) {
     auto tensor_size = tensor.numel() * tensor.element_size();
     
@@ -1140,6 +1140,55 @@ geminifs_dma* GPUController::createDMAContext(const torch::Tensor& tensor) {
     // 创建 geminifs_dma 结构
     geminifs_dma* dma_ctx = new geminifs_dma();
     dma_ctx->dma_ptr = dma_ptr;
+    
+    // 计算切片粒度：所有NVMe控制器maxIOsize的最小值
+    uint64_t min_max_io_size = UINT64_MAX;
+    size_t num_nvme_controllers = nvme_controllers_.size();
+    
+    for (const auto& nvme_ctrl : nvme_controllers_) {
+        if (nvme_ctrl && nvme_ctrl->maxIOsize > 0) {
+            min_max_io_size = std::min(min_max_io_size, nvme_ctrl->maxIOsize);
+        }
+    }
+    
+    // 如果没有找到有效的maxIOsize，报错并返回
+    if (min_max_io_size == UINT64_MAX) {
+        geminifs_error("GPU Controller: No valid maxIOsize found in any NVMe controller. Memory registration failed.\n");
+        delete dma_ctx;
+        return nullptr;
+    }
+    
+    dma_ctx->slice_granularity = min_max_io_size;
+    
+    // 根据切片粒度计算切片
+    if (tensor_size <= min_max_io_size) {
+        // 数据小于等于最小粒度，不进行切片
+        dma_ctx->num_slices = 1;
+        dma_ctx->slice_sizes.push_back(tensor_size);
+        dma_ctx->slice_offsets.push_back(0);
+        
+        geminifs_debug("GPU Controller: Tensor size %zu <= min_max_io_size %llu, no slicing needed\n", 
+                       tensor_size, min_max_io_size);
+    } else {
+        // 需要进行切片
+        size_t remaining_size = tensor_size;
+        size_t current_offset = 0;
+        
+        while (remaining_size > 0) {
+            size_t slice_size = std::min(remaining_size, (size_t)min_max_io_size);
+            dma_ctx->slice_sizes.push_back(slice_size);
+            dma_ctx->slice_offsets.push_back(current_offset);
+            
+            current_offset += slice_size;
+            remaining_size -= slice_size;
+        }
+        
+        dma_ctx->num_slices = dma_ctx->slice_sizes.size();
+        
+        geminifs_debug("GPU Controller: Sliced tensor into %zu slices, granularity %llu bytes, "
+                       "num_controllers %zu\n", 
+                       dma_ctx->num_slices, min_max_io_size, num_nvme_controllers);
+    }
     
     // fixme: delete the ioaddrs in GPU HBM 
     // 处理 ioaddrs

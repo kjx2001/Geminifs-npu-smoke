@@ -65,7 +65,14 @@ struct geminifs_dma{
     DmaPtr dma_ptr;                             // DMA 指针
     PRPContext* prp_context;                    // PRP 上下文
     
-    geminifs_dma() : ioaddrs(nullptr), dma_ptr(nullptr), prp_context(nullptr) {}
+    // Slice 相关字段
+    std::vector<size_t> slice_sizes;            // 每个切片的大小
+    std::vector<size_t> slice_offsets;          // 每个切片在原始数据中的偏移
+    uint64_t slice_granularity;                 // 切片粒度（最小maxIOsize）
+    size_t num_slices;                          // 切片数量
+    
+    geminifs_dma() : ioaddrs(nullptr), dma_ptr(nullptr), prp_context(nullptr), 
+                     slice_granularity(0), num_slices(0) {}
     
     ~geminifs_dma() {
         if (prp_context) {
