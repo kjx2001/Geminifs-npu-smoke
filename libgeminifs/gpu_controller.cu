@@ -890,7 +890,7 @@ void GPUController::cleanup() {
 
 // === Memory Management Methods ===
 
-bool GPUController::registerTensorMemory(const torch::Tensor& tensor) {
+bool GPUController::registerTensorMemory(const torch::Tensor& tensor, uint64_t granularity) {
     if (!isInitialized()) {
         geminifs_error("GPU Controller: Device %d is not initialized\n", device_id_);
         return false;
@@ -901,6 +901,25 @@ bool GPUController::registerTensorMemory(const torch::Tensor& tensor) {
     }
     
     uint64_t tensor_ptr = reinterpret_cast<uint64_t>(tensor.data_ptr());
+    auto tensor_size = tensor.numel() * tensor.element_size();
+    
+    // Check 4K alignment for tensor pointer
+    if (tensor_ptr % 4096 != 0) {
+        geminifs_error("GPU Controller: Tensor pointer 0x%lx is not 4K aligned. Memory registration failed.\n", tensor_ptr);
+        return false;
+    }
+    
+    // Check 4K alignment for tensor size
+    if (tensor_size % 4096 != 0) {
+        geminifs_error("GPU Controller: Tensor size %zu is not 4K aligned. Memory registration failed.\n", tensor_size);
+        return false;
+    }
+    
+    // Check 4K alignment for granularity (if specified)
+    if (granularity > 0 && granularity % 4096 != 0) {
+        geminifs_error("GPU Controller: Granularity %llu is not 4K aligned. Memory registration failed.\n", granularity);
+        return false;
+    }
     
     {
         std::lock_guard<std::mutex> lock(memory_mutex_);
@@ -912,7 +931,7 @@ bool GPUController::registerTensorMemory(const torch::Tensor& tensor) {
         }
         
         // Create DMA context
-        geminifs_dma* dma_ctx = createDMAContext(tensor);
+        geminifs_dma* dma_ctx = createDMAContext(tensor, granularity);
         if (dma_ctx == nullptr) {
             geminifs_error("GPU Controller: Failed to create DMA context for tensor at %p\n", tensor.data_ptr());
             return false;
@@ -1114,8 +1133,18 @@ bool GPUController::validateTensor(const torch::Tensor& tensor) const {
     return true;
 }
 // fixme: tensor 需要进一步按照文件粒度切分，然后再进一步切分
-geminifs_dma* GPUController::createDMAContext(const torch::Tensor& tensor) {
+geminifs_dma* GPUController::createDMAContext(const torch::Tensor& tensor, uint64_t granularity) {
     auto tensor_size = tensor.numel() * tensor.element_size();
+    
+    // 如果指定了切割粒度（非0），检查tensor大小是否为粒度的整数倍
+    if (granularity > 0) {
+        if (tensor_size % granularity != 0) {
+            geminifs_error("GPU Controller: Tensor size %zu is not a multiple of granularity %llu. Memory registration failed.\n", 
+                          tensor_size, granularity);
+            return nullptr;
+        }
+        geminifs_debug("GPU Controller: Using external granularity %llu for tensor size %zu\n", granularity, tensor_size);
+    }
     
     // For now, we'll assume we have at least one NVMe controller to get the ctrl pointer
     if (nvme_controllers_.empty()) {
@@ -1141,7 +1170,7 @@ geminifs_dma* GPUController::createDMAContext(const torch::Tensor& tensor) {
     geminifs_dma* dma_ctx = new geminifs_dma();
     dma_ctx->dma_ptr = dma_ptr;
     
-    // 计算切片粒度：所有NVMe控制器maxIOsize的最小值
+    // 获取所有NVMe控制器maxIOsize的最小值（用于第二级切割）
     uint64_t min_max_io_size = UINT64_MAX;
     size_t num_nvme_controllers = nvme_controllers_.size();
     
@@ -1158,105 +1187,202 @@ geminifs_dma* GPUController::createDMAContext(const torch::Tensor& tensor) {
         return nullptr;
     }
     
-    dma_ctx->slice_granularity = min_max_io_size;
+    // 记录切片粒度信息
+    dma_ctx->slice_granularity = (granularity > 0) ? granularity : min_max_io_size;
     
-    // 根据切片粒度计算切片
-    if (tensor_size <= min_max_io_size) {
-        // 数据小于等于最小粒度，不进行切片
-        dma_ctx->num_slices = 1;
-        dma_ctx->slice_sizes.push_back(tensor_size);
-        dma_ctx->slice_offsets.push_back(0);
-        
-        geminifs_debug("GPU Controller: Tensor size %zu <= min_max_io_size %llu, no slicing needed\n", 
-                       tensor_size, min_max_io_size);
-    } else {
-        // 需要进行切片
+    // 实现两级切割逻辑
+    if (granularity > 0) {
+        // 第一级：按照外部传入的granularity进行切割
+        std::vector<std::pair<size_t, size_t>> primary_slices;  // (offset, size)
         size_t remaining_size = tensor_size;
         size_t current_offset = 0;
         
         while (remaining_size > 0) {
-            size_t slice_size = std::min(remaining_size, (size_t)min_max_io_size);
-            dma_ctx->slice_sizes.push_back(slice_size);
-            dma_ctx->slice_offsets.push_back(current_offset);
+            size_t slice_size = std::min(remaining_size, (size_t)granularity);
+            primary_slices.push_back(std::make_pair(current_offset, slice_size));
             
             current_offset += slice_size;
             remaining_size -= slice_size;
         }
         
+        geminifs_debug("GPU Controller: First-level slicing: %zu slices by granularity %llu\n", 
+                       primary_slices.size(), granularity);
+        
+        // 第二级：对每个第一级切片再按照maxIOsize进行切割
+        for (const auto& primary_slice : primary_slices) {
+            size_t slice_offset = primary_slice.first;
+            size_t slice_size = primary_slice.second;
+            
+            if (slice_size <= min_max_io_size) {
+                // 当前切片小于等于maxIOsize，不需要进一步切割
+                dma_ctx->slice_sizes.push_back(slice_size);
+                dma_ctx->slice_offsets.push_back(slice_offset);
+            } else {
+                // 当前切片需要按照maxIOsize进一步切割
+                size_t sub_remaining = slice_size;
+                size_t sub_offset = slice_offset;
+                
+                while (sub_remaining > 0) {
+                    size_t sub_slice_size = std::min(sub_remaining, (size_t)min_max_io_size);
+                    dma_ctx->slice_sizes.push_back(sub_slice_size);
+                    dma_ctx->slice_offsets.push_back(sub_offset);
+                    
+                    sub_offset += sub_slice_size;
+                    sub_remaining -= sub_slice_size;
+                }
+            }
+        }
+        
         dma_ctx->num_slices = dma_ctx->slice_sizes.size();
         
-        geminifs_debug("GPU Controller: Sliced tensor into %zu slices, granularity %llu bytes, "
-                       "num_controllers %zu\n", 
-                       dma_ctx->num_slices, min_max_io_size, num_nvme_controllers);
-    }
-    
-    // fixme: delete the ioaddrs in GPU HBM 
-    // 处理 ioaddrs
-    uint64_t* ioaddrs = nullptr;
-    if (!dma_ptr->contiguous) {
-        // If the ioaddr of dma is not contiguous, allocate device buffer
-        geminifs_info("GPU Controller: Allocating device memory for non-contiguous ioaddrs\n");
-        cudaError_t err = cudaMalloc(&ioaddrs, sizeof(uint64_t) * dma_ptr->n_ioaddrs);
-        if (err != cudaSuccess) {
-            geminifs_error("GPU Controller: Failed to allocate device memory for ioaddrs: %s\n", 
-                           cudaGetErrorString(err));
-            delete dma_ctx;
-            return nullptr;
-        }
+        geminifs_debug("GPU Controller: Two-level slicing complete: %zu final slices "
+                       "(granularity %llu -> maxIOsize %llu)\n", 
+                       dma_ctx->num_slices, granularity, min_max_io_size);
         
-        err = cudaMemcpy(ioaddrs, dma_ptr->ioaddrs, sizeof(uint64_t) * dma_ptr->n_ioaddrs, 
-                         cudaMemcpyHostToDevice);
-        if (err != cudaSuccess) {
-            geminifs_error("GPU Controller: Failed to copy ioaddrs to device: %s\n", 
-                           cudaGetErrorString(err));
-            cudaFree(ioaddrs);
-            delete dma_ctx;
-            return nullptr;
-        }
-    }
-    dma_ctx->ioaddrs = ioaddrs;
-    
-    // 创建 PRP 上下文
-    std::vector<uint64_t> ioaddr_vector;
-    
-    // 将 DMA 地址复制到 vector 中
-    if (dma_ptr->contiguous && dma_ptr->n_ioaddrs > 0) {
-        // 连续内存，计算所有页面地址
-        uint64_t base_addr = dma_ptr->ioaddrs[0];
-        size_t num_pages = (tensor_size + PRP_PAGE_SIZE - 1) / PRP_PAGE_SIZE;
-        
-        for (size_t i = 0; i < num_pages; ++i) {
-            ioaddr_vector.push_back(base_addr + i * PRP_PAGE_SIZE);
-        }
     } else {
-        // 非连续内存，使用所有提供的地址
-        for (size_t i = 0; i < dma_ptr->n_ioaddrs; ++i) {
-            ioaddr_vector.push_back(dma_ptr->ioaddrs[i]);
+        // 没有外部粒度，只按照maxIOsize进行切割
+        if (tensor_size <= min_max_io_size) {
+            // 数据小于等于maxIOsize，不进行切片
+            dma_ctx->num_slices = 1;
+            dma_ctx->slice_sizes.push_back(tensor_size);
+            dma_ctx->slice_offsets.push_back(0);
+            
+            geminifs_debug("GPU Controller: Tensor size %zu <= maxIOsize %llu, no slicing needed\n", 
+                           tensor_size, min_max_io_size);
+        } else {
+            // 需要按照maxIOsize进行切片
+            size_t remaining_size = tensor_size;
+            size_t current_offset = 0;
+            
+            while (remaining_size > 0) {
+                size_t slice_size = std::min(remaining_size, (size_t)min_max_io_size);
+                dma_ctx->slice_sizes.push_back(slice_size);
+                dma_ctx->slice_offsets.push_back(current_offset);
+                
+                current_offset += slice_size;
+                remaining_size -= slice_size;
+            }
+            
+            dma_ctx->num_slices = dma_ctx->slice_sizes.size();
+            
+            geminifs_debug("GPU Controller: Single-level slicing: %zu slices by maxIOsize %llu\n", 
+                           dma_ctx->num_slices, min_max_io_size);
         }
     }
     
-    // 检查数据大小限制
-    if (tensor_size > MAX_TRANSFER_SIZE) {
-        geminifs_error("GPU Controller: Tensor size %zu exceeds maximum transfer size %zu\n", 
-                      tensor_size, MAX_TRANSFER_SIZE);
-        delete dma_ctx;
-        return nullptr;
+    // 对所有切片的size和offset进行4K对齐检查
+    const uint64_t alignment_4k = 4096;
+    for (size_t i = 0; i < dma_ctx->num_slices; i++) {
+        size_t slice_size = dma_ctx->slice_sizes[i];
+        size_t slice_offset = dma_ctx->slice_offsets[i];
+        
+        // 检查slice size是否4K对齐
+        if (slice_size % alignment_4k != 0) {
+            geminifs_error("GPU Controller: Slice %zu size %zu is not 4K-aligned\n", i, slice_size);
+            delete dma_ctx;
+            return nullptr;
+        }
+        
+        // 检查slice offset是否4K对齐
+        if (slice_offset % alignment_4k != 0) {
+            geminifs_error("GPU Controller: Slice %zu offset %zu is not 4K-aligned\n", i, slice_offset);
+            delete dma_ctx;
+            return nullptr;
+        }
     }
     
-    // 创建 PRP 上下文
-    dma_ctx->prp_context = new PRPContext();
-    if (!dma_ctx->prp_context->buildPRPList(ioaddr_vector)) {
-        geminifs_error("GPU Controller: Failed to build PRP list for tensor\n");
-        delete dma_ctx;
-        return nullptr;
+    geminifs_debug("GPU Controller: All %zu slices are 4K-aligned (size and offset)\n", 
+                   dma_ctx->num_slices);
+    
+    // Print DMA context information for debugging
+    geminifs_info("GPU Controller: DMA Context Created Successfully\n");
+    geminifs_info("  Tensor size: %zu bytes\n", tensor_size);
+    geminifs_info("  Slice granularity: %llu bytes\n", dma_ctx->slice_granularity);
+    geminifs_info("  Min maxIOsize: %llu bytes\n", min_max_io_size);
+    geminifs_info("  Total slices: %zu\n", dma_ctx->num_slices);
+    
+    // Print detailed slice information
+    for (size_t i = 0; i < dma_ctx->num_slices; i++) {
+        geminifs_info("  Slice[%zu]: offset=%zu, size=%zu\n", 
+                      i, dma_ctx->slice_offsets[i], dma_ctx->slice_sizes[i]);
     }
     
-    geminifs_debug("GPU Controller: Created DMA context for tensor %p, size %zu, transfer_type: %s, "
-                   "ioaddr 0x%lx, n_ioaddrs %zu, contiguous %d, prp_pages %zu\n", 
-                   tensor.data_ptr(), tensor_size, 
-                   getPRPTransferTypeString(dma_ctx->prp_context->transfer_type),
-                   dma_ptr->ioaddrs[0], dma_ptr->n_ioaddrs, dma_ptr->contiguous,
-                   dma_ctx->prp_context->num_prp_pages);
+    // Print DMA pointer information
+    if (dma_ctx->dma_ptr) {
+        geminifs_info("  DMA ptr contiguous: %s\n", dma_ctx->dma_ptr->contiguous ? "Yes" : "No");
+        geminifs_info("  DMA ptr n_ioaddrs: %zu\n", dma_ctx->dma_ptr->n_ioaddrs);
+        if (dma_ctx->dma_ptr->n_ioaddrs > 0) {
+            geminifs_info("  DMA ptr first ioaddr: 0x%lx\n", dma_ctx->dma_ptr->ioaddrs[0]);
+        }
+    }
+    
+    // // fixme: delete the ioaddrs in GPU HBM 
+    // // 处理 ioaddrs
+    // uint64_t* ioaddrs = nullptr;
+    // if (!dma_ptr->contiguous) {
+    //     // If the ioaddr of dma is not contiguous, allocate device buffer
+    //     geminifs_info("GPU Controller: Allocating device memory for non-contiguous ioaddrs\n");
+    //     cudaError_t err = cudaMalloc(&ioaddrs, sizeof(uint64_t) * dma_ptr->n_ioaddrs);
+    //     if (err != cudaSuccess) {
+    //         geminifs_error("GPU Controller: Failed to allocate device memory for ioaddrs: %s\n", 
+    //                        cudaGetErrorString(err));
+    //         delete dma_ctx;
+    //         return nullptr;
+    //     }
+        
+    //     err = cudaMemcpy(ioaddrs, dma_ptr->ioaddrs, sizeof(uint64_t) * dma_ptr->n_ioaddrs, 
+    //                      cudaMemcpyHostToDevice);
+    //     if (err != cudaSuccess) {
+    //         geminifs_error("GPU Controller: Failed to copy ioaddrs to device: %s\n", 
+    //                        cudaGetErrorString(err));
+    //         cudaFree(ioaddrs);
+    //         delete dma_ctx;
+    //         return nullptr;
+    //     }
+    // }
+    // dma_ctx->ioaddrs = ioaddrs;
+    
+    // // 创建 PRP 上下文
+    // std::vector<uint64_t> ioaddr_vector;
+    
+    // // 将 DMA 地址复制到 vector 中
+    // if (dma_ptr->contiguous && dma_ptr->n_ioaddrs > 0) {
+    //     // 连续内存，计算所有页面地址
+    //     uint64_t base_addr = dma_ptr->ioaddrs[0];
+    //     size_t num_pages = (tensor_size + PRP_PAGE_SIZE - 1) / PRP_PAGE_SIZE;
+        
+    //     for (size_t i = 0; i < num_pages; ++i) {
+    //         ioaddr_vector.push_back(base_addr + i * PRP_PAGE_SIZE);
+    //     }
+    // } else {
+    //     // 非连续内存，使用所有提供的地址
+    //     for (size_t i = 0; i < dma_ptr->n_ioaddrs; ++i) {
+    //         ioaddr_vector.push_back(dma_ptr->ioaddrs[i]);
+    //     }
+    // }
+    
+    // // 检查数据大小限制
+    // if (tensor_size > MAX_TRANSFER_SIZE) {
+    //     geminifs_error("GPU Controller: Tensor size %zu exceeds maximum transfer size %zu\n", 
+    //                   tensor_size, MAX_TRANSFER_SIZE);
+    //     delete dma_ctx;
+    //     return nullptr;
+    // }
+    
+    // // 创建 PRP 上下文
+    // dma_ctx->prp_context = new PRPContext();
+    // if (!dma_ctx->prp_context->buildPRPList(ioaddr_vector)) {
+    //     geminifs_error("GPU Controller: Failed to build PRP list for tensor\n");
+    //     delete dma_ctx;
+    //     return nullptr;
+    // }
+    
+    // geminifs_debug("GPU Controller: Created DMA context for tensor %p, size %zu, transfer_type: %s, "
+    //                "ioaddr 0x%lx, n_ioaddrs %zu, contiguous %d, prp_pages %zu\n", 
+    //                tensor.data_ptr(), tensor_size, 
+    //                getPRPTransferTypeString(dma_ctx->prp_context->transfer_type),
+    //                dma_ptr->ioaddrs[0], dma_ptr->n_ioaddrs, dma_ptr->contiguous,
+    //                dma_ctx->prp_context->num_prp_pages);
     
     return dma_ctx;
 }

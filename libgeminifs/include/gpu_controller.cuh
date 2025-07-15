@@ -222,7 +222,7 @@ public:
      * @param tensor PyTorch tensor to register
      * @return true if successful, false otherwise
      */
-    bool registerTensorMemory(const torch::Tensor& tensor);
+    bool registerTensorMemory(const torch::Tensor& tensor, uint64_t granularity = 0);
     
     /**
      * Unregister a tensor's memory
@@ -364,7 +364,7 @@ private:
      * @param tensor Tensor to create context for
      * @return DMA context or nullptr if failed
      */
-    struct geminifs_dma* createDMAContext(const torch::Tensor& tensor);
+    struct geminifs_dma* createDMAContext(const torch::Tensor& tensor, uint64_t granularity = 0);
     
     // === PRP List Management Methods ===
     

@@ -800,7 +800,7 @@ __host__ bool geminifs_add_nvme_to_gpu(int device_id, const nvme_ctrl_param& par
 /**
  * Register tensor memory with GPU controller
  */
-__host__ bool geminifs_register_tensor_with_gpu(const torch::Tensor& tensor) {
+__host__ bool geminifs_register_tensor_with_gpu(const torch::Tensor& tensor, uint64_t granularity) {
     int device_id = tensor.device().index();
     auto gpu_controller = geminifs_get_gpu_controller(device_id);
     
@@ -809,7 +809,7 @@ __host__ bool geminifs_register_tensor_with_gpu(const torch::Tensor& tensor) {
         return false;
     }
     
-    return gpu_controller->registerTensorMemory(tensor);
+    return gpu_controller->registerTensorMemory(tensor, granularity);
 }
 
 /**

@@ -48,13 +48,19 @@ NVMeController::NVMeController(const nvme_ctrl_param& params) : is_initialized_(
     // Set mount path
     mount_path = params.mount_path;
     
-    // Set maximum I/O size
-    maxIOsize = params.maxIOsize;
+    // Set maximum I/O size (convert from KB to bytes)
+    maxIOsize = params.maxIOsize * 1024;
     
-    // Check if maxIOsize is within supported limits
-    if (maxIOsize > 1024) {
-        geminifs_error("NVMeController initialization failed: maxIOsize (%llu) exceeds maximum supported size (1024). Current system only supports up to 1MB NVMe I/O\n", maxIOsize);
-        throw std::runtime_error("maxIOsize exceeds supported limit of 1024");
+    // Check if maxIOsize is within supported limits (params.maxIOsize is in KB)
+    if (params.maxIOsize > 1024) {
+        geminifs_error("NVMeController initialization failed: maxIOsize (%llu KB) exceeds maximum supported size (1024 KB). Current system only supports up to 1MB NVMe I/O\n", params.maxIOsize);
+        throw std::runtime_error("maxIOsize exceeds supported limit of 1024 KB");
+    }
+    
+    // Check if maxIOsize is 4K aligned
+    if (maxIOsize % 4096 != 0) {
+        geminifs_error("NVMeController initialization failed: maxIOsize (%llu bytes) is not 4K aligned. maxIOsize must be a multiple of 4096 bytes\n", maxIOsize);
+        throw std::runtime_error("maxIOsize is not 4K aligned");
     }
     
     // Create mount directory if it doesn't exist
