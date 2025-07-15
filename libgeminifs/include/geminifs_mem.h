@@ -7,6 +7,9 @@
 #include <cstring>
 #include "buffer.h"
 
+// 前向声明
+struct PRPMappingEntry;
+
 // PRP List 相关常量
 constexpr size_t PRP_PAGE_SIZE = 4096;                           // 4KB 页面大小
 constexpr size_t PRP_ENTRY_SIZE = 8;                             // 每个 PRP entry 8 字节
@@ -71,13 +74,25 @@ struct geminifs_dma{
     uint64_t slice_granularity;                 // 切片粒度（最小maxIOsize）
     size_t num_slices;                          // 切片数量
     
+    // PRP Mapping 相关字段
+    std::vector<PRPMappingEntry> prp_mappings;  // PRP映射条目数组
+    
+    // Type 2 PRP List GPU内存相关字段
+    void* type2_prp_gpu_memory;                 // 第三种类型PRP所需的GPU内存指针
+    size_t type2_prp_count;                     // 第三种类型PRP的数量
+    DmaPtr type2_prp_dma_ptr;                   // 第三种类型PRP GPU内存的DMA指针
+    
     geminifs_dma() : ioaddrs(nullptr), dma_ptr(nullptr), prp_context(nullptr), 
-                     slice_granularity(0), num_slices(0) {}
+                     slice_granularity(0), num_slices(0), type2_prp_gpu_memory(nullptr), type2_prp_count(0), type2_prp_dma_ptr(nullptr) {}
     
     ~geminifs_dma() {
         if (prp_context) {
             delete prp_context;
             prp_context = nullptr;
+        }
+        if (type2_prp_gpu_memory) {
+            cudaFree(type2_prp_gpu_memory);
+            type2_prp_gpu_memory = nullptr;
         }
     }
 };

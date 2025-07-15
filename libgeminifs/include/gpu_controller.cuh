@@ -13,16 +13,15 @@
 #include "geminifs_mem.h"
 
 /**
- * PRP映射条目结构 (24字节)
+ * PRP映射条目结构 (20字节)
  */
 struct PRPMappingEntry {
-    uint32_t NVMe_dev;         // index of NVMe device (4字节)
     uint32_t transfer_type; // NVMe cmd transfer type (4字节)
     uint64_t prp1;          // PRP1
     uint64_t prp2;          // PRP2 may be NULL
-    __device__ __host__ PRPMappingEntry() :  NVMe_dev(0), transfer_type(0), prp1(0), prp2(0)  {}
-    __device__ __host__ PRPMappingEntry(uint32_t NVMe_dev,uint32_t transfer_type,uint64_t p1, uint64_t p2 ) 
-        : NVMe_dev(0), transfer_type(0), prp1(p1), prp2(p2) {}
+    __device__ __host__ PRPMappingEntry() : transfer_type(0), prp1(0), prp2(0)  {}
+    __device__ __host__ PRPMappingEntry(uint32_t transfer_type, uint64_t p1, uint64_t p2 ) 
+        : transfer_type(transfer_type), prp1(p1), prp2(p2) {}
 };
 
 /**
@@ -91,13 +90,12 @@ public:
     /**
      * 添加单个映射到已存在的tensor
      * @param tensor_ptr Tensor的GPU虚拟内存指针
-     * @param nvme_dev NVMe设备索引
      * @param transfer_type 传输类型
      * @param prp1 PRP1地址
      * @param prp2 PRP2地址
      * @return 成功返回true
      */
-    bool addMapping(uint64_t tensor_ptr, uint32_t nvme_dev, uint32_t transfer_type, uint64_t prp1, uint64_t prp2);
+    bool addMapping(uint64_t tensor_ptr, uint32_t transfer_type, uint64_t prp1, uint64_t prp2);
     
     
     /**
@@ -109,20 +107,12 @@ public:
     bool addBatchMappings(uint64_t tensor_ptr, const std::vector<PRPMappingEntry>& mappings);
  
     
-     /**
+    /**
      * 移除tensor的所有映射
      * @param tensor_ptr Tensor的GPU虚拟内存指针
      * @return 成功返回true
      */
     bool removeAllMappings(uint64_t tensor_ptr);
-
-    /**
-     * 移除tensor的特定映射
-     * @param tensor_ptr Tensor的GPU虚拟内存指针
-     * @param nvme_dev 要移除的NVMe设备索引
-     * @return 成功返回true
-     */
-    bool removeMapping(uint64_t tensor_ptr, uint32_t nvme_dev);
     
    /**
      * 获取映射条目数组指针 (用于GPU kernel)
@@ -178,23 +168,6 @@ __device__ uint32_t gpu_lookup_all_prp_mappings(uint64_t tensor_ptr,
                                                 PRPMappingEntry* mapping_entries,
                                                 PRPMappingEntry* results,
                                                 uint32_t max_results);
-
-/**
- * GPU端查找tensor的特定NVMe设备映射
- * @param tensor_ptr Tensor的GPU虚拟内存指针
- * @param nvme_dev 目标NVMe设备索引
- * @param hash_table 哈希表指针
- * @param mapping_nodes 映射节点数组指针
- * @param mapping_entries 映射条目数组指针
- * @param result 输出的PRP映射条目
- * @return 找到返回true，未找到返回false
- */
-__device__ bool gpu_lookup_specific_prp_mapping(uint64_t tensor_ptr,
-                                                uint32_t nvme_dev,
-                                                GPUHashEntry* hash_table,
-                                                GPUMappingNode* mapping_nodes,
-                                                PRPMappingEntry* mapping_entries,
-                                                PRPMappingEntry* result);
 
 /**
  * GPU Controller class for managing a single GPU device's memory and storage
@@ -366,32 +339,19 @@ private:
      */
     struct geminifs_dma* createDMAContext(const torch::Tensor& tensor, uint64_t granularity = 0);
     
+    /**
+     * Perform DMA memory slicing for a given tensor
+     * @param dma_ctx DMA context to populate with slice information
+     * @param tensor_size Size of the tensor
+     * @param granularity Optional granularity for slicing (0 means use maxIOsize only)
+     * @return true if successful, false otherwise
+     */
+    bool performDMASlicing(geminifs_dma* dma_ctx, size_t tensor_size, uint64_t granularity = 0);
+    
     // === PRP List Management Methods ===
     
-    /**
-     * Build PRP list for tensor DMA
-     */
-    bool buildPRPList(geminifs_dma* dma_ctx, const torch::Tensor& tensor);
-    
-    /**
-     * Build single PRP entry
-     */
-    bool buildSinglePRP(geminifs_dma* dma_ctx, DmaPtr dma_ptr);
-    
-    /**
-     * Build dual PRP entries
-     */
-    bool buildDualPRP(geminifs_dma* dma_ctx, DmaPtr dma_ptr);
-    
-    /**
-     * Build PRP list for large transfers
-     */
-    bool buildListPRP(geminifs_dma* dma_ctx, DmaPtr dma_ptr);
-    
-    /**
-     * Cleanup PRP list resources
-     */
-    void cleanupPRPList(geminifs_dma* dma_ctx);
+
+
 };
 
 // Smart pointer for GPUController
