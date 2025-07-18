@@ -89,6 +89,7 @@ bool is_ptr_aligned(const void* ptr, size_t alignment = 65536ul);
 
 // CUDA device pointer utility functions
 bool is_device_pointer(const void* ptr, const char* error_msg = nullptr);
+cudaError_t cudaMallocAligned(void** alignedPtr, void** rawPtr, size_t size, size_t alignment=4096);
 
 ParsedSystemConfig parse_system_config(const std::string& config_file_path);
 std::vector<nvme_ctrl_param> convert_to_nvme_ctrl_params(const ParsedSystemConfig& config);

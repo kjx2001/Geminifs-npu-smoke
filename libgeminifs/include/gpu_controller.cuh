@@ -350,6 +350,12 @@ private:
     
     // === PRP List Management Methods ===
     
+    /**
+     * Initialize PRP entries for all slices in DMA context
+     * @param dma_ctx DMA context with slice information
+     * @return true if successful, false otherwise
+     */
+    bool initializePRPEntries(geminifs_dma* dma_ctx);
 
 
 };

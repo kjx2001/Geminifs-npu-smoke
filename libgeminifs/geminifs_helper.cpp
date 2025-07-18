@@ -559,3 +559,28 @@ bool is_device_pointer(const void* ptr, const char* error_msg) {
     
     return is_device;
 }
+
+
+cudaError_t cudaMallocAligned(void** alignedPtr, void** rawPtr, size_t size, size_t alignment) {
+    // 1. 分配一块比需求稍大的内存
+    // 多分配 (alignment - 1) 的空间
+    cudaError_t err = cudaMalloc(rawPtr, size + alignment - 1);
+    if (err != cudaSuccess) {
+        *alignedPtr = nullptr;
+        *rawPtr = nullptr;
+        return err;
+    }
+
+    // 2. 在分配的内存块中，计算出对齐后的地址
+    // 将指针转换为整数类型，方便进行位运算
+    uintptr_t ptr_val = reinterpret_cast<uintptr_t>(*rawPtr);
+    
+    // 使用位运算向上舍入到最近的对齐边界
+    // 这是一个标准算法: (ptr + alignment - 1) & ~(alignment - 1)
+    uintptr_t aligned_ptr_val = (ptr_val + alignment - 1) & ~(alignment - 1);
+    
+    // 将整数地址转回指针
+    *alignedPtr = reinterpret_cast<void*>(aligned_ptr_val);
+
+    return cudaSuccess;
+}

@@ -78,6 +78,7 @@ struct geminifs_dma{
     std::vector<PRPMappingEntry> prp_mappings;  // PRP映射条目数组
     
     // Type 2 PRP List GPU内存相关字段
+    void* raw_type2_prp_gpu_memory; 
     void* type2_prp_gpu_memory;                 // 第三种类型PRP所需的GPU内存指针
     size_t type2_prp_count;                     // 第三种类型PRP的数量
     DmaPtr type2_prp_dma_ptr;                   // 第三种类型PRP GPU内存的DMA指针
@@ -90,9 +91,9 @@ struct geminifs_dma{
             delete prp_context;
             prp_context = nullptr;
         }
-        if (type2_prp_gpu_memory) {
-            cudaFree(type2_prp_gpu_memory);
-            type2_prp_gpu_memory = nullptr;
+        if (raw_type2_prp_gpu_memory) {
+            cudaFree(raw_type2_prp_gpu_memory);
+            raw_type2_prp_gpu_memory = nullptr;
         }
     }
 };

@@ -1268,73 +1268,9 @@ geminifs_dma* GPUController::createDMAContext(const torch::Tensor& tensor, uint6
         return nullptr;
     }
     
-    // 创建对应数量的PRPMappingEntry
-    dma_ctx->prp_mappings.reserve(dma_ctx->num_slices);
-    
-    // 统计第三种类型(transfer_type=2)的数量
-    size_t type2_count = 0;
-    
-    for (size_t i = 0; i < dma_ctx->num_slices; i++) {
-        size_t slice_size = dma_ctx->slice_sizes[i];
-        uint32_t transfer_type = 0;  // 默认类型0
-        
-        // 根据slice_size确定NVMe IO cmd类型
-        if (slice_size <= 4096) {
-            transfer_type = 0;  // 小于等于4K
-        } else if (slice_size <= 8192) {
-            transfer_type = 1;  // 大于4K小于等于8K
-        } else {
-            transfer_type = 2;  // 大于8K
-            type2_count++;       // 统计第三种类型的数量
-        }
-        
-        // 创建PRPMappingEntry (prp1和prp2先不初始化)
-        PRPMappingEntry entry(transfer_type, 0, 0);
-        dma_ctx->prp_mappings.push_back(entry);
-        
-        geminifs_debug("GPU Controller: Created PRPMappingEntry[%zu]: transfer_type=%u for slice_size=%zu\n", 
-                       i, transfer_type, slice_size);
-    }
-    
-    // 记录第三种类型的数量
-    dma_ctx->type2_prp_count = type2_count;
-    
-    // 为第三种类型的PRP分配4KB对齐的GPU内存
-    if (type2_count > 0) {
-        size_t memory_size = type2_count * 4096;  // 每个第三种类型需要4KB
-        
-        cudaError_t err = cudaMalloc(&dma_ctx->type2_prp_gpu_memory, memory_size);
-        if (err != cudaSuccess) {
-            geminifs_error("GPU Controller: Failed to allocate type2 PRP GPU memory (%zu bytes): %s\n", 
-                           memory_size, cudaGetErrorString(err));
-            delete dma_ctx;
-            return nullptr;
-        }
-        
-        // 检查4KB对齐
-        uintptr_t ptr_addr = reinterpret_cast<uintptr_t>(dma_ctx->type2_prp_gpu_memory);
-        if (ptr_addr % 4096 != 0) {
-            geminifs_error("GPU Controller: Allocated type2 PRP GPU memory is not 4KB aligned (addr: 0x%lx)\n", ptr_addr);
-            delete dma_ctx;
-            return nullptr;
-        }
-        
-        geminifs_info("GPU Controller: Allocated %zu bytes of 4KB-aligned GPU memory for %zu type2 PRP entries at 0x%lx\n", 
-                      memory_size, type2_count, ptr_addr);
-        
-        // 获取type2_prp_gpu_memory的DMA地址
-        dma_ctx->type2_prp_dma_ptr = getDeviceDma(first_controller->controller->ctrl, 
-                                                   dma_ctx->type2_prp_gpu_memory, memory_size, device_id_);
-        if (dma_ctx->type2_prp_dma_ptr == nullptr) {
-            geminifs_error("GPU Controller: Failed to get DMA pointer for type2 PRP GPU memory\n");
-            delete dma_ctx;
-            return nullptr;
-        }
-        
-        geminifs_debug("GPU Controller: Successfully obtained DMA pointer for type2 PRP GPU memory (size: %zu bytes)\n", 
-                       memory_size);
-    } else {
-        geminifs_debug("GPU Controller: No type2 PRP entries found, no GPU memory allocation needed\n");
+    if (!initializePRPEntries(dma_ctx)) {
+        delete dma_ctx;
+        return nullptr;
     }
     
     geminifs_info("GPU Controller: DMA Context Created Successfully\n");
@@ -1358,6 +1294,177 @@ geminifs_dma* GPUController::createDMAContext(const torch::Tensor& tensor, uint6
     }
     
     return dma_ctx;
+}
+
+bool GPUController::initializePRPEntries(geminifs_dma* dma_ctx) {
+    if (!dma_ctx) {
+        geminifs_error("GPU Controller: DMA context is null\n");
+        return false;
+    }
+    
+    if (nvme_controllers_.empty()) {
+        geminifs_error("GPU Controller: No NVMe controllers available\n");
+        return false;
+    }
+    
+    // 创建对应数量的PRPMappingEntry
+    dma_ctx->prp_mappings.reserve(dma_ctx->num_slices);
+    
+    // 统计第三种类型(transfer_type=2)的数量
+    size_t type2_count = 0;
+    
+    for (size_t i = 0; i < dma_ctx->num_slices; i++) {
+        size_t slice_size = dma_ctx->slice_sizes[i];
+        uint32_t transfer_type = 0;  // 默认类型0
+        
+        // 根据slice_size确定NVMe IO cmd类型
+        if (slice_size <= 4096) {
+            transfer_type = 0;  // 小于等于4K
+        } else if (slice_size <= 8192) {
+            transfer_type = 1;  // 大于4K小于等于8K 
+        } else {
+            transfer_type = 2;  // 大于8K
+            type2_count++;       // 统计第三种类型的数量
+        }
+        
+        // 创建PRPMappingEntry (prp1和prp2先不初始化)
+        PRPMappingEntry entry(transfer_type, 0, 0);
+        dma_ctx->prp_mappings.push_back(entry);
+        
+        geminifs_debug("GPU Controller: Created PRPMappingEntry[%zu]: transfer_type=%u for slice_size=%zu\n", 
+                       i, transfer_type, slice_size);
+    }
+    
+    // 记录第三种类型的数量
+    dma_ctx->type2_prp_count = type2_count;
+    
+    // 为第三种类型的PRP分配4KB对齐的GPU内存
+    if (type2_count > 0) {
+        size_t memory_size = type2_count * 4096;  // 每个第三种类型需要4KB
+ 
+        cudaError_t err = cudaMallocAligned(&dma_ctx->type2_prp_gpu_memory, &dma_ctx->raw_type2_prp_gpu_memory, memory_size);
+        if (err != cudaSuccess) {
+            geminifs_error("GPU Controller: Failed to allocate type2 PRP GPU memory (%zu bytes): %s\n", 
+                           memory_size, cudaGetErrorString(err));
+            return false;
+        }
+        
+        // 检查4KB对齐
+        uintptr_t ptr_addr = reinterpret_cast<uintptr_t>(dma_ctx->type2_prp_gpu_memory);
+        if (ptr_addr % 4096 != 0) {
+            geminifs_error("GPU Controller: Allocated type2 PRP GPU memory is not 4KB aligned (addr: 0x%lx)\n", ptr_addr);
+            return false;
+        }
+        
+        geminifs_info("GPU Controller: Allocated %zu bytes of 4KB-aligned GPU memory for %zu type2 PRP entries at 0x%lx\n", 
+                      memory_size, type2_count, ptr_addr);
+        
+        // 获取type2_prp_gpu_memory的DMA地址
+        auto first_controller = nvme_controllers_[0];
+        dma_ctx->type2_prp_dma_ptr = getDeviceDma(first_controller->controller->ctrl, 
+                                                   dma_ctx->type2_prp_gpu_memory, memory_size, device_id_);
+        if (dma_ctx->type2_prp_dma_ptr == nullptr) {
+            geminifs_error("GPU Controller: Failed to get DMA pointer for type2 PRP GPU memory\n");
+            return false;
+        }
+        
+        geminifs_debug("GPU Controller: Successfully obtained DMA pointer for type2 PRP GPU memory (size: %zu bytes)\n", 
+                       memory_size);
+    } else {
+        geminifs_debug("GPU Controller: No type2 PRP entries found, no GPU memory allocation needed\n");
+    }
+    
+    // 根据NVMe命令规则设置每个PRPMappingEntry的prp1和prp2，并填充type2_prp_gpu_memory
+    size_t current_ioaddr_index = 0;  // 当前使用的ioaddrs索引
+    size_t type2_gpu_memory_offset = 0;  // type2_prp_gpu_memory中的偏移量
+    
+    for (size_t i = 0; i < dma_ctx->num_slices; i++) {
+        size_t slice_size = dma_ctx->slice_sizes[i];
+        size_t slice_pages = (slice_size + 4095) / 4096;  // 切片需要的4K页数（向上取整）
+        PRPMappingEntry& entry = dma_ctx->prp_mappings[i];
+        
+        if (current_ioaddr_index + slice_pages > dma_ctx->dma_ptr->n_ioaddrs) {
+            geminifs_error("GPU Controller: Not enough ioaddrs for slice %zu (need %zu, available %zu)\n", 
+                           i, slice_pages, dma_ctx->dma_ptr->n_ioaddrs - current_ioaddr_index);
+            return false;
+        }
+        
+        // 根据NVMe命令类型设置PRP1和PRP2
+        if (entry.transfer_type == 0) {
+            // 类型0: <= 4K, 单页传输
+            // PRP1指向数据页，PRP2不使用
+            entry.prp1 = dma_ctx->dma_ptr->ioaddrs[current_ioaddr_index];
+            entry.prp2 = 0;
+            geminifs_debug("GPU Controller: Slice[%zu] Type0: PRP1=0x%lx, PRP2=0x%lx\n", 
+                           i, entry.prp1, entry.prp2);
+            
+        } else if (entry.transfer_type == 1) {
+            // 类型1: 4K < size <= 8K, 双页传输
+            // PRP1指向第一个数据页，PRP2指向第二个数据页
+            entry.prp1 = dma_ctx->dma_ptr->ioaddrs[current_ioaddr_index];
+            if (slice_pages > 1) {
+                entry.prp2 = dma_ctx->dma_ptr->ioaddrs[current_ioaddr_index + 1];
+            } else {
+                entry.prp2 = 0;  // 如果实际只有一页，PRP2设为0
+            }
+            geminifs_debug("GPU Controller: Slice[%zu] Type1: PRP1=0x%lx, PRP2=0x%lx\n", 
+                           i, entry.prp1, entry.prp2);
+            
+        } else if (entry.transfer_type == 2) {
+            // 类型2: > 8K, PRP List传输
+            // PRP1指向第一个数据页，PRP2指向PRP List页
+            entry.prp1 = dma_ctx->dma_ptr->ioaddrs[current_ioaddr_index];
+            
+            // PRP2指向type2_prp_gpu_memory中对应的4K空间
+            if (dma_ctx->type2_prp_dma_ptr && dma_ctx->type2_prp_dma_ptr->n_ioaddrs > 0) {
+                size_t type2_page_index = type2_gpu_memory_offset / 4096;
+                if (type2_page_index < dma_ctx->type2_prp_dma_ptr->n_ioaddrs) {
+                    entry.prp2 = dma_ctx->type2_prp_dma_ptr->ioaddrs[type2_page_index];
+                } else {
+                    geminifs_error("GPU Controller: Type2 page index %zu exceeds available pages %zu\n", 
+                                   type2_page_index, dma_ctx->type2_prp_dma_ptr->n_ioaddrs);
+                    return false;
+                }
+            } else {
+                geminifs_error("GPU Controller: type2_prp_dma_ptr is invalid for slice %zu\n", i);
+                return false;
+            }
+            // 目前最大nvme io为1M，所以不需要考虑PRP List超过4K的情况
+            // 填充type2_prp_gpu_memory: 将剩余数据页的ioaddrs复制到GPU内存
+            size_t remaining_pages = slice_pages - 1;  // 除去PRP1指向的第一页
+            std::vector<uint64_t> prp_list_host(512, 0);  // 4KB / 8字节 = 512个entry
+            
+            for (size_t j = 0; j < remaining_pages && j < 511; j++) {  // 最多511个entry (最后一个可能用于链接下一页)
+                prp_list_host[j] = dma_ctx->dma_ptr->ioaddrs[current_ioaddr_index + 1 + j];
+            }
+            
+            // 将PRP List复制到GPU内存
+            cudaError_t err = cudaMemcpy(
+                static_cast<char*>(dma_ctx->type2_prp_gpu_memory) + type2_gpu_memory_offset,
+                prp_list_host.data(),
+                4096,
+                cudaMemcpyHostToDevice
+            );
+            
+            if (err != cudaSuccess) {
+                geminifs_error("GPU Controller: Failed to copy PRP list to GPU memory for slice %zu: %s\n", 
+                               i, cudaGetErrorString(err));
+                return false;
+            }
+            
+            geminifs_info("GPU Controller: Slice[%zu] Type2: PRP1=0x%lx, PRP2=0x%lx, filled %zu ioaddrs into GPU memory\n", 
+                           i, entry.prp1, entry.prp2, remaining_pages);
+            
+            type2_gpu_memory_offset += 4096;  // 移动到下一个4K空间
+        }
+        
+        current_ioaddr_index += slice_pages;  // 移动到下一个切片的起始ioaddr
+    }
+    
+    geminifs_info("GPU Controller: Successfully configured %zu PRPMappingEntries with NVMe command rules\n", 
+                  dma_ctx->num_slices);
+    
+    return true;
 }
 
 // === GPUControllerRegistry Implementation ===

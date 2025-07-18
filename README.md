@@ -65,6 +65,12 @@ $ make insmod                 # insmod snvme kernel module
 ## How to run
 Here, we provide partial functional verification code.
 > Please modify the device and corresponding path in the code as needed.
+
+Add a sys_config.ini like the example. 
+It should be noted that different disks have different configurations due to their respective physical limitations.
+For example, using the following cmd to get the to get the max IO 
+cat /sys/block/nvme0n1/queue/max_hw_sectors_kb
+
 ### Test
 ```shell
 cd examples/test_geminifs 
@@ -73,3 +79,4 @@ cmake ..
 make TestForPythonInterface 
 sudo ./TestForNvmeBacking.exe
 ```
+
