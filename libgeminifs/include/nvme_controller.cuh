@@ -95,5 +95,6 @@ using NVMeControllerPtr = std::shared_ptr<NVMeController>;
 __device__
 void * nvme_controller_g_read(dev_fd_t device_fd, uint64_t prp1, uint64_t prp2, size_t file_offset, size_t nbytes);
 
-
+__global__
+void nvme_controller_g_read_kernel(dev_fd_t device_fd, uint64_t prp1, uint64_t prp2, size_t file_offset, size_t nbytes);
 #endif // __NVME_CONTROLLER_H__

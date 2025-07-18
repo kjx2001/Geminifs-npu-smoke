@@ -35,9 +35,7 @@ __global__ void init_nvme_file_kernel(NVMe_File* d_nvme_file,
     if (threadIdx.x == 0 && blockIdx.x == 0) {
         new (d_nvme_file) NVMe_File(d_ctrl_ptr, device_fd);
         d_nvme_file->queue_acquire_helper = d_queue_acquire_helper;
-        d_nvme_file->file_size = file_size;
         d_nvme_file->nvme_page_size = nvme_page_size;
-        d_nvme_file->block_size = block_size;
         d_nvme_file->hqps_block_size_log = hqps_block_size_log;
     }
 }
@@ -571,7 +569,7 @@ dev_fd_t NVMeController::device_file_open_managed(const std::string& filename, s
     geminifs_debug("device file open managed: Opened device file '%s' with device_fd %p\n", 
                    filename.c_str(), device_fd);
     
-    return device_fd;
+    return d_nvme_file;
 }
 
 /**
@@ -827,11 +825,20 @@ bool NVMeController::device_file_delete_all_files_managed() {
 
 // GPU device-side read/write interface using NVMeFile pointer
 
+// Global wrapper for external calling from host
+__global__
+void nvme_controller_g_read_kernel(dev_fd_t device_fd, uint64_t prp1, uint64_t prp2, size_t file_offset, size_t nbytes)
+{
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        nvme_controller_g_read(device_fd, prp1, prp2, file_offset, nbytes);
+    }
+}
 
 __device__
 void * nvme_controller_g_read(dev_fd_t device_fd, uint64_t prp1, uint64_t prp2, size_t file_offset, size_t nbytes)
 {
     auto *nvme_file = (NVMe_File*)device_fd;
+    assert((file_offset+nbytes) < nvme_file->hdr->virtual_space_size);
     // Call the read method on the NVMe_File instance
     nvme_file->read_in(prp1, prp2, file_offset, nbytes);
 }

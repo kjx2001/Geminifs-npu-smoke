@@ -63,8 +63,11 @@ void show_fd_limits() {
 
 int main(int argc, char** argv) {
 
+    cudaStream_t nvme_stream;
+    cudaError_t stream_err = cudaStreamCreate(&nvme_stream);
     // 在程序开始时自动配置文件描述符限制
     auto_configure_fd_limits(NUM_FILES);
+
     ParsedSystemConfig config = parse_system_config("/home/qs/CompanionFS/Geminifs/sys_config.ini");
     std::vector<nvme_ctrl_param> nvme_params;
     if (config.valid) {
@@ -110,14 +113,11 @@ int main(int argc, char** argv) {
 
 
         void* device_fd = nvme_controller->g_open("1", FILE_SIZE, O_DEVICE);
-        // if(!is_device_pointer(device_fd,"device fd must be a device pointer")||device_fd==NULL)
-        // {
-        //     geminifs_error("g_open: fail device_fd is illeagel\n");
-        // }
-        if(device_fd==NULL)
+        if(!is_device_pointer(device_fd,"device fd must be a device pointer")||device_fd==NULL)
         {
             geminifs_error("g_open: fail device_fd is illeagel\n");
         }
+
 
 
         // // 记录开始时间
@@ -153,14 +153,27 @@ int main(int argc, char** argv) {
                 );
         // Register tensor with GPU controller
         bool success = gpu_controller->registerTensorMemory(key_cache, 1024*1024* 2); // 2MB granularity
-
-        if(success)
-        {
-            std::cout << "✓ Successfully registered tensor with GPU controller" << std::endl;
-        } else{
-            std::cerr << "✗ Failed to register tensor with GPU controller" << std::endl;
+        if(!success) {
+            std::cerr << "Failed to register tensor with GPU controller" << std::endl;
         }
-        
+        else
+        {
+            std::cout << "Successfully registered tensor with GPU controller" << std::endl;
+            struct geminifs_dma* dma_context = gpu_controller->getDMAContext(key_cache.data_ptr());
+            assert(dma_context != nullptr && dma_context->dma_ptr != nullptr);
+            nvme_controller_g_read_kernel<<<1,1,0,nvme_stream>>>(device_fd,dma_context->prp_mappings.at(0).prp1,
+                                          dma_context->prp_mappings.at(0).prp2, 0, dma_context->slice_sizes.at(0));
+
+            if(success)
+            {
+                std::cout << "✓ Successfully registered tensor with GPU controller" << std::endl;
+            } else{
+                std::cerr << "✗ Failed to register tensor with GPU controller" << std::endl;
+            }
+        }
+
+
+
         std::cout << "\nTest completed. Type 'end' to terminate and release resources:" << std::endl;
         std::cout << "Available commands: 'end', 'delete'" << std::endl;
         std::string user_input;
