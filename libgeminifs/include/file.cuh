@@ -86,17 +86,20 @@ private:
         assert(file_offset % nvme_page_size == 0);
         nvme_ofst_t nvme_ofst = __get_nvmeofst(file_offset);
         uint64_t starting_lba = nvme_ofst >> hqps_block_size_log;
+        // printf("NVMe_File: nvme_ofst: %lx, starting_lba: %lx, nbytes: %zu\n", 
+        //        (unsigned long) nvme_ofst, (unsigned long) starting_lba, nbytes);
         int queue = queue_acquire_helper->acquire_queue();
         QueuePair* qp = &ctrl->d_qps[queue];
 
         uint64_t n_blocks = nbytes >> hqps_block_size_log;
         uint16_t cid;
         uint16_t sq_pos;
-
+        // printf("NVMe_File: queue %d, n_blocks %lu, starting_lba %lx\n", 
+        //        queue, (unsigned long)n_blocks, (unsigned long)starting_lba);
         queue_acquire_helper->issue_nvme_cmd(qp,
             prp1,
             prp2, // fixme
-            nbytes,
+            n_blocks,
             starting_lba,
             type == FILE_XFER_READ ? NVM_IO_READ : NVM_IO_WRITE,
             &cid);

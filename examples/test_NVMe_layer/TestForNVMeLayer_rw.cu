@@ -145,7 +145,7 @@ int main(int argc, char** argv) {
     //         }
     //     }
 
-        auto key_cache = torch::rand({16, 1024, 1024, 2}, // 512kb
+        auto key_cache = torch::rand({4, 1024, 1024, 2}, // 512kb
                 torch::TensorOptions()
                     .dtype(torch::kFloat16)
                     .device(torch::kCUDA, group.gpu.cudaDevice)
@@ -161,8 +161,35 @@ int main(int argc, char** argv) {
             std::cout << "Successfully registered tensor with GPU controller" << std::endl;
             struct geminifs_dma* dma_context = gpu_controller->getDMAContext(key_cache.data_ptr());
             assert(dma_context != nullptr && dma_context->dma_ptr != nullptr);
+            
+            // Print IO submission information
+            geminifs_info("Submitting NVMe I/O operation:\n");
+            geminifs_info("  PRP1 address: 0x%lx\n", dma_context->prp_mappings.at(0).prp1);
+            geminifs_info("  PRP2 address: 0x%lx\n", dma_context->prp_mappings.at(0).prp2);
+            geminifs_info("  Transfer type: %u\n", dma_context->prp_mappings.at(0).transfer_type);
+            geminifs_info("  I/O length: %zu bytes\n", dma_context->slice_sizes.at(0));
+            geminifs_info("  File offset: 0\n");
+            
+            // Record start time for bandwidth calculation
+            auto bandwidth_start = std::chrono::high_resolution_clock::now();
+            
             nvme_controller_g_read_kernel<<<1,1,0,nvme_stream>>>(device_fd,dma_context->prp_mappings.at(0).prp1,
                                           dma_context->prp_mappings.at(0).prp2, 0, dma_context->slice_sizes.at(0));
+            
+            // Synchronize stream to ensure kernel completion
+            cudaStreamSynchronize(nvme_stream);
+            
+            // Record end time and calculate bandwidth
+            auto bandwidth_end = std::chrono::high_resolution_clock::now();
+            auto duration_us = std::chrono::duration_cast<std::chrono::microseconds>(bandwidth_end - bandwidth_start);
+            double duration_sec = duration_us.count() / 1000000.0;
+            double data_mb = dma_context->slice_sizes.at(0) / (1024.0 * 1024.0);
+            double bandwidth_mbps = data_mb / duration_sec;
+            
+            geminifs_info("NVMe Read Bandwidth Statistics:\n");
+            geminifs_info("  Data size: %.2f MB\n", data_mb);
+            geminifs_info("  Duration: %.3f ms\n", duration_us.count() / 1000.0);
+            geminifs_info("  Bandwidth: %.2f MB/s\n", bandwidth_mbps);
 
             if(success)
             {

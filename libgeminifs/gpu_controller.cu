@@ -1131,6 +1131,9 @@ bool GPUController::performDMASlicing(geminifs_dma* dma_ctx, size_t tensor_size,
             size_t slice_size = std::min(remaining_size, (size_t)granularity);
             primary_slices.push_back(std::make_pair(current_offset, slice_size));
             
+            // geminifs_info("GPU Controller: First-level slice[%zu]: offset=%zu, size=%zu bytes\n", 
+            //               primary_slices.size() - 1, current_offset, slice_size);
+            
             current_offset += slice_size;
             remaining_size -= slice_size;
         }
@@ -1143,19 +1146,31 @@ bool GPUController::performDMASlicing(geminifs_dma* dma_ctx, size_t tensor_size,
             size_t slice_offset = primary_slice.first;
             size_t slice_size = primary_slice.second;
             
+            // geminifs_info("GPU Controller: Processing primary slice: offset=%zu, size=%zu bytes for second-level cutting\n", 
+            //               slice_offset, slice_size);
+            
             if (slice_size <= min_max_io_size) {
                 // 当前切片小于等于maxIOsize，不需要进一步切割
                 dma_ctx->slice_sizes.push_back(slice_size);
                 dma_ctx->slice_offsets.push_back(slice_offset);
+                
+                // geminifs_info("GPU Controller: Second-level slice[%zu]: offset=%zu, size=%zu bytes (no further cutting needed)\n", 
+                //               dma_ctx->slice_sizes.size() - 1, slice_offset, slice_size);
             } else {
                 // 当前切片需要按照maxIOsize进一步切割
                 size_t sub_remaining = slice_size;
                 size_t sub_offset = slice_offset;
                 
+                // geminifs_info("GPU Controller: Primary slice size %zu > maxIOsize %llu, performing second-level cutting\n", 
+                //               slice_size, min_max_io_size);
+                
                 while (sub_remaining > 0) {
                     size_t sub_slice_size = std::min(sub_remaining, (size_t)min_max_io_size);
                     dma_ctx->slice_sizes.push_back(sub_slice_size);
                     dma_ctx->slice_offsets.push_back(sub_offset);
+                    
+                    // geminifs_info("GPU Controller: Second-level slice[%zu]: offset=%zu, size=%zu bytes\n", 
+                    //               dma_ctx->slice_sizes.size() - 1, sub_offset, sub_slice_size);
                     
                     sub_offset += sub_slice_size;
                     sub_remaining -= sub_slice_size;
@@ -1229,7 +1244,7 @@ geminifs_dma* GPUController::createDMAContext(const torch::Tensor& tensor, uint6
     auto tensor_size = tensor.numel() * tensor.element_size();
     
     // 如果指定了切割粒度（非0），检查tensor大小是否为粒度的整数倍
-    if (granularity > 0) {
+    if (granularity > 0 && tensor_size > tensor_size) {
         if (tensor_size % granularity != 0) {
             geminifs_error("GPU Controller: Tensor size %zu is not a multiple of granularity %llu. Memory registration failed.\n", 
                           tensor_size, granularity);
@@ -1273,25 +1288,25 @@ geminifs_dma* GPUController::createDMAContext(const torch::Tensor& tensor, uint6
         return nullptr;
     }
     
-    geminifs_info("GPU Controller: DMA Context Created Successfully\n");
-    geminifs_info("  Tensor size: %zu bytes\n", tensor_size);
-    geminifs_info("  Slice granularity: %llu bytes\n", dma_ctx->slice_granularity);
-    geminifs_info("  Total slices: %zu\n", dma_ctx->num_slices);
+    // geminifs_info("GPU Controller: DMA Context Created Successfully\n");
+    // geminifs_info("  Tensor size: %zu bytes\n", tensor_size);
+    // geminifs_info("  Slice granularity: %llu bytes\n", dma_ctx->slice_granularity);
+    // geminifs_info("  Total slices: %zu\n", dma_ctx->num_slices);
     
     // Print detailed slice information
-    for (size_t i = 0; i < dma_ctx->num_slices; i++) {
-        geminifs_info("  Slice[%zu]: offset=%zu, size=%zu\n", 
-                      i, dma_ctx->slice_offsets[i], dma_ctx->slice_sizes[i]);
-    }
+    // for (size_t i = 0; i < dma_ctx->num_slices; i++) {
+    //     geminifs_info("  Slice[%zu]: offset=%zu, size=%zu\n", 
+    //                   i, dma_ctx->slice_offsets[i], dma_ctx->slice_sizes[i]);
+    // }
     
     // Print DMA pointer information
-    if (dma_ctx->dma_ptr) {
-        geminifs_info("  DMA ptr contiguous: %s\n", dma_ctx->dma_ptr->contiguous ? "Yes" : "No");
-        geminifs_info("  DMA ptr n_ioaddrs: %zu\n", dma_ctx->dma_ptr->n_ioaddrs);
-        if (dma_ctx->dma_ptr->n_ioaddrs > 0) {
-            geminifs_info("  DMA ptr first ioaddr: 0x%lx\n", dma_ctx->dma_ptr->ioaddrs[0]);
-        }
-    }
+    // if (dma_ctx->dma_ptr) {
+    //     geminifs_info("  DMA ptr contiguous: %s\n", dma_ctx->dma_ptr->contiguous ? "Yes" : "No");
+    //     geminifs_info("  DMA ptr n_ioaddrs: %zu\n", dma_ctx->dma_ptr->n_ioaddrs);
+    //     if (dma_ctx->dma_ptr->n_ioaddrs > 0) {
+    //         geminifs_info("  DMA ptr first ioaddr: 0x%lx\n", dma_ctx->dma_ptr->ioaddrs[0]);
+    //     }
+    // }
     
     return dma_ctx;
 }
@@ -1337,39 +1352,20 @@ bool GPUController::initializePRPEntries(geminifs_dma* dma_ctx) {
     
     // 记录第三种类型的数量
     dma_ctx->type2_prp_count = type2_count;
-    
+
+    auto first_controller = nvme_controllers_[0];
+    if (!first_controller || !first_controller->controller) {
+        geminifs_error("GPU Controller: Invalid NVMe controller for DMA context creation\n");
+        return false;
+    }
     // 为第三种类型的PRP分配4KB对齐的GPU内存
     if (type2_count > 0) {
         size_t memory_size = type2_count * 4096;  // 每个第三种类型需要4KB
- 
-        cudaError_t err = cudaMallocAligned(&dma_ctx->type2_prp_gpu_memory, &dma_ctx->raw_type2_prp_gpu_memory, memory_size);
-        if (err != cudaSuccess) {
-            geminifs_error("GPU Controller: Failed to allocate type2 PRP GPU memory (%zu bytes): %s\n", 
-                           memory_size, cudaGetErrorString(err));
+        dma_ctx->type2_prp_dma_ptr = createDma(first_controller->controller->ctrl,memory_size,device_id_);
+        if (!dma_ctx->type2_prp_dma_ptr) {
+            geminifs_error("GPU Controller: Failed to create DMA pointer for type2 PRP GPU memory\n");
             return false;
         }
-        
-        // 检查4KB对齐
-        uintptr_t ptr_addr = reinterpret_cast<uintptr_t>(dma_ctx->type2_prp_gpu_memory);
-        if (ptr_addr % 4096 != 0) {
-            geminifs_error("GPU Controller: Allocated type2 PRP GPU memory is not 4KB aligned (addr: 0x%lx)\n", ptr_addr);
-            return false;
-        }
-        
-        geminifs_info("GPU Controller: Allocated %zu bytes of 4KB-aligned GPU memory for %zu type2 PRP entries at 0x%lx\n", 
-                      memory_size, type2_count, ptr_addr);
-        
-        // 获取type2_prp_gpu_memory的DMA地址
-        auto first_controller = nvme_controllers_[0];
-        dma_ctx->type2_prp_dma_ptr = getDeviceDma(first_controller->controller->ctrl, 
-                                                   dma_ctx->type2_prp_gpu_memory, memory_size, device_id_);
-        if (dma_ctx->type2_prp_dma_ptr == nullptr) {
-            geminifs_error("GPU Controller: Failed to get DMA pointer for type2 PRP GPU memory\n");
-            return false;
-        }
-        
-        geminifs_debug("GPU Controller: Successfully obtained DMA pointer for type2 PRP GPU memory (size: %zu bytes)\n", 
-                       memory_size);
     } else {
         geminifs_debug("GPU Controller: No type2 PRP entries found, no GPU memory allocation needed\n");
     }
@@ -1436,11 +1432,13 @@ bool GPUController::initializePRPEntries(geminifs_dma* dma_ctx) {
             
             for (size_t j = 0; j < remaining_pages && j < 511; j++) {  // 最多511个entry (最后一个可能用于链接下一页)
                 prp_list_host[j] = dma_ctx->dma_ptr->ioaddrs[current_ioaddr_index + 1 + j];
+                // geminifs_info("GPU Controller: Slice[%zu] PRP List[%zu] = 0x%lx (ioaddr_index=%zu)\n", 
+                //               i, j, prp_list_host[j], current_ioaddr_index + 1 + j);
             }
             
             // 将PRP List复制到GPU内存
             cudaError_t err = cudaMemcpy(
-                static_cast<char*>(dma_ctx->type2_prp_gpu_memory) + type2_gpu_memory_offset,
+                static_cast<char*>(dma_ctx->type2_prp_dma_ptr->vaddr) + type2_gpu_memory_offset,
                 prp_list_host.data(),
                 4096,
                 cudaMemcpyHostToDevice
@@ -1452,8 +1450,8 @@ bool GPUController::initializePRPEntries(geminifs_dma* dma_ctx) {
                 return false;
             }
             
-            geminifs_info("GPU Controller: Slice[%zu] Type2: PRP1=0x%lx, PRP2=0x%lx, filled %zu ioaddrs into GPU memory\n", 
-                           i, entry.prp1, entry.prp2, remaining_pages);
+            // geminifs_info("GPU Controller: Slice[%zu] Type2: PRP1=0x%lx, PRP2=0x%lx, filled %zu ioaddrs into GPU memory\n", 
+            //                i, entry.prp1, entry.prp2, remaining_pages);
             
             type2_gpu_memory_offset += 4096;  // 移动到下一个4K空间
         }
@@ -1461,8 +1459,8 @@ bool GPUController::initializePRPEntries(geminifs_dma* dma_ctx) {
         current_ioaddr_index += slice_pages;  // 移动到下一个切片的起始ioaddr
     }
     
-    geminifs_info("GPU Controller: Successfully configured %zu PRPMappingEntries with NVMe command rules\n", 
-                  dma_ctx->num_slices);
+    // geminifs_info("GPU Controller: Successfully configured %zu PRPMappingEntries with NVMe command rules\n", 
+    //               dma_ctx->num_slices);
     
     return true;
 }

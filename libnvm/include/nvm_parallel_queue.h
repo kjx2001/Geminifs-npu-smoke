@@ -418,6 +418,7 @@ uint32_t cq_poll(nvm_queue_t* cq, uint16_t search_cid, uint32_t* loc_ = NULL, ui
                 //         (unsigned long long) cq->head_mark[loc].val.load(cuda::memory_order_acquire),cpl_entry);
 
 //            if ((cid == search_cid) && (phase == search_phase) && (cq->head_mark[loc].load(cuda::memory_order_acquire) == UNLOCKED)){
+            // fail reason see 4.2.3.1 in NVM Express Base Specification
             if ((cid == search_cid) && (phase == search_phase)){
 
                  if ((cpl_entry >> 17) != 0)
