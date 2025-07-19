@@ -834,11 +834,26 @@ void nvme_controller_g_read_kernel(dev_fd_t device_fd, uint64_t prp1, uint64_t p
     }
 }
 
+__global__
+void nvme_controller_g_write_kernel(dev_fd_t device_fd, uint64_t prp1, uint64_t prp2, size_t file_offset, size_t nbytes)
+{
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        nvme_controller_g_write(device_fd, prp1, prp2, file_offset, nbytes);
+    }
+}
+
 __device__
 void * nvme_controller_g_read(dev_fd_t device_fd, uint64_t prp1, uint64_t prp2, size_t file_offset, size_t nbytes)
 {
     auto *nvme_file = (NVMe_File*)device_fd;
-    assert((file_offset+nbytes) < nvme_file->hdr->virtual_space_size);
     // Call the read method on the NVMe_File instance
     nvme_file->read_in(prp1, prp2, file_offset, nbytes);
+}
+
+__device__
+void * nvme_controller_g_write(dev_fd_t device_fd, uint64_t prp1, uint64_t prp2, size_t file_offset, size_t nbytes)
+{
+    auto *nvme_file = (NVMe_File*)device_fd;
+    // Call the write method on the NVMe_File instance
+    nvme_file->write_out(prp1, prp2, file_offset, nbytes);
 }
