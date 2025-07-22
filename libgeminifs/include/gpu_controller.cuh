@@ -49,6 +49,25 @@ struct GPUHashEntry {
 };
 
 /**
+ * GPU内存映射管理器的Device侧视图结构体
+ * 用于在GPU kernel中访问映射数据结构
+ */
+struct GPUMemoryMapperDeviceView {
+    PRPMappingEntry* d_mapping_entries;     // PRP映射条目数组
+    GPUMappingNode* d_mapping_nodes;        // 映射节点数组
+    GPUHashEntry* d_hash_table;             // 哈希表
+    uint32_t* d_free_entry_list;            // 空闲映射条目列表
+    uint32_t* d_free_node_list;             // 空闲映射节点列表
+    uint32_t* d_free_entry_count;           // 空闲映射条目计数器
+    uint32_t* d_free_node_count;            // 空闲映射节点计数器
+    
+    __device__ __host__ GPUMemoryMapperDeviceView() 
+        : d_mapping_entries(nullptr), d_mapping_nodes(nullptr), d_hash_table(nullptr),
+          d_free_entry_list(nullptr), d_free_node_list(nullptr), 
+          d_free_entry_count(nullptr), d_free_node_count(nullptr) {}
+};
+
+/**
  * GPU内存映射管理器
  */
 class GPUMemoryMapper {
@@ -67,6 +86,9 @@ private:
     uint32_t* d_free_node_list_;             // 空闲映射节点列表
     uint32_t* d_free_entry_count_;           // 空闲映射条目计数器
     uint32_t* d_free_node_count_;            // 空闲映射节点计数器
+    
+    // Device侧视图结构体指针 - 在GPU内存中
+    GPUMemoryMapperDeviceView* d_device_view_;
     
     // 主机端管理
     mutable std::mutex mapper_mutex_;
@@ -130,6 +152,11 @@ public:
     GPUHashEntry* getHashTablePtr() const { return d_hash_table_; }
     
     /**
+     * 获取Device侧视图结构体指针 (用于GPU kernel)
+     */
+    GPUMemoryMapperDeviceView* getDeviceViewPtr() const { return d_device_view_; }
+    
+    /**
      * 获取统计信息
      */
     std::tuple<uint32_t, uint32_t, uint32_t, uint32_t> getStats() const; // (used_entries, total_entries, used_nodes, total_nodes)
@@ -168,6 +195,30 @@ __device__ uint32_t gpu_lookup_all_prp_mappings(uint64_t tensor_ptr,
                                                 PRPMappingEntry* mapping_entries,
                                                 PRPMappingEntry* results,
                                                 uint32_t max_results);
+
+/**
+ * GPU kernel用于查询和打印tensor的PRP映射信息
+ * @param device_view Device侧视图结构体指针
+ * @param tensor_ptr Tensor指针
+ * @param tensor_size Tensor大小
+ * @param granularity 粒度大小
+ */
+__global__ void gpu_debug_prp_mappings_kernel(GPUMemoryMapperDeviceView* device_view,
+                                              uint64_t tensor_ptr, 
+                                              size_t tensor_size,
+                                              uint64_t granularity);
+
+/**
+ * Host端函数用于调用GPU kernel查询和打印PRP映射
+ * @param mapper GPUMemoryMapper指针
+ * @param tensor_ptr Tensor指针
+ * @param tensor_size Tensor大小
+ * @param granularity 粒度大小
+ */
+void debug_prp_mappings_from_gpu(GPUMemoryMapper* mapper, 
+                                 uint64_t tensor_ptr, 
+                                 size_t tensor_size, 
+                                 uint64_t granularity);
 
 /**
  * GPU Controller class for managing a single GPU device's memory and storage
@@ -356,6 +407,13 @@ private:
      * @return true if successful, false otherwise
      */
     bool initializePRPEntries(geminifs_dma* dma_ctx);
+
+    /**
+     * Add PRP mappings to GPU memory for all granularity groups
+     * @param dma_ctx DMA context with initialized PRP entries
+     * @return true if successful, false otherwise
+     */
+    bool addPRPMappingsToGPU(geminifs_dma* dma_ctx);
 
 
 };

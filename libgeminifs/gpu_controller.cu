@@ -46,7 +46,7 @@ __device__ uint32_t gpu_lookup_all_prp_mappings(uint64_t tensor_ptr,
 GPUMemoryMapper::GPUMemoryMapper(int device_id) 
     : d_mapping_entries_(nullptr), d_mapping_nodes_(nullptr), d_hash_table_(nullptr), 
       d_free_entry_list_(nullptr), d_free_node_list_(nullptr),
-      d_free_entry_count_(nullptr), d_free_node_count_(nullptr),
+      d_free_entry_count_(nullptr), d_free_node_count_(nullptr), d_device_view_(nullptr),
       is_initialized_(false), device_id_(device_id) {
 }
 
@@ -130,6 +130,15 @@ bool GPUMemoryMapper::initialize() {
         return false;
     }
     
+    // 分配Device侧视图结构体
+    err = cudaMalloc(&d_device_view_, sizeof(GPUMemoryMapperDeviceView));
+    if (err != cudaSuccess) {
+        geminifs_error("GPU Memory Mapper: Failed to allocate device view: %s\n", 
+                       cudaGetErrorString(err));
+        cleanup();
+        return false;
+    }
+    
     // 初始化所有数据结构
     err = cudaMemset(d_hash_table_, 0, sizeof(GPUHashEntry) * HASH_TABLE_SIZE);
     if (err != cudaSuccess) {
@@ -204,6 +213,24 @@ bool GPUMemoryMapper::initialize() {
         return false;
     }
     
+    // 初始化Device侧视图结构体
+    GPUMemoryMapperDeviceView host_view;
+    host_view.d_mapping_entries = d_mapping_entries_;
+    host_view.d_mapping_nodes = d_mapping_nodes_;
+    host_view.d_hash_table = d_hash_table_;
+    host_view.d_free_entry_list = d_free_entry_list_;
+    host_view.d_free_node_list = d_free_node_list_;
+    host_view.d_free_entry_count = d_free_entry_count_;
+    host_view.d_free_node_count = d_free_node_count_;
+    
+    err = cudaMemcpy(d_device_view_, &host_view, sizeof(GPUMemoryMapperDeviceView), cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        geminifs_error("GPU Memory Mapper: Failed to initialize device view: %s\n", 
+                       cudaGetErrorString(err));
+        cleanup();
+        return false;
+    }
+    
     is_initialized_ = true;
     geminifs_debug("GPU Memory Mapper: Successfully initialized for device %d\n", device_id_);
     return true;
@@ -243,6 +270,11 @@ void GPUMemoryMapper::cleanup() {
     if (d_free_node_count_) {
         cudaFree(d_free_node_count_);
         d_free_node_count_ = nullptr;
+    }
+    
+    if (d_device_view_) {
+        cudaFree(d_device_view_);
+        d_device_view_ = nullptr;
     }
     
     is_initialized_ = false;
@@ -1087,6 +1119,11 @@ geminifs_dma* GPUController::createDMAContext(const torch::Tensor& tensor, uint6
         return nullptr;
     }
     
+    if (!addPRPMappingsToGPU(dma_ctx)) {
+        delete dma_ctx;
+        return nullptr;
+    }
+    
     // geminifs_info("GPU Controller: DMA Context Created Successfully\n");
     // geminifs_info("  Tensor size: %zu bytes\n", tensor_size);
     // geminifs_info("  Slice granularity: %llu bytes\n", dma_ctx->slice_granularity);
@@ -1306,6 +1343,55 @@ bool GPUController::initializePRPEntries(geminifs_dma* dma_ctx) {
     return true;
 }
 
+bool GPUController::addPRPMappingsToGPU(geminifs_dma* dma_ctx) {
+    if (!dma_ctx) {
+        geminifs_error("GPU Controller: DMA context is null for PRP mappings registration\n");
+        return false;
+    }
+
+    if (!memory_mapper_) {
+        geminifs_error("GPU Controller: Memory mapper not initialized\n");
+        return false;
+    }
+
+    if (dma_ctx->granularity_groups.empty()) {
+        geminifs_error("GPU Controller: No granularity groups found for PRP mappings registration\n");
+        return false;
+    }
+
+    geminifs_info("GPU Controller: Adding PRP mappings to GPU memory for %zu granularity groups\n", 
+                  dma_ctx->granularity_groups.size());
+
+    // 遍历每个granularity group，将其PRP映射注册到GPU内存
+    for (size_t group_idx = 0; group_idx < dma_ctx->granularity_groups.size(); group_idx++) {
+        const auto& group = dma_ctx->granularity_groups[group_idx];
+        
+        if (group.prp_mappings.empty()) {
+            geminifs_warn("GPU Controller: Group[%zu] has no PRP mappings to register\n", group_idx);
+            continue;
+        }
+        
+        geminifs_info("GPU Controller: Registering %zu PRP mappings for Group[%zu] (gpu_ptr=0x%lx)\n", 
+                      group.prp_mappings.size(), group_idx, group.gpu_tensor_ptr);
+        
+        // 使用addBatchMappings批量添加该group的所有PRP映射
+        bool success = memory_mapper_->addBatchMappings(group.gpu_tensor_ptr, group.prp_mappings);
+        
+        if (!success) {
+            geminifs_error("GPU Controller: Failed to add batch mappings for Group[%zu]\n", group_idx);
+            return false;
+        }
+        
+        geminifs_debug("GPU Controller: Successfully registered %zu PRP mappings for Group[%zu]\n", 
+                       group.prp_mappings.size(), group_idx);
+    }
+    
+    geminifs_info("GPU Controller: Successfully registered PRP mappings for all %zu granularity groups\n", 
+                  dma_ctx->granularity_groups.size());
+    
+    return true;
+}
+
 // === GPUControllerRegistry Implementation ===
 
 GPUControllerRegistry& GPUControllerRegistry::getInstance() {
@@ -1360,4 +1446,76 @@ void GPUControllerRegistry::clearAll() {
     std::lock_guard<std::mutex> lock(registry_mutex_);
     gpu_controllers_.clear();
     geminifs_debug("GPU Controller Registry: Cleared all registered controllers\n");
+}
+
+/**
+ * GPU kernel用于查询和打印tensor的PRP映射信息
+ */
+__global__ void gpu_debug_prp_mappings_kernel(GPUMemoryMapperDeviceView* device_view,
+                                              uint64_t tensor_ptr, 
+                                              size_t tensor_size,
+                                              uint64_t granularity) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        if (!device_view) {
+            printf("GPU Debug: Device view is null\n");
+            return;
+        }
+        
+        printf("=== GPU PRP Mapping Debug ===\n");
+        printf("Tensor Ptr: 0x%lx, Size: %zu, Granularity: %lu\n", 
+               tensor_ptr, tensor_size, granularity);
+        
+        // 分配临时结果缓冲区
+        PRPMappingEntry results[256]; // 最多查询256个映射
+        uint32_t found_count = gpu_lookup_all_prp_mappings(
+            tensor_ptr,
+            device_view->d_hash_table,
+            device_view->d_mapping_nodes, 
+            device_view->d_mapping_entries,
+            results,
+            256
+        );
+        
+        printf("Found %u PRP mappings for tensor 0x%lx:\n", found_count, tensor_ptr);
+        
+        for (uint32_t i = 0; i < found_count; ++i) {
+            printf("  [%u] Type: %u, PRP1: 0x%lx, PRP2: 0x%lx\n",
+                   i, results[i].transfer_type, results[i].prp1, results[i].prp2);
+        }
+        
+        if (found_count == 0) {
+            printf("  No PRP mappings found for this tensor\n");
+        }
+        
+        printf("=== End PRP Mapping Debug ===\n");
+    }
+}
+
+/**
+ * Host端函数用于调用GPU kernel查询和打印PRP映射
+ */
+void debug_prp_mappings_from_gpu(GPUMemoryMapper* mapper, 
+                                 uint64_t tensor_ptr, 
+                                 size_t tensor_size, 
+                                 uint64_t granularity) {
+    if (!mapper) {
+        geminifs_error("Debug PRP Mappings: Invalid mapper\n");
+        return;
+    }
+    
+    GPUMemoryMapperDeviceView* device_view = mapper->getDeviceViewPtr();
+    if (!device_view) {
+        geminifs_error("Debug PRP Mappings: Invalid device view\n");
+        return;
+    }
+    
+    // 启动kernel - 使用单个线程块和单个线程
+    gpu_debug_prp_mappings_kernel<<<1, 1>>>(device_view, tensor_ptr, tensor_size, granularity);
+    
+    // 同步等待kernel完成
+    cudaError_t err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+        geminifs_error("Debug PRP Mappings: Kernel execution failed: %s\n", 
+                       cudaGetErrorString(err));
+    }
 }
