@@ -10,6 +10,7 @@
 // 前向声明
 struct PRPMappingEntry;
 
+
 // PRP List 相关常量
 constexpr size_t PRP_PAGE_SIZE = 4096;                           // 4KB 页面大小
 constexpr size_t PRP_ENTRY_SIZE = 8;                             // 每个 PRP entry 8 字节
@@ -34,25 +35,7 @@ struct PRPListPage {
     }
 };
 
-// PRP 上下文结构
-struct PRPContext {
-    PRPTransferType transfer_type;                // 传输类型
-    size_t data_size;                            // 数据总大小
-    size_t num_prp_pages;                        // PRP 页面数量
-    void** prp_pages;                            // PRP 页面指针数组 (GPU 内存)
-    uint64_t* prp_page_addrs;                    // PRP 页面的物理地址数组
-    
-    PRPContext() : transfer_type(PRP_TYPE_SINGLE_PAGE), data_size(0), 
-                   num_prp_pages(0), prp_pages(nullptr), prp_page_addrs(nullptr) {}
-    
-    ~PRPContext() {
-        cleanup();
-    }
-    
-    void cleanup();
-    bool allocatePRPPages(size_t num_pages);
-    bool buildPRPList(const std::vector<uint64_t>& ioaddrs);
-};
+
 
 // struct geminifs_metadata{
 //     std::vector<ControllerPtr> ctrls;
@@ -63,36 +46,46 @@ struct PRPContext {
 //     std::vector<cudaStream_t> streams;
 // };
 
+// 子切片信息结构
+struct SubSliceInfo {
+    size_t offset;                              // 切片在granularity内的偏移
+    size_t size;                                // 切片大小
+    size_t global_offset;                       // 切片在整个tensor中的偏移
+    
+    SubSliceInfo(size_t o, size_t s, size_t go) : offset(o), size(s), global_offset(go) {}
+};
+
+// 粒度级别的切片信息
+struct GranularitySliceGroup {
+    uint64_t gpu_tensor_ptr;                    // 该granularity对应的GPU tensor数据指针
+    size_t granularity_offset;                  // 该granularity在整个tensor中的起始偏移
+    size_t granularity_size;                    // 该granularity的大小
+    std::vector<SubSliceInfo> sub_slices;       // 该granularity内的所有子切片
+    std::vector<PRPMappingEntry> prp_mappings;  // 该granularity对应的PRP映射条目
+    
+    GranularitySliceGroup(uint64_t ptr, size_t offset, size_t size) 
+        : gpu_tensor_ptr(ptr), granularity_offset(offset), granularity_size(size) {}
+};
+
 struct geminifs_dma{
     uint64_t *ioaddrs;                          // 原始 IO 地址数组
     DmaPtr dma_ptr;                             // DMA 指针
-    PRPContext* prp_context;                    // PRP 上下文
     
-    // Slice 相关字段
-    std::vector<size_t> slice_sizes;            // 每个切片的大小
-    std::vector<size_t> slice_offsets;          // 每个切片在原始数据中的偏移
+    // 切片粒度信息
     uint64_t slice_granularity;                 // 切片粒度（最小maxIOsize）
-    size_t num_slices;                          // 切片数量
     
-    // PRP Mapping 相关字段
-    std::vector<PRPMappingEntry> prp_mappings;  // PRP映射条目数组
+    // 二级切片组织结构
+    std::vector<GranularitySliceGroup> granularity_groups;  // 每个granularity对应的切片组
     
     // Type 2 PRP List GPU内存相关字段
-
     size_t type2_prp_count;                     // 第三种类型PRP的数量
     DmaPtr type2_prp_dma_ptr;                   // 第三种类型PRP GPU内存的DMA指针
-    geminifs_dma() : ioaddrs(nullptr), dma_ptr(nullptr), prp_context(nullptr), 
-                     slice_granularity(0), num_slices(0), type2_prp_count(0), type2_prp_dma_ptr(nullptr) {}
+    
+    geminifs_dma() : ioaddrs(nullptr), dma_ptr(nullptr), 
+                     slice_granularity(0), type2_prp_count(0), type2_prp_dma_ptr(nullptr) {}
     
     ~geminifs_dma() {
-        if (prp_context) {
-            delete prp_context;
-            prp_context = nullptr;
-        }
-        // if (raw_type2_prp_gpu_memory) {
-        //     cudaFree(raw_type2_prp_gpu_memory);
-        //     raw_type2_prp_gpu_memory = nullptr;
-        // }
+        // DMA指针和GPU内存由系统自动管理，无需手动释放
     }
 };
 

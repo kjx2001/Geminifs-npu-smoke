@@ -569,208 +569,6 @@ std::tuple<uint32_t, uint32_t, uint32_t, uint32_t> GPUMemoryMapper::getStats() c
 }
  
 
-// === PRPContext Implementation ===
-
-void PRPContext::cleanup() {
-    if (prp_pages) {
-        for (size_t i = 0; i < num_prp_pages; ++i) {
-            if (prp_pages[i]) {
-                cudaFree(prp_pages[i]);
-                prp_pages[i] = nullptr;
-            }
-        }
-        delete[] prp_pages;
-        prp_pages = nullptr;
-    }
-    
-    if (prp_page_addrs) {
-        delete[] prp_page_addrs;
-        prp_page_addrs = nullptr;
-    }
-    
-    num_prp_pages = 0;
-    data_size = 0;
-    transfer_type = PRP_TYPE_SINGLE_PAGE;
-}
-
-bool PRPContext::allocatePRPPages(size_t num_pages) {
-    if (num_pages == 0) {
-        geminifs_error("PRP Context: Cannot allocate 0 pages\n");
-        return false;
-    }
-    
-    cleanup(); // 清理之前的分配
-    
-    // 分配页面指针数组
-    prp_pages = new void*[num_pages];
-    prp_page_addrs = new uint64_t[num_pages];
-    
-    if (!prp_pages || !prp_page_addrs) {
-        geminifs_error("PRP Context: Failed to allocate page arrays\n");
-        cleanup();
-        return false;
-    }
-    
-    // 初始化为空
-    memset(prp_pages, 0, sizeof(void*) * num_pages);
-    memset(prp_page_addrs, 0, sizeof(uint64_t) * num_pages);
-    
-    // 分配每个 PRP 页面
-    for (size_t i = 0; i < num_pages; ++i) {
-        cudaError_t err = cudaMalloc(&prp_pages[i], PRP_PAGE_SIZE);
-        if (err != cudaSuccess) {
-            geminifs_error("PRP Context: Failed to allocate PRP page %zu: %s\n", 
-                          i, cudaGetErrorString(err));
-            cleanup();
-            return false;
-        }
-        
-        // 清零页面
-        err = cudaMemset(prp_pages[i], 0, PRP_PAGE_SIZE);
-        if (err != cudaSuccess) {
-            geminifs_error("PRP Context: Failed to clear PRP page %zu: %s\n", 
-                          i, cudaGetErrorString(err));
-            cleanup();
-            return false;
-        }
-        
-        // 获取页面的设备地址 (这里简化处理，实际可能需要更复杂的地址获取)
-        prp_page_addrs[i] = reinterpret_cast<uint64_t>(prp_pages[i]);
-    }
-    
-    num_prp_pages = num_pages;
-    geminifs_debug("PRP Context: Successfully allocated %zu PRP pages\n", num_pages);
-    return true;
-}
-
-bool PRPContext::buildPRPList(const std::vector<uint64_t>& ioaddrs) {
-    if (ioaddrs.empty()) {
-        geminifs_error("PRP Context: Cannot build PRP list with empty ioaddrs\n");
-        return false;
-    }
-    
-    data_size = ioaddrs.size() * PRP_PAGE_SIZE;
-    
-    // 检查数据大小限制
-    if (data_size > MAX_TRANSFER_SIZE) {
-        geminifs_error("PRP Context: Data size %zu exceeds maximum transfer size %zu\n", 
-                      data_size, MAX_TRANSFER_SIZE);
-        return false;
-    }
-    
-    // 确定传输类型
-    if (data_size <= PRP_PAGE_SIZE) {
-        // 单页传输
-        transfer_type = PRP_TYPE_SINGLE_PAGE;
-        
-        if (!allocatePRPPages(1)) {
-            return false;
-        }
-        
-        // 创建 PRP 页面结构
-        PRPListPage host_page;
-        host_page.prp_entries[0] = ioaddrs[0];
-        host_page.transfer_type = PRP_TYPE_SINGLE_PAGE;
-        
-        // 复制到设备
-        cudaError_t err = cudaMemcpy(prp_pages[0], &host_page, sizeof(PRPListPage), cudaMemcpyHostToDevice);
-        if (err != cudaSuccess) {
-            geminifs_error("PRP Context: Failed to copy single page PRP to device: %s\n", 
-                          cudaGetErrorString(err));
-            return false;
-        }
-        
-        geminifs_debug("PRP Context: Built single page PRP list with ioaddr 0x%lx\n", ioaddrs[0]);
-        
-    } else if (data_size <= 2 * PRP_PAGE_SIZE) {
-        // 双页传输
-        transfer_type = PRP_TYPE_DUAL_PAGE;
-        
-        if (!allocatePRPPages(1)) {
-            return false;
-        }
-        
-        // 创建 PRP 页面结构
-        PRPListPage host_page;
-        host_page.prp_entries[0] = ioaddrs[0];
-        host_page.prp_entries[1] = ioaddrs.size() > 1 ? ioaddrs[1] : 0;
-        host_page.transfer_type = PRP_TYPE_DUAL_PAGE;
-        
-        // 复制到设备
-        cudaError_t err = cudaMemcpy(prp_pages[0], &host_page, sizeof(PRPListPage), cudaMemcpyHostToDevice);
-        if (err != cudaSuccess) {
-            geminifs_error("PRP Context: Failed to copy dual page PRP to device: %s\n", 
-                          cudaGetErrorString(err));
-            return false;
-        }
-        
-        geminifs_debug("PRP Context: Built dual page PRP list with ioaddrs 0x%lx, 0x%lx\n", 
-                      ioaddrs[0], ioaddrs.size() > 1 ? ioaddrs[1] : 0);
-        
-    } else {
-        // PRP List 传输
-        transfer_type = PRP_TYPE_LIST;
-        
-        // 计算需要的 PRP 页面数量
-        size_t total_entries = ioaddrs.size();
-        size_t pages_needed = (total_entries + PRP_ENTRIES_PER_PAGE - 1) / PRP_ENTRIES_PER_PAGE;
-        
-        if (!allocatePRPPages(pages_needed)) {
-            return false;
-        }
-        
-        // 构建多个 PRP 页面
-        size_t entry_index = 0;
-        for (size_t page_idx = 0; page_idx < pages_needed; ++page_idx) {
-            PRPListPage host_page;
-            
-            // 填充当前页面的 entries
-            size_t entries_in_this_page = std::min(PRP_ENTRIES_PER_PAGE, total_entries - entry_index);
-            
-            for (size_t i = 0; i < entries_in_this_page; ++i) {
-                host_page.prp_entries[i] = ioaddrs[entry_index + i];
-            }
-            
-            // 如果不是最后一页，最后一个 entry 指向下一个 PRP 页面
-            if (page_idx < pages_needed - 1) {
-                host_page.prp_entries[PRP_ENTRIES_PER_PAGE - 1] = prp_page_addrs[page_idx + 1];
-                entries_in_this_page--; // 最后一个 entry 用于链接，减少实际数据 entries
-            }
-            
-            host_page.transfer_type = PRP_TYPE_LIST;
-            
-            // 复制到设备
-            cudaError_t err = cudaMemcpy(prp_pages[page_idx], &host_page, sizeof(PRPListPage), cudaMemcpyHostToDevice);
-            if (err != cudaSuccess) {
-                geminifs_error("PRP Context: Failed to copy PRP list page %zu to device: %s\n", 
-                              page_idx, cudaGetErrorString(err));
-                return false;
-            }
-            
-            entry_index += entries_in_this_page;
-        }
-        
-        geminifs_debug("PRP Context: Built PRP list with %zu pages, %zu total entries\n", 
-                      pages_needed, total_entries);
-    }
-    
-    return true;
-}
-
-
-
-/**
- * 获取 PRP 传输类型字符串
- */
-const char* getPRPTransferTypeString(PRPTransferType type) {
-    switch (type) {
-        case PRP_TYPE_SINGLE_PAGE: return "Single Page";
-        case PRP_TYPE_DUAL_PAGE:   return "Dual Page";
-        case PRP_TYPE_LIST:        return "PRP List";
-        default:                   return "Unknown";
-    }
-}
-
 
 
 // === GPUController Implementation ===
@@ -1120,77 +918,80 @@ bool GPUController::performDMASlicing(geminifs_dma* dma_ctx, size_t tensor_size,
     // 记录切片粒度信息
     dma_ctx->slice_granularity = (granularity > 0) ? granularity : min_max_io_size;
     
+    // 清空之前的数据
+    dma_ctx->granularity_groups.clear();
+    
     // 实现两级切割逻辑
     if (granularity > 0) {
-        // 第一级：按照外部传入的granularity进行切割
-        std::vector<std::pair<size_t, size_t>> primary_slices;  // (offset, size)
+        // 第一级：按照外部传入的granularity进行切割，创建granularity groups
         size_t remaining_size = tensor_size;
         size_t current_offset = 0;
         
         while (remaining_size > 0) {
-            size_t slice_size = std::min(remaining_size, (size_t)granularity);
-            primary_slices.push_back(std::make_pair(current_offset, slice_size));
+            size_t granularity_size = std::min(remaining_size, (size_t)granularity);
             
-            // geminifs_info("GPU Controller: First-level slice[%zu]: offset=%zu, size=%zu bytes\n", 
-            //               primary_slices.size() - 1, current_offset, slice_size);
+            // 计算该granularity对应的GPU tensor数据指针
+            uint64_t gpu_tensor_ptr = reinterpret_cast<uint64_t>(dma_ctx->dma_ptr->vaddr) + current_offset;
             
-            current_offset += slice_size;
-            remaining_size -= slice_size;
-        }
-        
-        geminifs_debug("GPU Controller: First-level slicing: %zu slices by granularity %llu\n", 
-                       primary_slices.size(), granularity);
-        
-        // 第二级：对每个第一级切片再按照maxIOsize进行切割
-        for (const auto& primary_slice : primary_slices) {
-            size_t slice_offset = primary_slice.first;
-            size_t slice_size = primary_slice.second;
+            // 创建granularity组
+            GranularitySliceGroup group(gpu_tensor_ptr, current_offset, granularity_size);
             
-            // geminifs_info("GPU Controller: Processing primary slice: offset=%zu, size=%zu bytes for second-level cutting\n", 
-            //               slice_offset, slice_size);
+            geminifs_info("GPU Controller: First-level granularity[%zu]: offset=%zu, size=%zu bytes, gpu_ptr=0x%lx\n", 
+                          dma_ctx->granularity_groups.size(), current_offset, granularity_size, gpu_tensor_ptr);
             
-            if (slice_size <= min_max_io_size) {
-                // 当前切片小于等于maxIOsize，不需要进一步切割
-                dma_ctx->slice_sizes.push_back(slice_size);
-                dma_ctx->slice_offsets.push_back(slice_offset);
+            // 第二级：对当前granularity按照maxIOsize进行切割
+            if (granularity_size <= min_max_io_size) {
+                // 当前granularity小于等于maxIOsize，不需要进一步切割
+                SubSliceInfo sub_slice(0, granularity_size, current_offset);
+                group.sub_slices.push_back(sub_slice);
                 
-                // geminifs_info("GPU Controller: Second-level slice[%zu]: offset=%zu, size=%zu bytes (no further cutting needed)\n", 
-                //               dma_ctx->slice_sizes.size() - 1, slice_offset, slice_size);
+                geminifs_info("GPU Controller: Sub-slice[0]: local_offset=0, size=%zu, global_offset=%zu (no further cutting needed)\n", 
+                              granularity_size, current_offset);
             } else {
-                // 当前切片需要按照maxIOsize进一步切割
-                size_t sub_remaining = slice_size;
-                size_t sub_offset = slice_offset;
+                // 当前granularity需要按照maxIOsize进一步切割
+                size_t sub_remaining = granularity_size;
+                size_t sub_local_offset = 0;  // granularity内的本地偏移
+                size_t sub_index = 0;
                 
-                // geminifs_info("GPU Controller: Primary slice size %zu > maxIOsize %llu, performing second-level cutting\n", 
-                //               slice_size, min_max_io_size);
+                geminifs_info("GPU Controller: Granularity size %zu > maxIOsize %llu, performing second-level cutting\n", 
+                              granularity_size, min_max_io_size);
                 
                 while (sub_remaining > 0) {
                     size_t sub_slice_size = std::min(sub_remaining, (size_t)min_max_io_size);
-                    dma_ctx->slice_sizes.push_back(sub_slice_size);
-                    dma_ctx->slice_offsets.push_back(sub_offset);
+                    size_t sub_global_offset = current_offset + sub_local_offset;
                     
-                    // geminifs_info("GPU Controller: Second-level slice[%zu]: offset=%zu, size=%zu bytes\n", 
-                    //               dma_ctx->slice_sizes.size() - 1, sub_offset, sub_slice_size);
+                    SubSliceInfo sub_slice(sub_local_offset, sub_slice_size, sub_global_offset);
+                    group.sub_slices.push_back(sub_slice);
                     
-                    sub_offset += sub_slice_size;
+                    geminifs_info("GPU Controller: Sub-slice[%zu]: local_offset=%zu, size=%zu, global_offset=%zu\n", 
+                                  sub_index, sub_local_offset, sub_slice_size, sub_global_offset);
+                    
+                    sub_local_offset += sub_slice_size;
                     sub_remaining -= sub_slice_size;
+                    sub_index++;
                 }
             }
+            
+            // 添加granularity组到列表
+            dma_ctx->granularity_groups.push_back(std::move(group));
+            
+            current_offset += granularity_size;
+            remaining_size -= granularity_size;
         }
         
-        dma_ctx->num_slices = dma_ctx->slice_sizes.size();
-        
-        geminifs_debug("GPU Controller: Two-level slicing complete: %zu final slices "
+        geminifs_debug("GPU Controller: Two-level slicing complete: %zu granularity groups "
                        "(granularity %llu -> maxIOsize %llu)\n", 
-                       dma_ctx->num_slices, granularity, min_max_io_size);
+                       dma_ctx->granularity_groups.size(), granularity, min_max_io_size);
         
     } else {
-        // 没有外部粒度，只按照maxIOsize进行切割
+        // 没有外部粒度，只按照maxIOsize进行切割，创建单个granularity组
+        uint64_t gpu_tensor_ptr = reinterpret_cast<uint64_t>(dma_ctx->dma_ptr->vaddr);
+        GranularitySliceGroup group(gpu_tensor_ptr, 0, tensor_size);
+        
         if (tensor_size <= min_max_io_size) {
             // 数据小于等于maxIOsize，不进行切片
-            dma_ctx->num_slices = 1;
-            dma_ctx->slice_sizes.push_back(tensor_size);
-            dma_ctx->slice_offsets.push_back(0);
+            SubSliceInfo sub_slice(0, tensor_size, 0);
+            group.sub_slices.push_back(sub_slice);
             
             geminifs_debug("GPU Controller: Tensor size %zu <= maxIOsize %llu, no slicing needed\n", 
                            tensor_size, min_max_io_size);
@@ -1198,44 +999,42 @@ bool GPUController::performDMASlicing(geminifs_dma* dma_ctx, size_t tensor_size,
             // 需要按照maxIOsize进行切片
             size_t remaining_size = tensor_size;
             size_t current_offset = 0;
+            size_t sub_index = 0;
             
             while (remaining_size > 0) {
                 size_t slice_size = std::min(remaining_size, (size_t)min_max_io_size);
-                dma_ctx->slice_sizes.push_back(slice_size);
-                dma_ctx->slice_offsets.push_back(current_offset);
+                
+                SubSliceInfo sub_slice(current_offset, slice_size, current_offset);
+                group.sub_slices.push_back(sub_slice);
+                
+                geminifs_info("GPU Controller: Sub-slice[%zu]: local_offset=%zu, size=%zu, global_offset=%zu\n", 
+                              sub_index, current_offset, slice_size, current_offset);
                 
                 current_offset += slice_size;
                 remaining_size -= slice_size;
+                sub_index++;
             }
             
-            dma_ctx->num_slices = dma_ctx->slice_sizes.size();
-            
             geminifs_debug("GPU Controller: Single-level slicing: %zu slices by maxIOsize %llu\n", 
-                           dma_ctx->num_slices, min_max_io_size);
-        }
-    }
-    
-    // 对所有切片的size和offset进行4K对齐检查
-    const uint64_t alignment_4k = 4096;
-    for (size_t i = 0; i < dma_ctx->num_slices; i++) {
-        size_t slice_size = dma_ctx->slice_sizes[i];
-        size_t slice_offset = dma_ctx->slice_offsets[i];
-        
-        // 检查slice size是否4K对齐
-        if (slice_size % alignment_4k != 0) {
-            geminifs_error("GPU Controller: Slice %zu size %zu is not 4K-aligned\n", i, slice_size);
-            return false;
+                           group.sub_slices.size(), min_max_io_size);
         }
         
-        // 检查slice offset是否4K对齐
-        if (slice_offset % alignment_4k != 0) {
-            geminifs_error("GPU Controller: Slice %zu offset %zu is not 4K-aligned\n", i, slice_offset);
-            return false;
-        }
+        // 添加单个granularity组
+        dma_ctx->granularity_groups.push_back(std::move(group));
     }
     
-    geminifs_debug("GPU Controller: All %zu slices are 4K-aligned (size and offset)\n", 
-                   dma_ctx->num_slices);
+    // 打印granularity组的详细信息
+    for (size_t i = 0; i < dma_ctx->granularity_groups.size(); i++) {
+        const auto& group = dma_ctx->granularity_groups[i];
+        geminifs_info("GPU Controller: Granularity Group[%zu]: gpu_ptr=0x%lx, offset=%zu, size=%zu, sub_slices=%zu\n", 
+                      i, group.gpu_tensor_ptr, group.granularity_offset, group.granularity_size, group.sub_slices.size());
+        
+        for (size_t j = 0; j < group.sub_slices.size(); j++) {
+            const auto& sub_slice = group.sub_slices[j];
+            geminifs_info("  Sub-slice[%zu]: local_offset=%zu, size=%zu, global_offset=%zu\n", 
+                          j, sub_slice.offset, sub_slice.size, sub_slice.global_offset);
+        }
+    }
     
     return true;
 }
@@ -1322,145 +1121,187 @@ bool GPUController::initializePRPEntries(geminifs_dma* dma_ctx) {
         return false;
     }
     
-    // 创建对应数量的PRPMappingEntry
-    dma_ctx->prp_mappings.reserve(dma_ctx->num_slices);
-    
-    // 统计第三种类型(transfer_type=2)的数量
-    size_t type2_count = 0;
-    
-    for (size_t i = 0; i < dma_ctx->num_slices; i++) {
-        size_t slice_size = dma_ctx->slice_sizes[i];
-        uint32_t transfer_type = 0;  // 默认类型0
-        
-        // 根据slice_size确定NVMe IO cmd类型
-        if (slice_size <= 4096) {
-            transfer_type = 0;  // 小于等于4K
-        } else if (slice_size <= 8192) {
-            transfer_type = 1;  // 大于4K小于等于8K 
-        } else {
-            transfer_type = 2;  // 大于8K
-            type2_count++;       // 统计第三种类型的数量
-        }
-        
-        // 创建PRPMappingEntry (prp1和prp2先不初始化)
-        PRPMappingEntry entry(transfer_type, 0, 0);
-        dma_ctx->prp_mappings.push_back(entry);
-        
-        geminifs_debug("GPU Controller: Created PRPMappingEntry[%zu]: transfer_type=%u for slice_size=%zu\n", 
-                       i, transfer_type, slice_size);
+    if (dma_ctx->granularity_groups.empty()) {
+        geminifs_error("GPU Controller: No granularity groups found\n");
+        return false;
     }
     
-    // 记录第三种类型的数量
-    dma_ctx->type2_prp_count = type2_count;
-
     auto first_controller = nvme_controllers_[0];
     if (!first_controller || !first_controller->controller) {
         geminifs_error("GPU Controller: Invalid NVMe controller for DMA context creation\n");
         return false;
     }
+    
+    // 统计全局第三种类型(transfer_type=2)的数量
+    size_t total_type2_count = 0;
+    
+    // 为每个GranularitySliceGroup构建PRP映射条目
+    for (size_t group_idx = 0; group_idx < dma_ctx->granularity_groups.size(); group_idx++) {
+        auto& group = dma_ctx->granularity_groups[group_idx];
+        
+        geminifs_info("GPU Controller: Building PRP mappings for Granularity Group[%zu]: %zu sub-slices\n", 
+                      group_idx, group.sub_slices.size());
+        
+        // 为该granularity group预留PRP映射空间
+        group.prp_mappings.reserve(group.sub_slices.size());
+        
+        // 统计该group的type2数量
+        size_t group_type2_count = 0;
+        
+        // 为该group的每个子切片创建PRP映射条目
+        for (size_t sub_idx = 0; sub_idx < group.sub_slices.size(); sub_idx++) {
+            const auto& sub_slice = group.sub_slices[sub_idx];
+            size_t slice_size = sub_slice.size;
+            uint32_t transfer_type = 0;  // 默认类型0
+            
+            // 根据slice_size确定NVMe IO cmd类型
+            if (slice_size <= 4096) {
+                transfer_type = 0;  // 小于等于4K
+            } else if (slice_size <= 8192) {
+                transfer_type = 1;  // 大于4K小于等于8K 
+            } else {
+                transfer_type = 2;  // 大于8K
+                group_type2_count++;       // 统计该group的第三种类型数量
+                total_type2_count++;       // 统计全局第三种类型数量
+            }
+            
+            // 创建PRPMappingEntry (prp1和prp2先不初始化)
+            PRPMappingEntry entry(transfer_type, 0, 0);
+            group.prp_mappings.push_back(entry);
+            
+            geminifs_debug("GPU Controller: Group[%zu] Sub-slice[%zu]: transfer_type=%u, size=%zu\n", 
+                           group_idx, sub_idx, transfer_type, slice_size);
+        }
+        
+        geminifs_info("GPU Controller: Group[%zu] created %zu PRP mappings (%zu type2)\n", 
+                      group_idx, group.prp_mappings.size(), group_type2_count);
+    }
+    
+    // 记录全局第三种类型的数量
+    dma_ctx->type2_prp_count = total_type2_count;
+    
     // 为第三种类型的PRP分配4KB对齐的GPU内存
-    if (type2_count > 0) {
-        size_t memory_size = type2_count * 4096;  // 每个第三种类型需要4KB
-        dma_ctx->type2_prp_dma_ptr = createDma(first_controller->controller->ctrl,memory_size,device_id_);
+    if (total_type2_count > 0) {
+        size_t memory_size = total_type2_count * 4096;  // 每个第三种类型需要4KB
+        dma_ctx->type2_prp_dma_ptr = createDma(first_controller->controller->ctrl, memory_size, device_id_);
         if (!dma_ctx->type2_prp_dma_ptr) {
             geminifs_error("GPU Controller: Failed to create DMA pointer for type2 PRP GPU memory\n");
             return false;
         }
+        geminifs_info("GPU Controller: Allocated %zu bytes GPU memory for %zu type2 PRP entries\n", 
+                      memory_size, total_type2_count);
     } else {
         geminifs_debug("GPU Controller: No type2 PRP entries found, no GPU memory allocation needed\n");
     }
     
-    // 根据NVMe命令规则设置每个PRPMappingEntry的prp1和prp2，并填充type2_prp_gpu_memory
-    size_t current_ioaddr_index = 0;  // 当前使用的ioaddrs索引
-    size_t type2_gpu_memory_offset = 0;  // type2_prp_gpu_memory中的偏移量
+    // 初始化每个granularity group的PRP条目
+    size_t current_ioaddr_index = 0;      // 当前使用的ioaddrs索引
+    size_t type2_gpu_memory_offset = 0;   // type2_prp_gpu_memory中的偏移量
     
-    for (size_t i = 0; i < dma_ctx->num_slices; i++) {
-        size_t slice_size = dma_ctx->slice_sizes[i];
-        size_t slice_pages = (slice_size + 4095) / 4096;  // 切片需要的4K页数（向上取整）
-        PRPMappingEntry& entry = dma_ctx->prp_mappings[i];
+    for (size_t group_idx = 0; group_idx < dma_ctx->granularity_groups.size(); group_idx++) {
+        auto& group = dma_ctx->granularity_groups[group_idx];
         
-        if (current_ioaddr_index + slice_pages > dma_ctx->dma_ptr->n_ioaddrs) {
-            geminifs_error("GPU Controller: Not enough ioaddrs for slice %zu (need %zu, available %zu)\n", 
-                           i, slice_pages, dma_ctx->dma_ptr->n_ioaddrs - current_ioaddr_index);
-            return false;
-        }
+        geminifs_info("GPU Controller: Initializing PRP entries for Group[%zu]: gpu_ptr=0x%lx\n", 
+                      group_idx, group.gpu_tensor_ptr);
         
-        // 根据NVMe命令类型设置PRP1和PRP2
-        if (entry.transfer_type == 0) {
-            // 类型0: <= 4K, 单页传输
-            // PRP1指向数据页，PRP2不使用
-            entry.prp1 = dma_ctx->dma_ptr->ioaddrs[current_ioaddr_index];
-            entry.prp2 = 0;
-            geminifs_debug("GPU Controller: Slice[%zu] Type0: PRP1=0x%lx, PRP2=0x%lx\n", 
-                           i, entry.prp1, entry.prp2);
+        // 处理该group的每个子切片
+        for (size_t sub_idx = 0; sub_idx < group.sub_slices.size(); sub_idx++) {
+            const auto& sub_slice = group.sub_slices[sub_idx];
+            size_t slice_size = sub_slice.size;
+            size_t slice_pages = (slice_size + 4095) / 4096;  // 切片需要的4K页数（向上取整）
             
-        } else if (entry.transfer_type == 1) {
-            // 类型1: 4K < size <= 8K, 双页传输
-            // PRP1指向第一个数据页，PRP2指向第二个数据页
-            entry.prp1 = dma_ctx->dma_ptr->ioaddrs[current_ioaddr_index];
-            if (slice_pages > 1) {
-                entry.prp2 = dma_ctx->dma_ptr->ioaddrs[current_ioaddr_index + 1];
-            } else {
-                entry.prp2 = 0;  // 如果实际只有一页，PRP2设为0
+            PRPMappingEntry& group_entry = group.prp_mappings[sub_idx];
+            
+            // 检查ioaddrs边界
+            if (current_ioaddr_index + slice_pages > dma_ctx->dma_ptr->n_ioaddrs) {
+                geminifs_error("GPU Controller: Not enough ioaddrs for Group[%zu] Sub-slice[%zu] (need %zu, available %zu)\n", 
+                               group_idx, sub_idx, slice_pages, dma_ctx->dma_ptr->n_ioaddrs - current_ioaddr_index);
+                return false;
             }
-            geminifs_debug("GPU Controller: Slice[%zu] Type1: PRP1=0x%lx, PRP2=0x%lx\n", 
-                           i, entry.prp1, entry.prp2);
             
-        } else if (entry.transfer_type == 2) {
-            // 类型2: > 8K, PRP List传输
-            // PRP1指向第一个数据页，PRP2指向PRP List页
-            entry.prp1 = dma_ctx->dma_ptr->ioaddrs[current_ioaddr_index];
-            
-            // PRP2指向type2_prp_gpu_memory中对应的4K空间
-            if (dma_ctx->type2_prp_dma_ptr && dma_ctx->type2_prp_dma_ptr->n_ioaddrs > 0) {
-                size_t type2_page_index = type2_gpu_memory_offset / 4096;
-                if (type2_page_index < dma_ctx->type2_prp_dma_ptr->n_ioaddrs) {
-                    entry.prp2 = dma_ctx->type2_prp_dma_ptr->ioaddrs[type2_page_index];
+            // 根据NVMe命令类型设置PRP1和PRP2
+            if (group_entry.transfer_type == 0) {
+                // 类型0: <= 4K, 单页传输
+                // PRP1指向数据页，PRP2不使用
+                group_entry.prp1 = dma_ctx->dma_ptr->ioaddrs[current_ioaddr_index];
+                group_entry.prp2 = 0;
+                
+                geminifs_debug("GPU Controller: Group[%zu] Sub-slice[%zu] Type0: PRP1=0x%lx, PRP2=0x%lx\n", 
+                               group_idx, sub_idx, group_entry.prp1, group_entry.prp2);
+                
+            } else if (group_entry.transfer_type == 1) {
+                // 类型1: 4K < size <= 8K, 双页传输
+                // PRP1指向第一个数据页，PRP2指向第二个数据页
+                group_entry.prp1 = dma_ctx->dma_ptr->ioaddrs[current_ioaddr_index];
+                if (slice_pages > 1) {
+                    group_entry.prp2 = dma_ctx->dma_ptr->ioaddrs[current_ioaddr_index + 1];
                 } else {
-                    geminifs_error("GPU Controller: Type2 page index %zu exceeds available pages %zu\n", 
-                                   type2_page_index, dma_ctx->type2_prp_dma_ptr->n_ioaddrs);
+                    group_entry.prp2 = 0;  // 如果实际只有一页，PRP2设为0
+                }
+                
+                geminifs_debug("GPU Controller: Group[%zu] Sub-slice[%zu] Type1: PRP1=0x%lx, PRP2=0x%lx\n", 
+                               group_idx, sub_idx, group_entry.prp1, group_entry.prp2);
+                
+            } else if (group_entry.transfer_type == 2) {
+                // 类型2: > 8K, PRP List传输
+                // PRP1指向第一个数据页，PRP2指向PRP List页
+                group_entry.prp1 = dma_ctx->dma_ptr->ioaddrs[current_ioaddr_index];
+                
+                // PRP2指向type2_prp_gpu_memory中对应的4K空间
+                if (dma_ctx->type2_prp_dma_ptr && dma_ctx->type2_prp_dma_ptr->n_ioaddrs > 0) {
+                    size_t type2_page_index = type2_gpu_memory_offset / 4096;
+                    if (type2_page_index < dma_ctx->type2_prp_dma_ptr->n_ioaddrs) {
+                        group_entry.prp2 = dma_ctx->type2_prp_dma_ptr->ioaddrs[type2_page_index];
+                    } else {
+                        geminifs_error("GPU Controller: Type2 page index %zu exceeds available pages %zu\n", 
+                                       type2_page_index, dma_ctx->type2_prp_dma_ptr->n_ioaddrs);
+                        return false;
+                    }
+                } else {
+                    geminifs_error("GPU Controller: type2_prp_dma_ptr is invalid for Group[%zu] Sub-slice[%zu]\n", 
+                                   group_idx, sub_idx);
                     return false;
                 }
-            } else {
-                geminifs_error("GPU Controller: type2_prp_dma_ptr is invalid for slice %zu\n", i);
-                return false;
+                
+                // 填充type2_prp_gpu_memory: 将剩余数据页的ioaddrs复制到GPU内存
+                size_t remaining_pages = slice_pages - 1;  // 除去PRP1指向的第一页
+                std::vector<uint64_t> prp_list_host(512, 0);  // 4KB / 8字节 = 512个entry
+                
+                for (size_t j = 0; j < remaining_pages && j < 511; j++) {  // 最多511个entry
+                    prp_list_host[j] = dma_ctx->dma_ptr->ioaddrs[current_ioaddr_index + 1 + j];
+                    geminifs_debug("GPU Controller: Group[%zu] Sub-slice[%zu] PRP List[%zu] = 0x%lx (ioaddr_index=%zu)\n", 
+                                   group_idx, sub_idx, j, prp_list_host[j], current_ioaddr_index + 1 + j);
+                }
+                
+                // 将PRP List复制到GPU内存
+                cudaError_t err = cudaMemcpy(
+                    static_cast<char*>(dma_ctx->type2_prp_dma_ptr->vaddr) + type2_gpu_memory_offset,
+                    prp_list_host.data(),
+                    4096,
+                    cudaMemcpyHostToDevice
+                );
+                
+                if (err != cudaSuccess) {
+                    geminifs_error("GPU Controller: Failed to copy PRP list to GPU memory for Group[%zu] Sub-slice[%zu]: %s\n", 
+                                   group_idx, sub_idx, cudaGetErrorString(err));
+                    return false;
+                }
+                
+                geminifs_info("GPU Controller: Group[%zu] Sub-slice[%zu] Type2: PRP1=0x%lx, PRP2=0x%lx, filled %zu ioaddrs into GPU memory\n", 
+                              group_idx, sub_idx, group_entry.prp1, group_entry.prp2, remaining_pages);
+                
+                type2_gpu_memory_offset += 4096;  // 移动到下一个4K空间
             }
-            // 目前最大nvme io为1M，所以不需要考虑PRP List超过4K的情况
-            // 填充type2_prp_gpu_memory: 将剩余数据页的ioaddrs复制到GPU内存
-            size_t remaining_pages = slice_pages - 1;  // 除去PRP1指向的第一页
-            std::vector<uint64_t> prp_list_host(512, 0);  // 4KB / 8字节 = 512个entry
             
-            for (size_t j = 0; j < remaining_pages && j < 511; j++) {  // 最多511个entry (最后一个可能用于链接下一页)
-                prp_list_host[j] = dma_ctx->dma_ptr->ioaddrs[current_ioaddr_index + 1 + j];
-                // geminifs_info("GPU Controller: Slice[%zu] PRP List[%zu] = 0x%lx (ioaddr_index=%zu)\n", 
-                //               i, j, prp_list_host[j], current_ioaddr_index + 1 + j);
-            }
-            
-            // 将PRP List复制到GPU内存
-            cudaError_t err = cudaMemcpy(
-                static_cast<char*>(dma_ctx->type2_prp_dma_ptr->vaddr) + type2_gpu_memory_offset,
-                prp_list_host.data(),
-                4096,
-                cudaMemcpyHostToDevice
-            );
-            
-            if (err != cudaSuccess) {
-                geminifs_error("GPU Controller: Failed to copy PRP list to GPU memory for slice %zu: %s\n", 
-                               i, cudaGetErrorString(err));
-                return false;
-            }
-            
-            // geminifs_info("GPU Controller: Slice[%zu] Type2: PRP1=0x%lx, PRP2=0x%lx, filled %zu ioaddrs into GPU memory\n", 
-            //                i, entry.prp1, entry.prp2, remaining_pages);
-            
-            type2_gpu_memory_offset += 4096;  // 移动到下一个4K空间
+            current_ioaddr_index += slice_pages;  // 移动到下一个切片的起始ioaddr
         }
         
-        current_ioaddr_index += slice_pages;  // 移动到下一个切片的起始ioaddr
+        geminifs_info("GPU Controller: Group[%zu] PRP initialization complete: %zu entries processed\n", 
+                      group_idx, group.prp_mappings.size());
     }
     
-    // geminifs_info("GPU Controller: Successfully configured %zu PRPMappingEntries with NVMe command rules\n", 
-    //               dma_ctx->num_slices);
+    geminifs_info("GPU Controller: Successfully configured PRP mappings for %zu granularity groups\n", 
+                  dma_ctx->granularity_groups.size());
     
     return true;
 }
