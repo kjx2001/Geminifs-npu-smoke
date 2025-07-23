@@ -160,7 +160,6 @@ int main(int argc, char** argv) {
                 );
         // Register tensor with GPU controller
         bool success = gpu_controller->registerTensorMemory(key_cache, 1024*1024* 2); // 2MB granularity
-        success = gpu_controller->registerTensorMemory(key_cache2, 1024*1024* 2); // 2MB granularity
         if(!success) {
             std::cerr << "Failed to register tensor with GPU controller" << std::endl;
         }
@@ -170,116 +169,117 @@ int main(int argc, char** argv) {
             struct geminifs_dma* dma_context = gpu_controller->getDMAContext(key_cache.data_ptr());
             assert(dma_context != nullptr && dma_context->dma_ptr != nullptr);
             
-            struct geminifs_dma* dma_context2 = gpu_controller->getDMAContext(key_cache2.data_ptr());
-            assert(dma_context2 != nullptr && dma_context2->dma_ptr != nullptr);
-            
-            // Record start time for bandwidth calculation
-            auto bandwidth_start = std::chrono::high_resolution_clock::now();
+            debug_prp_mappings_from_gpu(gpu_controller->getMemoryMapper(),
+                                        reinterpret_cast<uint64_t>(key_cache.data_ptr()), 
+                                        key_cache.numel() * key_cache.element_size(), 
+                                        1024*1024*2); // 2MB granularity
 
-            nvme_controller_g_write_kernel<<<1,1,0,nvme_stream>>>(device_fd,dma_context->granularity_groups.at(0).prp_mappings.at(0).prp1,
-                                          dma_context->granularity_groups.at(0).prp_mappings.at(0).prp2, 0, dma_context->granularity_groups.at(0).sub_slices.at(0).size);
+        //     // Record start time for bandwidth calculation
+        //     auto bandwidth_start = std::chrono::high_resolution_clock::now();
+        //     nvme_controller_g_write_kernel<<<1,1,0,nvme_stream>>>(device_fd,dma_context->prp_mappings.at(0).prp1,
+        //                                   dma_context->prp_mappings.at(0).prp2, 0, dma_context->slice_sizes.at(0));
 
-            
-            nvme_controller_g_write_kernel<<<1,1,0,nvme_stream>>>(device_fd,dma_context2->granularity_groups.at(0).prp_mappings.at(0).prp1,
-                                          dma_context2->granularity_groups.at(0).prp_mappings.at(0).prp2, 0, dma_context2->granularity_groups.at(0).sub_slices.at(0).size);
-            
-            // Synchronize stream to ensure kernel completion
-            cudaStreamSynchronize(nvme_stream);
-            
-            // Record end time and calculate bandwidth
-            auto bandwidth_end = std::chrono::high_resolution_clock::now();
-            auto duration_us = std::chrono::duration_cast<std::chrono::microseconds>(bandwidth_end - bandwidth_start);
-            double duration_sec = duration_us.count() / 1000000.0;
-            double data_mb = dma_context->granularity_groups.at(0).sub_slices.at(0).size / (1024.0 * 1024.0);
-            double bandwidth_mbps = data_mb / duration_sec;
-            
-            geminifs_info("NVMe Read Bandwidth Statistics:\n");
-            geminifs_info("  Data size: %.2f MB\n", data_mb);
-            geminifs_info("  Duration: %.3f ms\n", duration_us.count() / 1000.0);
-            geminifs_info("  Bandwidth: %.2f MB/s\n", bandwidth_mbps);
 
-            // 检查两个tensor前1MB数据是否一致
-            std::cout << "\nVerifying data consistency between key_cache and key_cache2..." << std::endl;
+        //     nvme_controller_g_read_kernel<<<1,1,0,nvme_stream>>>(device_fd,dma_context2->prp_mappings.at(0).prp1,
+        //                                   dma_context2->prp_mappings.at(0).prp2, 0, dma_context2->slice_sizes.at(0));
             
-            // 计算前1MB的元素数量 (half precision = 2 bytes per element)
-            size_t verify_bytes = 1024 * 1024; // 1MB
-            size_t verify_elements = verify_bytes / 2; // 2 bytes per half precision element
+        //     // Synchronize stream to ensure kernel completion
+        //     cudaStreamSynchronize(nvme_stream);
             
-            // 确保不超过tensor的实际大小
-            size_t tensor_elements = key_cache.numel();
-            verify_elements = std::min(verify_elements, tensor_elements);
-            verify_bytes = verify_elements * 2;
+        //     // Record end time and calculate bandwidth
+        //     auto bandwidth_end = std::chrono::high_resolution_clock::now();
+        //     auto duration_us = std::chrono::duration_cast<std::chrono::microseconds>(bandwidth_end - bandwidth_start);
+        //     double duration_sec = duration_us.count() / 1000000.0;
+        //     double data_mb = dma_context->slice_sizes.at(0) / (1024.0 * 1024.0);
+        //     double bandwidth_mbps = data_mb / duration_sec;
             
-            std::cout << "Comparing first " << verify_bytes << " bytes (" << verify_elements << " elements)..." << std::endl;
+        //     geminifs_info("NVMe Read Bandwidth Statistics:\n");
+        //     geminifs_info("  Data size: %.2f MB\n", data_mb);
+        //     geminifs_info("  Duration: %.3f ms\n", duration_us.count() / 1000.0);
+        //     geminifs_info("  Bandwidth: %.2f MB/s\n", bandwidth_mbps);
+
+        //     // 检查两个tensor前1MB数据是否一致
+        //     std::cout << "\nVerifying data consistency between key_cache and key_cache2..." << std::endl;
             
-            // 将数据从GPU拷贝到CPU进行比较
-            torch::Tensor key_cache_cpu = key_cache.flatten().slice(0, 0, verify_elements).to(torch::kCPU);
-            torch::Tensor key_cache2_cpu = key_cache2.flatten().slice(0, 0, verify_elements).to(torch::kCPU);
+        //     // 计算前1MB的元素数量 (half precision = 2 bytes per element)
+        //     size_t verify_bytes = 1024 * 1024; // 1MB
+        //     size_t verify_elements = verify_bytes / 2; // 2 bytes per half precision element
             
-            // 比较数据
-            torch::Tensor diff = torch::abs(key_cache_cpu - key_cache2_cpu);
-            torch::Tensor max_diff = torch::max(diff);
-            torch::Tensor mean_diff = torch::mean(diff);
+        //     // 确保不超过tensor的实际大小
+        //     size_t tensor_elements = key_cache.numel();
+        //     verify_elements = std::min(verify_elements, tensor_elements);
+        //     verify_bytes = verify_elements * 2;
             
-            // 检查是否完全一致
-            bool data_identical = torch::allclose(key_cache_cpu, key_cache2_cpu, 1e-6, 1e-6);
+        //     std::cout << "Comparing first " << verify_bytes << " bytes (" << verify_elements << " elements)..." << std::endl;
             
-            if (data_identical) {
-                std::cout << "✓ Data verification PASSED: key_cache and key_cache2 are identical (first 1MB)" << std::endl;
-            } else {
-                std::cout << "✗ Data verification FAILED: key_cache and key_cache2 differ" << std::endl;
-                std::cout << "  Max difference: " << max_diff.item<float>() << std::endl;
-                std::cout << "  Mean difference: " << mean_diff.item<float>() << std::endl;
+        //     // 将数据从GPU拷贝到CPU进行比较
+        //     torch::Tensor key_cache_cpu = key_cache.flatten().slice(0, 0, verify_elements).to(torch::kCPU);
+        //     torch::Tensor key_cache2_cpu = key_cache2.flatten().slice(0, 0, verify_elements).to(torch::kCPU);
+            
+        //     // 比较数据
+        //     torch::Tensor diff = torch::abs(key_cache_cpu - key_cache2_cpu);
+        //     torch::Tensor max_diff = torch::max(diff);
+        //     torch::Tensor mean_diff = torch::mean(diff);
+            
+        //     // 检查是否完全一致
+        //     bool data_identical = torch::allclose(key_cache_cpu, key_cache2_cpu, 1e-6, 1e-6);
+            
+        //     if (data_identical) {
+        //         std::cout << "✓ Data verification PASSED: key_cache and key_cache2 are identical (first 1MB)" << std::endl;
+        //     } else {
+        //         std::cout << "✗ Data verification FAILED: key_cache and key_cache2 differ" << std::endl;
+        //         std::cout << "  Max difference: " << max_diff.item<float>() << std::endl;
+        //         std::cout << "  Mean difference: " << mean_diff.item<float>() << std::endl;
                 
-                // 统计不同元素的数量
-                torch::Tensor non_zero_diff = (diff > 1e-6);
-                int64_t diff_count = torch::sum(non_zero_diff).item<int64_t>();
-                double diff_percentage = (double)diff_count / verify_elements * 100.0;
+        //         // 统计不同元素的数量
+        //         torch::Tensor non_zero_diff = (diff > 1e-6);
+        //         int64_t diff_count = torch::sum(non_zero_diff).item<int64_t>();
+        //         double diff_percentage = (double)diff_count / verify_elements * 100.0;
                 
-                std::cout << "  Different elements: " << diff_count << " / " << verify_elements 
-                          << " (" << std::fixed << std::setprecision(2) << diff_percentage << "%)" << std::endl;
+        //         std::cout << "  Different elements: " << diff_count << " / " << verify_elements 
+        //                   << " (" << std::fixed << std::setprecision(2) << diff_percentage << "%)" << std::endl;
                 
-                // 显示前几个不同的值进行调试
-                if (diff_count > 0) {
-                    std::cout << "  First few differences:" << std::endl;
-                    auto key_cache_data = key_cache_cpu.accessor<torch::Half, 1>();
-                    auto key_cache2_data = key_cache2_cpu.accessor<torch::Half, 1>();
+        //         // 显示前几个不同的值进行调试
+        //         if (diff_count > 0) {
+        //             std::cout << "  First few differences:" << std::endl;
+        //             auto key_cache_data = key_cache_cpu.accessor<torch::Half, 1>();
+        //             auto key_cache2_data = key_cache2_cpu.accessor<torch::Half, 1>();
                     
-                    int shown_diffs = 0;
-                    for (int64_t i = 0; i < verify_elements && shown_diffs < 5; i++) {
-                        if (std::abs(static_cast<float>(key_cache_data[i]) - static_cast<float>(key_cache2_data[i])) > 1e-6) {
-                            std::cout << "    Index " << i << ": " 
-                                      << static_cast<float>(key_cache_data[i]) << " vs " 
-                                      << static_cast<float>(key_cache2_data[i]) << std::endl;
-                            shown_diffs++;
-                        }
-                    }
-                }
-            }
+        //             int shown_diffs = 0;
+        //             for (int64_t i = 0; i < verify_elements && shown_diffs < 5; i++) {
+        //                 if (std::abs(static_cast<float>(key_cache_data[i]) - static_cast<float>(key_cache2_data[i])) > 1e-6) {
+        //                     std::cout << "    Index " << i << ": " 
+        //                               << static_cast<float>(key_cache_data[i]) << " vs " 
+        //                               << static_cast<float>(key_cache2_data[i]) << std::endl;
+        //                     shown_diffs++;
+        //                 }
+        //             }
+        //         }
+        //     }
             
-            // 显示数据统计信息
-            torch::Tensor key_cache_stats = key_cache_cpu.slice(0, 0, std::min((int64_t)10, (int64_t)verify_elements));
-            torch::Tensor key_cache2_stats = key_cache2_cpu.slice(0, 0, std::min((int64_t)10, (int64_t)verify_elements));
+        //     // 显示数据统计信息
+        //     torch::Tensor key_cache_stats = key_cache_cpu.slice(0, 0, std::min((int64_t)10, (int64_t)verify_elements));
+        //     torch::Tensor key_cache2_stats = key_cache2_cpu.slice(0, 0, std::min((int64_t)10, (int64_t)verify_elements));
             
-            std::cout << "\nData samples (first 10 elements):" << std::endl;
-            std::cout << "key_cache:  ";
-            for (int i = 0; i < key_cache_stats.size(0); i++) {
-                std::cout << std::fixed << std::setprecision(4) << key_cache_stats[i].item<float>() << " ";
-            }
-            std::cout << std::endl;
+        //     std::cout << "\nData samples (first 10 elements):" << std::endl;
+        //     std::cout << "key_cache:  ";
+        //     for (int i = 0; i < key_cache_stats.size(0); i++) {
+        //         std::cout << std::fixed << std::setprecision(4) << key_cache_stats[i].item<float>() << " ";
+        //     }
+        //     std::cout << std::endl;
             
-            std::cout << "key_cache2: ";
-            for (int i = 0; i < key_cache2_stats.size(0); i++) {
-                std::cout << std::fixed << std::setprecision(4) << key_cache2_stats[i].item<float>() << " ";
-            }
-            std::cout << std::endl;
+        //     std::cout << "key_cache2: ";
+        //     for (int i = 0; i < key_cache2_stats.size(0); i++) {
+        //         std::cout << std::fixed << std::setprecision(4) << key_cache2_stats[i].item<float>() << " ";
+        //     }
+        //     std::cout << std::endl;
 
-            if(success)
-            {
-                std::cout << "✓ Successfully registered tensor with GPU controller" << std::endl;
-            } else{
-                std::cerr << "✗ Failed to register tensor with GPU controller" << std::endl;
-            }
+        //     if(success)
+        //     {
+        //         std::cout << "✓ Successfully registered tensor with GPU controller" << std::endl;
+        //     } else{
+        //         std::cerr << "✗ Failed to register tensor with GPU controller" << std::endl;
+        //     }
         }
 
 
