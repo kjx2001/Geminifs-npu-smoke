@@ -170,11 +170,15 @@ public:
  * GPU端哈希函数
  */
 __device__ __forceinline__ uint32_t gpu_hash(uint64_t key) {
-    // 使用FNV-1a哈希算法的简化版本
-    uint64_t hash = 14695981039346656037ULL;
-    hash ^= key;
-    hash *= 1099511628211ULL;
-    return static_cast<uint32_t>(hash % GPUMemoryMapper::HASH_TABLE_SIZE);
+    // 改进的哈希函数，解决指针哈希冲突问题
+    // 灵感来源于MurmurHash和xorshift
+    key = (key >> 12); // 指针通常是4K对齐的，右移12位可以消除低位的0，增加有效信息
+    key ^= (key >> 33);
+    key *= 0xff51afd7ed558ccdULL;
+    key ^= (key >> 33);
+    key *= 0xc4ceb9fe1a85ec53ULL;
+    key ^= (key >> 33);
+    return static_cast<uint32_t>(key % GPUMemoryMapper::HASH_TABLE_SIZE);
 }
 
 // === GPU设备端查找函数 ===

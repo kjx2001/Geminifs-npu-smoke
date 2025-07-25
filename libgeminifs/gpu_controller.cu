@@ -17,8 +17,10 @@ __device__ uint32_t gpu_lookup_all_prp_mappings(uint64_t tensor_ptr,
                                                 PRPMappingEntry* results,
                                                 uint32_t max_results) {
     uint32_t hash_index = gpu_hash(tensor_ptr);
+    
     GPUHashEntry& hash_entry = hash_table[hash_index];
     
+    printf("tensor_ptr is %lx, hash id is %u\n",tensor_ptr, hash_index);
     // 检查是否找到对应的tensor
     if (hash_entry.GPU_virtual_ptr != tensor_ptr || hash_entry.first_node == GPUMemoryMapper::INVALID_INDEX) {
         return 0; // 未找到
@@ -384,7 +386,10 @@ __global__ void kernel_add_batch_mappings(uint64_t tensor_ptr,
         // 分配资源
         uint32_t entry_start = atomicSub(free_entry_count, mapping_count);
         uint32_t node_start = atomicSub(free_node_count, mapping_count);
-        
+
+        printf("Available entries: %u, nodes: %u\n", available_entries, available_nodes);
+        printf("Requested mappings: %u, entries start: %u, nodes start: %u\n", 
+               mapping_count, entry_start, node_start);
         if (entry_start < mapping_count || node_start < mapping_count) {
             // 恢复计数器并退出
             atomicAdd(free_entry_count, mapping_count);
@@ -413,7 +418,7 @@ __global__ void kernel_add_batch_mappings(uint64_t tensor_ptr,
         
         // 更新哈希表
         uint32_t hash_index = gpu_hash(tensor_ptr);
-        
+        printf("Hash index for tensor 0x%lx: %u\n", tensor_ptr, hash_index);
         // 线性探测找到合适的槽位
         for (uint32_t i = 0; i < GPUMemoryMapper::HASH_TABLE_SIZE; ++i) {
             uint32_t probe_index = (hash_index + i) % GPUMemoryMapper::HASH_TABLE_SIZE;
@@ -968,8 +973,8 @@ bool GPUController::performDMASlicing(geminifs_dma* dma_ctx, size_t tensor_size,
             // 创建granularity组
             GranularitySliceGroup group(gpu_tensor_ptr, current_offset, granularity_size);
             
-            geminifs_info("GPU Controller: First-level granularity[%zu]: offset=%zu, size=%zu bytes, gpu_ptr=0x%lx\n", 
-                          dma_ctx->granularity_groups.size(), current_offset, granularity_size, gpu_tensor_ptr);
+            // geminifs_info("GPU Controller: First-level granularity[%zu]: offset=%zu, size=%zu bytes, gpu_ptr=0x%lx\n", 
+            //               dma_ctx->granularity_groups.size(), current_offset, granularity_size, gpu_tensor_ptr);
             
             // 第二级：对当前granularity按照maxIOsize进行切割
             if (granularity_size <= min_max_io_size) {
@@ -977,16 +982,16 @@ bool GPUController::performDMASlicing(geminifs_dma* dma_ctx, size_t tensor_size,
                 SubSliceInfo sub_slice(0, granularity_size, current_offset);
                 group.sub_slices.push_back(sub_slice);
                 
-                geminifs_info("GPU Controller: Sub-slice[0]: local_offset=0, size=%zu, global_offset=%zu (no further cutting needed)\n", 
-                              granularity_size, current_offset);
+                // geminifs_info("GPU Controller: Sub-slice[0]: local_offset=0, size=%zu, global_offset=%zu (no further cutting needed)\n", 
+                //               granularity_size, current_offset);
             } else {
                 // 当前granularity需要按照maxIOsize进一步切割
                 size_t sub_remaining = granularity_size;
                 size_t sub_local_offset = 0;  // granularity内的本地偏移
                 size_t sub_index = 0;
                 
-                geminifs_info("GPU Controller: Granularity size %zu > maxIOsize %llu, performing second-level cutting\n", 
-                              granularity_size, min_max_io_size);
+                // geminifs_info("GPU Controller: Granularity size %zu > maxIOsize %llu, performing second-level cutting\n", 
+                //               granularity_size, min_max_io_size);
                 
                 while (sub_remaining > 0) {
                     size_t sub_slice_size = std::min(sub_remaining, (size_t)min_max_io_size);
@@ -995,8 +1000,8 @@ bool GPUController::performDMASlicing(geminifs_dma* dma_ctx, size_t tensor_size,
                     SubSliceInfo sub_slice(sub_local_offset, sub_slice_size, sub_global_offset);
                     group.sub_slices.push_back(sub_slice);
                     
-                    geminifs_info("GPU Controller: Sub-slice[%zu]: local_offset=%zu, size=%zu, global_offset=%zu\n", 
-                                  sub_index, sub_local_offset, sub_slice_size, sub_global_offset);
+                    // geminifs_info("GPU Controller: Sub-slice[%zu]: local_offset=%zu, size=%zu, global_offset=%zu\n", 
+                    //               sub_index, sub_local_offset, sub_slice_size, sub_global_offset);
                     
                     sub_local_offset += sub_slice_size;
                     sub_remaining -= sub_slice_size;
@@ -1055,18 +1060,18 @@ bool GPUController::performDMASlicing(geminifs_dma* dma_ctx, size_t tensor_size,
         dma_ctx->granularity_groups.push_back(std::move(group));
     }
     
-    // 打印granularity组的详细信息
-    for (size_t i = 0; i < dma_ctx->granularity_groups.size(); i++) {
-        const auto& group = dma_ctx->granularity_groups[i];
-        geminifs_info("GPU Controller: Granularity Group[%zu]: gpu_ptr=0x%lx, offset=%zu, size=%zu, sub_slices=%zu\n", 
-                      i, group.gpu_tensor_ptr, group.granularity_offset, group.granularity_size, group.sub_slices.size());
+    // // 打印granularity组的详细信息
+    // for (size_t i = 0; i < dma_ctx->granularity_groups.size(); i++) {
+    //     const auto& group = dma_ctx->granularity_groups[i];
+    //     geminifs_info("GPU Controller: Granularity Group[%zu]: gpu_ptr=0x%lx, offset=%zu, size=%zu, sub_slices=%zu\n", 
+    //                   i, group.gpu_tensor_ptr, group.granularity_offset, group.granularity_size, group.sub_slices.size());
         
-        for (size_t j = 0; j < group.sub_slices.size(); j++) {
-            const auto& sub_slice = group.sub_slices[j];
-            geminifs_info("  Sub-slice[%zu]: local_offset=%zu, size=%zu, global_offset=%zu\n", 
-                          j, sub_slice.offset, sub_slice.size, sub_slice.global_offset);
-        }
-    }
+    //     for (size_t j = 0; j < group.sub_slices.size(); j++) {
+    //         const auto& sub_slice = group.sub_slices[j];
+    //         geminifs_info("  Sub-slice[%zu]: local_offset=%zu, size=%zu, global_offset=%zu\n", 
+    //                       j, sub_slice.offset, sub_slice.size, sub_slice.global_offset);
+    //     }
+    // }
     
     return true;
 }
@@ -1176,8 +1181,8 @@ bool GPUController::initializePRPEntries(geminifs_dma* dma_ctx) {
     for (size_t group_idx = 0; group_idx < dma_ctx->granularity_groups.size(); group_idx++) {
         auto& group = dma_ctx->granularity_groups[group_idx];
         
-        geminifs_info("GPU Controller: Building PRP mappings for Granularity Group[%zu]: %zu sub-slices\n", 
-                      group_idx, group.sub_slices.size());
+        // geminifs_info("GPU Controller: Building PRP mappings for Granularity Group[%zu]: %zu sub-slices\n", 
+        //               group_idx, group.sub_slices.size());
         
         // 为该granularity group预留PRP映射空间
         group.prp_mappings.reserve(group.sub_slices.size());
@@ -1210,8 +1215,8 @@ bool GPUController::initializePRPEntries(geminifs_dma* dma_ctx) {
                            group_idx, sub_idx, transfer_type, slice_size);
         }
         
-        geminifs_info("GPU Controller: Group[%zu] created %zu PRP mappings (%zu type2)\n", 
-                      group_idx, group.prp_mappings.size(), group_type2_count);
+        // geminifs_info("GPU Controller: Group[%zu] created %zu PRP mappings (%zu type2)\n", 
+        //               group_idx, group.prp_mappings.size(), group_type2_count);
     }
     
     // 记录全局第三种类型的数量
@@ -1225,8 +1230,8 @@ bool GPUController::initializePRPEntries(geminifs_dma* dma_ctx) {
             geminifs_error("GPU Controller: Failed to create DMA pointer for type2 PRP GPU memory\n");
             return false;
         }
-        geminifs_info("GPU Controller: Allocated %zu bytes GPU memory for %zu type2 PRP entries\n", 
-                      memory_size, total_type2_count);
+        // geminifs_info("GPU Controller: Allocated %zu bytes GPU memory for %zu type2 PRP entries\n", 
+        //               memory_size, total_type2_count);
     } else {
         geminifs_debug("GPU Controller: No type2 PRP entries found, no GPU memory allocation needed\n");
     }
@@ -1324,8 +1329,8 @@ bool GPUController::initializePRPEntries(geminifs_dma* dma_ctx) {
                     return false;
                 }
                 
-                geminifs_info("GPU Controller: Group[%zu] Sub-slice[%zu] Type2: PRP1=0x%lx, PRP2=0x%lx, filled %zu ioaddrs into GPU memory\n", 
-                              group_idx, sub_idx, group_entry.prp1, group_entry.prp2, remaining_pages);
+                // geminifs_info("GPU Controller: Group[%zu] Sub-slice[%zu] Type2: PRP1=0x%lx, PRP2=0x%lx, filled %zu ioaddrs into GPU memory\n", 
+                //               group_idx, sub_idx, group_entry.prp1, group_entry.prp2, remaining_pages);
                 
                 type2_gpu_memory_offset += 4096;  // 移动到下一个4K空间
             }
@@ -1333,8 +1338,8 @@ bool GPUController::initializePRPEntries(geminifs_dma* dma_ctx) {
             current_ioaddr_index += slice_pages;  // 移动到下一个切片的起始ioaddr
         }
         
-        geminifs_info("GPU Controller: Group[%zu] PRP initialization complete: %zu entries processed\n", 
-                      group_idx, group.prp_mappings.size());
+        // geminifs_info("GPU Controller: Group[%zu] PRP initialization complete: %zu entries processed\n", 
+        //               group_idx, group.prp_mappings.size());
     }
     
     geminifs_info("GPU Controller: Successfully configured PRP mappings for %zu granularity groups\n", 
@@ -1382,7 +1387,7 @@ bool GPUController::addPRPMappingsToGPU(geminifs_dma* dma_ctx) {
             return false;
         }
         
-        geminifs_debug("GPU Controller: Successfully registered %zu PRP mappings for Group[%zu]\n", 
+        geminifs_info("GPU Controller: Successfully registered %zu PRP mappings for Group[%zu]\n", 
                        group.prp_mappings.size(), group_idx);
     }
     
@@ -1449,7 +1454,52 @@ void GPUControllerRegistry::clearAll() {
 }
 
 /**
- * GPU kernel用于查询和打印tensor的PRP映射信息
+ * 子kernel：每个线程查询一个granularity地址的PRP映射
+ */
+__global__ void gpu_lookup_granularity_prp_mappings_kernel(GPUMemoryMapperDeviceView* device_view,
+                                                           uint64_t base_tensor_ptr,
+                                                           uint64_t granularity,
+                                                           uint32_t total_granularities) {
+    uint32_t tid = threadIdx.x + blockIdx.x * blockDim.x;
+    
+    // 确保线程ID在有效范围内
+    if (tid >= total_granularities) {
+        return;
+    }
+    
+    // 计算当前线程负责的tensor地址
+    uint64_t current_tensor_ptr = base_tensor_ptr + tid * granularity;
+    
+    // 分配临时结果缓冲区（每个线程独立的栈空间）
+    PRPMappingEntry results[64]; // 每个granularity最多查询64个映射
+    
+    // 查询当前地址的PRP映射
+    uint32_t found_count = gpu_lookup_all_prp_mappings(
+        current_tensor_ptr,
+        device_view->d_hash_table,
+        device_view->d_mapping_nodes, 
+        device_view->d_mapping_entries,
+        results,
+        64
+    );
+    
+    // 打印查询结果
+    if (found_count > 0) {
+        printf("Thread[%u] Tensor 0x%lx (offset: %lu): Found %u PRP mappings\n",
+               tid, current_tensor_ptr, tid * granularity, found_count);
+        
+        for (uint32_t i = 0; i < found_count; ++i) {
+            printf("  [%u.%u] Type: %u, PRP1: 0x%lx, PRP2: 0x%lx\n",
+                   tid, i, results[i].transfer_type, results[i].prp1, results[i].prp2);
+        }
+    } else {
+        printf("Thread[%u] Tensor 0x%lx (offset: %lu): No PRP mappings found\n",
+               tid, current_tensor_ptr, tid * granularity);
+    }
+}
+
+/**
+ * 主kernel：根据granularity计算所有需要查询的地址，并动态启动子kernel
  */
 __global__ void gpu_debug_prp_mappings_kernel(GPUMemoryMapperDeviceView* device_view,
                                               uint64_t tensor_ptr, 
@@ -1461,32 +1511,48 @@ __global__ void gpu_debug_prp_mappings_kernel(GPUMemoryMapperDeviceView* device_
             return;
         }
         
-        printf("=== GPU PRP Mapping Debug ===\n");
-        printf("Tensor Ptr: 0x%lx, Size: %zu, Granularity: %lu\n", 
-               tensor_ptr, tensor_size, granularity);
+        // 验证tensor_size是granularity的整数倍
+        if (granularity == 0 || tensor_size % granularity != 0) {
+            printf("GPU Debug Error: tensor_size (%zu) must be a multiple of granularity (%lu)\n", 
+                   tensor_size, granularity);
+            return;
+        }
         
-        // 分配临时结果缓冲区
-        PRPMappingEntry results[256]; // 最多查询256个映射
-        uint32_t found_count = gpu_lookup_all_prp_mappings(
+        // 计算需要查询的granularity数量
+        uint32_t total_granularities = tensor_size / granularity;
+        
+        printf("=== GPU PRP Mapping Debug (Dynamic Parallel) ===\n");
+        printf("Base Tensor Ptr: 0x%lx, Size: %zu, Granularity: %lu\n", 
+               tensor_ptr, tensor_size, granularity);
+        printf("Total granularities to query: %u\n", total_granularities);
+        
+        // 计算最优的线程块配置
+        // 使用32线程为一个warp，尽量降低SM使用
+        const uint32_t THREADS_PER_BLOCK = 32;  // 一个warp
+        uint32_t blocks_needed = (total_granularities + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+        
+        // 限制最大block数量以避免过度使用SM资源
+        const uint32_t MAX_BLOCKS = 64;  // 限制最大block数量
+        if (blocks_needed > MAX_BLOCKS) {
+            printf("GPU Debug Warning: Need %u blocks, limiting to %u blocks\n", 
+                   blocks_needed, MAX_BLOCKS);
+            blocks_needed = MAX_BLOCKS;
+        }
+        
+        printf("Launching dynamic kernel with %u blocks × %u threads = %u total threads\n",
+               blocks_needed, THREADS_PER_BLOCK, blocks_needed * THREADS_PER_BLOCK);
+        
+        // 动态启动子kernel进行并行查询
+        gpu_lookup_granularity_prp_mappings_kernel<<<blocks_needed, THREADS_PER_BLOCK>>>(
+            device_view,
             tensor_ptr,
-            device_view->d_hash_table,
-            device_view->d_mapping_nodes, 
-            device_view->d_mapping_entries,
-            results,
-            256
+            granularity,
+            total_granularities
         );
         
-        printf("Found %u PRP mappings for tensor 0x%lx:\n", found_count, tensor_ptr);
-        
-        for (uint32_t i = 0; i < found_count; ++i) {
-            printf("  [%u] Type: %u, PRP1: 0x%lx, PRP2: 0x%lx\n",
-                   i, results[i].transfer_type, results[i].prp1, results[i].prp2);
-        }
-        
-        if (found_count == 0) {
-            printf("  No PRP mappings found for this tensor\n");
-        }
-        
+        // 在device代码中，我们不能显式同步子kernel
+        // 子kernel会自动完成并返回结果
+        printf("GPU Debug: Launched dynamic kernel with %u blocks\n", blocks_needed);
         printf("=== End PRP Mapping Debug ===\n");
     }
 }
