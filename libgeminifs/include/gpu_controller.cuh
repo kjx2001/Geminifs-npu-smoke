@@ -221,6 +221,18 @@ __global__ void nvme_batch_read_kernel(NVMe_File* d_fd,
                                       size_t base_file_offset);
 
 /**
+ * 批量NVMe写入kernel：每个线程处理一个PRP映射条目
+ * @param d_fd NVMe文件描述符
+ * @param mapping_entry_ptrs PRP映射条目指针数组
+ * @param found_count 找到的映射条目数量
+ * @param base_file_offset 文件基础偏移量
+ */
+__global__ void nvme_batch_write_kernel(NVMe_File* d_fd,
+                                       PRPMappingEntry** mapping_entry_ptrs,
+                                       uint32_t found_count,
+                                       size_t base_file_offset);
+
+/**
  * GPU读取kernel：查询PRP映射并动态并行发起NVMe IO
  * @param d_fd NVMe文件描述符
  * @param tensor_ptr GPU tensor指针
@@ -233,6 +245,20 @@ __global__ void GPU_Read_kernel(NVMe_File* d_fd,
                                size_t offset,
                                size_t len, 
                                GPUMemoryMapperDeviceView* device_view);
+
+/**
+ * GPU写入kernel：查询PRP映射并动态并行发起NVMe IO
+ * @param d_fd NVMe文件描述符
+ * @param tensor_ptr GPU tensor指针
+ * @param offset 文件偏移量
+ * @param len 写入长度
+ * @param device_view GPU内存映射器的设备视图
+ */
+__global__ void GPU_Write_kernel(NVMe_File* d_fd,
+                                uint64_t tensor_ptr,
+                                size_t offset,
+                                size_t len, 
+                                GPUMemoryMapperDeviceView* device_view);
 
 /**
  * Host端函数用于调用GPU kernel查询和打印PRP映射
