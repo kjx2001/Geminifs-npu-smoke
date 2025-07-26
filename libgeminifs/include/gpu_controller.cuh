@@ -13,15 +13,20 @@
 #include "geminifs_mem.h"
 
 /**
- * PRP映射条目结构 (20字节)
+ * PRP映射条目结构 (32字节)
  */
 struct PRPMappingEntry {
     uint32_t transfer_type; // NVMe cmd transfer type (4字节)
-    uint64_t prp1;          // PRP1
-    uint64_t prp2;          // PRP2 may be NULL
-    __device__ __host__ PRPMappingEntry() : transfer_type(0), prp1(0), prp2(0)  {}
-    __device__ __host__ PRPMappingEntry(uint32_t transfer_type, uint64_t p1, uint64_t p2 ) 
-        : transfer_type(transfer_type), prp1(p1), prp2(p2) {}
+    uint32_t data_length;   // 数据长度 (4字节)
+    uint64_t prp1;          // PRP1 (8字节)
+    uint64_t prp2;          // PRP2 may be NULL (8字节)
+    uint64_t tensor_offset; // 该PRP entry在granularity内的偏移位置 (8字节)
+    
+    __device__ __host__ PRPMappingEntry() : transfer_type(0), data_length(0), prp1(0), prp2(0), tensor_offset(0) {}
+    __device__ __host__ PRPMappingEntry(uint32_t transfer_type, uint32_t data_len, uint64_t p1, uint64_t p2) 
+        : transfer_type(transfer_type), data_length(data_len), prp1(p1), prp2(p2), tensor_offset(0) {}
+    __device__ __host__ PRPMappingEntry(uint32_t transfer_type, uint32_t data_len, uint64_t p1, uint64_t p2, uint64_t offset) 
+        : transfer_type(transfer_type), data_length(data_len), prp1(p1), prp2(p2), tensor_offset(offset) {}
 };
 
 /**
@@ -44,8 +49,9 @@ struct GPUHashEntry {
     uint64_t GPU_virtual_ptr;    // 8字节 - tensor指针 (作为key)
     uint32_t first_node;         // 4字节 - 第一个映射节点的索引
     uint32_t mapping_count;      // 4字节 - 该tensor的映射数量
+    uint64_t tensor_size;        // 8字节 - 注册的GPU虚拟内存总长度
     
-    __device__ __host__ GPUHashEntry() : GPU_virtual_ptr(0), first_node(0xFFFFFFFF), mapping_count(0) {}
+    __device__ __host__ GPUHashEntry() : GPU_virtual_ptr(0), first_node(0xFFFFFFFF), mapping_count(0), tensor_size(0) {}
 };
 
 /**
@@ -110,23 +116,12 @@ public:
     void cleanup();
     
     /**
-     * 添加单个映射到已存在的tensor
-     * @param tensor_ptr Tensor的GPU虚拟内存指针
-     * @param transfer_type 传输类型
-     * @param prp1 PRP1地址
-     * @param prp2 PRP2地址
-     * @return 成功返回true
-     */
-    bool addMapping(uint64_t tensor_ptr, uint32_t transfer_type, uint64_t prp1, uint64_t prp2);
-    
-    
-    /**
      * 批量添加多个映射到同一个tensor
      * @param tensor_ptr Tensor的GPU虚拟内存指针
      * @param mappings 映射条目向量
      * @return 成功返回true
      */
-    bool addBatchMappings(uint64_t tensor_ptr, const std::vector<PRPMappingEntry>& mappings);
+    bool addBatchMappings(uint64_t tensor_ptr, uint64_t tensor_size, const std::vector<PRPMappingEntry>& mappings);
  
     
     /**
@@ -189,7 +184,7 @@ __device__ __forceinline__ uint32_t gpu_hash(uint64_t key) {
  * @param hash_table 哈希表指针
  * @param mapping_nodes 映射节点数组指针
  * @param mapping_entries 映射条目数组指针
- * @param results 输出的PRP映射条目数组 (调用者分配)
+ * @param result_ptrs 输出的PRP映射条目指针数组 (调用者分配)
  * @param max_results 最大结果数量
  * @return 实际找到的映射数量
  */
@@ -197,8 +192,9 @@ __device__ uint32_t gpu_lookup_all_prp_mappings(uint64_t tensor_ptr,
                                                 GPUHashEntry* hash_table,
                                                 GPUMappingNode* mapping_nodes,
                                                 PRPMappingEntry* mapping_entries,
-                                                PRPMappingEntry* results,
-                                                uint32_t max_results);
+                                                PRPMappingEntry** result_ptrs,
+                                                uint32_t max_results,
+                                                uint64_t* tensor_size);
 
 /**
  * GPU kernel用于查询和打印tensor的PRP映射信息
@@ -211,6 +207,32 @@ __global__ void gpu_debug_prp_mappings_kernel(GPUMemoryMapperDeviceView* device_
                                               uint64_t tensor_ptr, 
                                               size_t tensor_size,
                                               uint64_t granularity);
+
+/**
+ * 批量NVMe读取kernel：每个线程处理一个PRP映射条目
+ * @param d_fd NVMe文件描述符
+ * @param mapping_entry_ptrs PRP映射条目指针数组
+ * @param found_count 找到的映射条目数量
+ * @param base_file_offset 文件基础偏移量
+ */
+__global__ void nvme_batch_read_kernel(NVMe_File* d_fd,
+                                      PRPMappingEntry** mapping_entry_ptrs,
+                                      uint32_t found_count,
+                                      size_t base_file_offset);
+
+/**
+ * GPU读取kernel：查询PRP映射并动态并行发起NVMe IO
+ * @param d_fd NVMe文件描述符
+ * @param tensor_ptr GPU tensor指针
+ * @param offset 文件偏移量
+ * @param len 读取长度
+ * @param device_view GPU内存映射器的设备视图
+ */
+__global__ void GPU_Read_kernel(NVMe_File* d_fd,
+                               uint64_t tensor_ptr,
+                               size_t offset,
+                               size_t len, 
+                               GPUMemoryMapperDeviceView* device_view);
 
 /**
  * Host端函数用于调用GPU kernel查询和打印PRP映射

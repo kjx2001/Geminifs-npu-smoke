@@ -80,7 +80,7 @@ set (CUDA_NVCC_FLAGS_DEBUG "${CMAKE_NVCC_FLAGS_DEBUG} -DDEBUG" CACHE INTERNAL ""
 set (CUDA_NVCC_FLAGS_RELEASE "${CMAKE_NVCC_FLAGS_RELEASE} -O2" CACHE INTERNAL "" FORCE)
 
 # set (CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xlinker -rpath=${CMAKE_BINARY_DIR}/lib --expt-relaxed-constexpr --expt-extended-lambda -lcudadevrt -lcudart ${GPU_ARCHS}")
-set (CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xlinker -rpath=${CMAKE_BINARY_DIR}/lib -rdc=true -O3 --expt-relaxed-constexpr --expt-extended-lambda -lcudadevrt -lcudart ${GPU_ARCHS}")
+set (CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xlinker -rpath=${CMAKE_BINARY_DIR}/lib -rdc=true -O3 --expt-relaxed-constexpr --expt-extended-lambda -lcudadevrt -lcudart -lineinfo ${GPU_ARCHS}")
 set (CMAKE_CUDA_FLAGS_DEBUG "${CMAKE_CUDA_FLAGS_DEBUG} -G -DDEBUG" CACHE INTERNAL "" FORCE)
 set (CMAKE_CUDA_GEMINIFS_LIBS "${CMAKE_CUDA_GEMINIFS_LIBS} -L${PROJECT_BINARY_DIR}/libgeminifs -L${PROJECT_SOURCE_DIR}/include/geminifs -L${CMAKE_BINARY_DIR}/lib -lgeminifs -lnvm")
 

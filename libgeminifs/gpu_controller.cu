@@ -14,8 +14,9 @@ __device__ uint32_t gpu_lookup_all_prp_mappings(uint64_t tensor_ptr,
                                                 GPUHashEntry* hash_table,
                                                 GPUMappingNode* mapping_nodes,
                                                 PRPMappingEntry* mapping_entries,
-                                                PRPMappingEntry* results,
-                                                uint32_t max_results) {
+                                                PRPMappingEntry** result_ptrs,
+                                                uint32_t max_results,
+                                                uint64_t* tensor_size) {
     uint32_t hash_index = gpu_hash(tensor_ptr);
     
     GPUHashEntry& hash_entry = hash_table[hash_index];
@@ -23,18 +24,26 @@ __device__ uint32_t gpu_lookup_all_prp_mappings(uint64_t tensor_ptr,
     printf("tensor_ptr is %lx, hash id is %u\n",tensor_ptr, hash_index);
     // 检查是否找到对应的tensor
     if (hash_entry.GPU_virtual_ptr != tensor_ptr || hash_entry.first_node == GPUMemoryMapper::INVALID_INDEX) {
+        if (tensor_size) {
+            *tensor_size = 0; // 未找到时设置tensor_size为0
+        }
         return 0; // 未找到
+    }
+    
+    // 如果找到了tensor，返回其tensor_size
+    if (tensor_size) {
+        *tensor_size = hash_entry.tensor_size;
     }
     
     uint32_t found_count = 0;
     uint32_t current_node = hash_entry.first_node;
     
-    // 遍历映射链表
+    // 遍历映射链表，只返回mapping_entries的地址指针
     while (current_node != GPUMemoryMapper::INVALID_INDEX && found_count < max_results) {
         GPUMappingNode& node = mapping_nodes[current_node];
         
         if (node.entry_index != GPUMemoryMapper::INVALID_INDEX) {
-            results[found_count] = mapping_entries[node.entry_index];
+            result_ptrs[found_count] = &mapping_entries[node.entry_index];
             found_count++;
         }
         
@@ -282,86 +291,9 @@ void GPUMemoryMapper::cleanup() {
     is_initialized_ = false;
 }
 
-// CUDA kernel for adding mapping
-__global__ void kernel_add_mapping(uint64_t tensor_ptr, uint32_t transfer_type,
-                                  uint64_t prp1, uint64_t prp2,
-                                  GPUHashEntry* hash_table,
-                                  GPUMappingNode* mapping_nodes,
-                                  PRPMappingEntry* mapping_entries,
-                                  uint32_t* free_entry_list,
-                                  uint32_t* free_node_list,
-                                  uint32_t* free_entry_count,
-                                  uint32_t* free_node_count,
-                                  bool* success) {
-    if (threadIdx.x == 0 && blockIdx.x == 0) {
-        *success = false;
-        
-        // 获取空闲条目索引
-        uint32_t old_entry_count = atomicSub(free_entry_count, 1);
-        if (old_entry_count == 0) {
-            atomicAdd(free_entry_count, 1); // 恢复计数
-            return;
-        }
-        
-        // 获取空闲节点索引
-        uint32_t old_node_count = atomicSub(free_node_count, 1);
-        if (old_node_count == 0) {
-            atomicAdd(free_entry_count, 1); // 恢复条目计数
-            atomicAdd(free_node_count, 1);  // 恢复节点计数
-            return;
-        }
-        
-        uint32_t entry_index = free_entry_list[old_entry_count - 1];
-        uint32_t node_index = free_node_list[old_node_count - 1];
-        
-        // 填充映射条目
-        mapping_entries[entry_index] = PRPMappingEntry(transfer_type, prp1, prp2);
-        
-        // 填充映射节点
-        mapping_nodes[node_index] = GPUMappingNode(entry_index);
-        
-        // 计算哈希索引
-        uint32_t hash_index = gpu_hash(tensor_ptr);
-        GPUHashEntry& hash_entry = hash_table[hash_index];
-        
-        if (hash_entry.GPU_virtual_ptr == 0) {
-            // 新的tensor，创建新的哈希条目
-            hash_entry.GPU_virtual_ptr = tensor_ptr;
-            hash_entry.first_node = node_index;
-            hash_entry.mapping_count = 1;
-        } else if (hash_entry.GPU_virtual_ptr == tensor_ptr) {
-            // 已存在的tensor，添加到链表头
-            mapping_nodes[node_index].next_node = hash_entry.first_node;
-            hash_entry.first_node = node_index;
-            hash_entry.mapping_count++;
-        } else {
-            // 哈希冲突，使用线性探测
-            for (uint32_t i = 1; i < GPUMemoryMapper::HASH_TABLE_SIZE; ++i) {
-                uint32_t probe_index = (hash_index + i) % GPUMemoryMapper::HASH_TABLE_SIZE;
-                GPUHashEntry& probe_entry = hash_table[probe_index];
-                
-                if (probe_entry.GPU_virtual_ptr == 0) {
-                    // 找到空槽位
-                    probe_entry.GPU_virtual_ptr = tensor_ptr;
-                    probe_entry.first_node = node_index;
-                    probe_entry.mapping_count = 1;
-                    break;
-                } else if (probe_entry.GPU_virtual_ptr == tensor_ptr) {
-                    // 找到相同tensor的条目
-                    mapping_nodes[node_index].next_node = probe_entry.first_node;
-                    probe_entry.first_node = node_index;
-                    probe_entry.mapping_count++;
-                    break;
-                }
-            }
-        }
-        
-        *success = true;
-    }
-}
-
 // CUDA kernel for batch adding mappings
 __global__ void kernel_add_batch_mappings(uint64_t tensor_ptr, 
+                                          uint64_t tensor_size,
                                           PRPMappingEntry* new_mappings,
                                           uint32_t mapping_count,
                                           GPUHashEntry* hash_table,
@@ -399,6 +331,7 @@ __global__ void kernel_add_batch_mappings(uint64_t tensor_ptr,
         
         // 填充映射条目和节点
         uint32_t first_node_idx = GPUMemoryMapper::INVALID_INDEX;
+        uint32_t last_node_idx = GPUMemoryMapper::INVALID_INDEX;
         for (uint32_t i = 0; i < mapping_count; ++i) {
             uint32_t entry_idx = free_entry_list[entry_start - 1 - i];
             uint32_t node_idx = free_node_list[node_start - 1 - i];
@@ -406,13 +339,14 @@ __global__ void kernel_add_batch_mappings(uint64_t tensor_ptr,
             // 填充条目
             mapping_entries[entry_idx] = new_mappings[i];
             
-            // 构建链表
+            // 构建链表（尾插入）
             mapping_nodes[node_idx] = GPUMappingNode(entry_idx);
             if (i == 0) {
                 first_node_idx = node_idx;
+                last_node_idx = node_idx;
             } else {
-                mapping_nodes[node_idx].next_node = first_node_idx;
-                first_node_idx = node_idx;
+                mapping_nodes[last_node_idx].next_node = node_idx;
+                last_node_idx = node_idx;
             }
         }
         
@@ -429,6 +363,7 @@ __global__ void kernel_add_batch_mappings(uint64_t tensor_ptr,
                 entry.GPU_virtual_ptr = tensor_ptr;
                 entry.first_node = first_node_idx;
                 entry.mapping_count = mapping_count;
+                entry.tensor_size = tensor_size;
                 *success = true;
                 break;
             } else if (entry.GPU_virtual_ptr == tensor_ptr) {
@@ -447,59 +382,7 @@ __global__ void kernel_add_batch_mappings(uint64_t tensor_ptr,
     }
 }
 
-bool GPUMemoryMapper::addMapping(uint64_t tensor_ptr, uint32_t transfer_type, uint64_t prp1, uint64_t prp2) {
-    if (!is_initialized_) {
-        geminifs_error("GPU Memory Mapper: Not initialized\n");
-        return false;
-    }
-    
-    std::lock_guard<std::mutex> lock(mapper_mutex_);
-    
-    // 分配设备端成功标志
-    bool* d_success;
-    cudaError_t err = cudaMalloc(&d_success, sizeof(bool));
-    if (err != cudaSuccess) {
-        geminifs_error("GPU Memory Mapper: Failed to allocate success flag: %s\n", 
-                       cudaGetErrorString(err));
-        return false;
-    }
-    
-    // 启动内核
-    kernel_add_mapping<<<1, 1>>>(tensor_ptr, transfer_type, prp1, prp2,
-                                 d_hash_table_, d_mapping_nodes_, d_mapping_entries_,
-                                 d_free_entry_list_, d_free_node_list_,
-                                 d_free_entry_count_, d_free_node_count_, d_success);
-    
-    err = cudaDeviceSynchronize();
-    if (err != cudaSuccess) {
-        geminifs_error("GPU Memory Mapper: Kernel execution failed: %s\n", 
-                       cudaGetErrorString(err));
-        cudaFree(d_success);
-        return false;
-    }
-    
-    // 获取结果
-    bool success;
-    err = cudaMemcpy(&success, d_success, sizeof(bool), cudaMemcpyDeviceToHost);
-    cudaFree(d_success);
-    
-    if (err != cudaSuccess) {
-        geminifs_error("GPU Memory Mapper: Failed to copy result: %s\n", 
-                       cudaGetErrorString(err));
-        return false;
-    }
-    
-    if (success) {
-        geminifs_debug("GPU Memory Mapper: Added mapping for tensor 0x%lx -> transfer_type %u, PRP1: 0x%lx, PRP2: 0x%lx\n",
-                       tensor_ptr, transfer_type, prp1, prp2);
-    } else {
-        geminifs_error("GPU Memory Mapper: Failed to add mapping - no free space\n");
-    }
-    
-    return success;
-}
-
-bool GPUMemoryMapper::addBatchMappings(uint64_t tensor_ptr, const std::vector<PRPMappingEntry>& mappings) {
+bool GPUMemoryMapper::addBatchMappings(uint64_t tensor_ptr, uint64_t tensor_size, const std::vector<PRPMappingEntry>& mappings) {
     if (!is_initialized_) {
         geminifs_error("GPU Memory Mapper: Not initialized\n");
         return false;
@@ -543,7 +426,7 @@ bool GPUMemoryMapper::addBatchMappings(uint64_t tensor_ptr, const std::vector<PR
     }
     
     // 启动内核
-    kernel_add_batch_mappings<<<1, 1>>>(tensor_ptr, d_mappings, static_cast<uint32_t>(mappings.size()),
+    kernel_add_batch_mappings<<<1, 1>>>(tensor_ptr, tensor_size, d_mappings, static_cast<uint32_t>(mappings.size()),
                                         d_hash_table_, d_mapping_nodes_, d_mapping_entries_,
                                         d_free_entry_list_, d_free_node_list_,
                                         d_free_entry_count_, d_free_node_count_, d_success);
@@ -1207,8 +1090,8 @@ bool GPUController::initializePRPEntries(geminifs_dma* dma_ctx) {
                 total_type2_count++;       // 统计全局第三种类型数量
             }
             
-            // 创建PRPMappingEntry (prp1和prp2先不初始化)
-            PRPMappingEntry entry(transfer_type, 0, 0);
+            // 创建PRPMappingEntry (prp1和prp2先不初始化，tensor_offset使用granularity内的本地偏移)
+            PRPMappingEntry entry(transfer_type, (uint32_t)slice_size, 0, 0, sub_slice.offset);
             group.prp_mappings.push_back(entry);
             
             geminifs_debug("GPU Controller: Group[%zu] Sub-slice[%zu]: transfer_type=%u, size=%zu\n", 
@@ -1376,11 +1259,11 @@ bool GPUController::addPRPMappingsToGPU(geminifs_dma* dma_ctx) {
             continue;
         }
         
-        geminifs_info("GPU Controller: Registering %zu PRP mappings for Group[%zu] (gpu_ptr=0x%lx)\n", 
-                      group.prp_mappings.size(), group_idx, group.gpu_tensor_ptr);
+        geminifs_info("GPU Controller: Registering %zu PRP mappings for Group[%zu] (gpu_ptr=0x%lx, size=%zu)\n", 
+                      group.prp_mappings.size(), group_idx, group.gpu_tensor_ptr, group.granularity_size);
         
         // 使用addBatchMappings批量添加该group的所有PRP映射
-        bool success = memory_mapper_->addBatchMappings(group.gpu_tensor_ptr, group.prp_mappings);
+        bool success = memory_mapper_->addBatchMappings(group.gpu_tensor_ptr, group.granularity_size, group.prp_mappings);
         
         if (!success) {
             geminifs_error("GPU Controller: Failed to add batch mappings for Group[%zu]\n", group_idx);
@@ -1470,31 +1353,35 @@ __global__ void gpu_lookup_granularity_prp_mappings_kernel(GPUMemoryMapperDevice
     // 计算当前线程负责的tensor地址
     uint64_t current_tensor_ptr = base_tensor_ptr + tid * granularity;
     
-    // 分配临时结果缓冲区（每个线程独立的栈空间）
-    PRPMappingEntry results[64]; // 每个granularity最多查询64个映射
+    // 优化：只存储mapping_entries的地址指针，大幅减少栈内存使用
+    PRPMappingEntry* mapping_entry_ptrs[64]; // 每个granularity最多存储64个mapping_entries指针
+    uint64_t found_tensor_size = 0; // 用于接收tensor_size
     
-    // 查询当前地址的PRP映射
+    // 查询当前地址的PRP映射，返回mapping_entries的地址
     uint32_t found_count = gpu_lookup_all_prp_mappings(
         current_tensor_ptr,
         device_view->d_hash_table,
         device_view->d_mapping_nodes, 
         device_view->d_mapping_entries,
-        results,
-        64
+        mapping_entry_ptrs,
+        64,
+        &found_tensor_size
     );
     
-    // 打印查询结果
+    // 打印查询结果（通过指针访问mapping_entries内容）
     if (found_count > 0) {
-        printf("Thread[%u] Tensor 0x%lx (offset: %lu): Found %u PRP mappings\n",
-               tid, current_tensor_ptr, tid * granularity, found_count);
+        // printf("Thread[%u] Tensor 0x%lx (offset: %lu): Found %u PRP mappings, tensor_size: %lu\n",
+        //        tid, current_tensor_ptr, tid * granularity, found_count, found_tensor_size);
         
-        for (uint32_t i = 0; i < found_count; ++i) {
-            printf("  [%u.%u] Type: %u, PRP1: 0x%lx, PRP2: 0x%lx\n",
-                   tid, i, results[i].transfer_type, results[i].prp1, results[i].prp2);
-        }
+        // for (uint32_t i = 0; i < found_count; ++i) {
+        //     PRPMappingEntry* entry_ptr = mapping_entry_ptrs[i];
+        //     printf("  [%u.%u] GPU_VAddr: 0x%lx, Type: %u, PRP1: 0x%lx, PRP2: 0x%lx\n",
+        //            tid, i, current_tensor_ptr, entry_ptr->transfer_type, 
+        //            entry_ptr->prp1, entry_ptr->prp2);
+        // }
     } else {
-        printf("Thread[%u] Tensor 0x%lx (offset: %lu): No PRP mappings found\n",
-               tid, current_tensor_ptr, tid * granularity);
+        printf("Thread[%u] Tensor 0x%lx (offset: %lu): No PRP mappings found, tensor_size: %lu\n",
+               tid, current_tensor_ptr, tid * granularity, found_tensor_size);
     }
 }
 
@@ -1521,10 +1408,10 @@ __global__ void gpu_debug_prp_mappings_kernel(GPUMemoryMapperDeviceView* device_
         // 计算需要查询的granularity数量
         uint32_t total_granularities = tensor_size / granularity;
         
-        printf("=== GPU PRP Mapping Debug (Dynamic Parallel) ===\n");
-        printf("Base Tensor Ptr: 0x%lx, Size: %zu, Granularity: %lu\n", 
-               tensor_ptr, tensor_size, granularity);
-        printf("Total granularities to query: %u\n", total_granularities);
+        // printf("=== GPU PRP Mapping Debug (Dynamic Parallel) ===\n");
+        // printf("Base Tensor Ptr: 0x%lx, Size: %zu, Granularity: %lu\n", 
+        //        tensor_ptr, tensor_size, granularity);
+        // printf("Total granularities to query: %u\n", total_granularities);
         
         // 计算最优的线程块配置
         // 使用32线程为一个warp，尽量降低SM使用
@@ -1539,8 +1426,8 @@ __global__ void gpu_debug_prp_mappings_kernel(GPUMemoryMapperDeviceView* device_
             blocks_needed = MAX_BLOCKS;
         }
         
-        printf("Launching dynamic kernel with %u blocks × %u threads = %u total threads\n",
-               blocks_needed, THREADS_PER_BLOCK, blocks_needed * THREADS_PER_BLOCK);
+        // printf("Launching dynamic kernel with %u blocks × %u threads = %u total threads\n",
+        //        blocks_needed, THREADS_PER_BLOCK, blocks_needed * THREADS_PER_BLOCK);
         
         // 动态启动子kernel进行并行查询
         gpu_lookup_granularity_prp_mappings_kernel<<<blocks_needed, THREADS_PER_BLOCK>>>(
@@ -1552,10 +1439,12 @@ __global__ void gpu_debug_prp_mappings_kernel(GPUMemoryMapperDeviceView* device_
         
         // 在device代码中，我们不能显式同步子kernel
         // 子kernel会自动完成并返回结果
-        printf("GPU Debug: Launched dynamic kernel with %u blocks\n", blocks_needed);
-        printf("=== End PRP Mapping Debug ===\n");
+        // printf("GPU Debug: Launched dynamic kernel with %u blocks\n", blocks_needed);
+        // printf("=== End PRP Mapping Debug ===\n");
     }
 }
+
+
 
 /**
  * Host端函数用于调用GPU kernel查询和打印PRP映射
@@ -1584,4 +1473,182 @@ void debug_prp_mappings_from_gpu(GPUMemoryMapper* mapper,
         geminifs_error("Debug PRP Mappings: Kernel execution failed: %s\n", 
                        cudaGetErrorString(err));
     }
+}
+
+/**
+ * 设备端安全检查函数：检查文件读写操作的安全性
+ * @param d_fd NVMe文件描述符
+ * @param tensor_size 找到的tensor大小
+ * @param offset 文件偏移量
+ * @param len 读写长度
+ * @return true表示安全，false表示不安全
+ */
+__device__ bool check_file_access_safety(NVMe_File* d_fd, 
+                                         uint64_t tensor_size, 
+                                         size_t offset, 
+                                         size_t len) {
+    if (!d_fd) {
+        printf("Safety Check Error: NVMe_File pointer is null\n");
+        return false;
+    }
+    
+    // 获取文件大小（通过公共方法）
+    uint64_t file_max_size = d_fd->get_file_size();
+    if (file_max_size == 0) {
+        printf("Safety Check Error: Could not get file size (hdr might be null)\n");
+        return false;
+    }
+    
+    // 检查tensor_size是否足够容纳要读取的数据
+    if (tensor_size < len) {
+        printf("Safety Check Error: tensor_size (%lu) < read length (%zu)\n", 
+               tensor_size, len);
+        return false;
+    }
+    
+    // 检查文件访问边界
+    if (offset + len > file_max_size) {
+        printf("Safety Check Error: access beyond file boundary - "
+               "offset (%zu) + len (%zu) = %zu > file_max_size (%lu)\n", 
+               offset, len, offset + len, file_max_size);
+        return false;
+    }
+    
+    // 检查offset是否有效
+    if (offset >= file_max_size) {
+        printf("Safety Check Error: offset (%zu) >= file_max_size (%lu)\n", 
+               offset, file_max_size);
+        return false;
+    }
+    
+    // 检查len是否为0
+    if (len == 0) {
+        printf("Safety Check Warning: read length is 0\n");
+        return false;
+    }
+    
+    // 检查4K对齐 - NVMe设备通常要求4K对齐访问
+    if (offset % 4096 != 0) {
+        printf("Safety Check Error: offset (%zu) is not 4K aligned (remainder: %zu)\n", 
+               offset, offset % 4096);
+        return false;
+    }
+    
+    if (len % 4096 != 0) {
+        printf("Safety Check Error: length (%zu) is not 4K aligned (remainder: %zu)\n", 
+               len, len % 4096);
+        return false;
+    }
+    
+    // // 打印成功信息
+    // printf("Safety Check Passed: tensor_size=%lu, offset=%zu, len=%zu, file_max_size=%lu (all 4K aligned)\n",
+    //        tensor_size, offset, len, file_max_size);
+    
+    return true;
+}
+
+
+
+__global__ void GPU_Read_kernel(NVMe_File* d_fd,
+            uint64_t tensor_ptr,
+            size_t offset,
+            size_t len, 
+            GPUMemoryMapperDeviceView* device_view) {
+
+     if (threadIdx.x == 0 && blockIdx.x == 0) {
+        if (!device_view) {
+            printf("GPU Debug: Device view is null\n");
+            return;
+        }
+        
+       PRPMappingEntry* mapping_entry_ptrs[32]; // 每个granularity最多存储32个mapping_entries指针
+       uint64_t found_tensor_size = 0; // 用于接收tensor_size
+    
+        // 查询当前地址的PRP映射，返回mapping_entries的地址
+        uint32_t found_count = gpu_lookup_all_prp_mappings(
+            tensor_ptr,
+            device_view->d_hash_table,
+            device_view->d_mapping_nodes, 
+            device_view->d_mapping_entries,
+            mapping_entry_ptrs,
+            32,
+            &found_tensor_size
+        );     
+        
+        if (found_count == 0) {
+            printf("GPU_Read_kernel: No PRP mappings found for tensor 0x%lx\n", tensor_ptr);
+            return;
+        }
+        
+        if (!check_file_access_safety(d_fd, found_tensor_size, offset, len)) {
+            printf("GPU_Read_kernel: Safety check failed, aborting read operation\n");
+            return;
+        }
+
+        // 计算线程块配置
+        const uint32_t THREADS_PER_BLOCK = 32;  // 一个warp
+        uint32_t blocks_needed = (found_count + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+        
+        // 限制最大block数量以避免过度使用SM资源
+        const uint32_t MAX_BLOCKS = 64;  
+        if (blocks_needed > MAX_BLOCKS) {
+            printf("GPU_Read_kernel Warning: Need %u blocks, limiting to %u blocks\n", 
+                   blocks_needed, MAX_BLOCKS);
+            blocks_needed = MAX_BLOCKS;
+        }
+
+        printf("GPU_Read_kernel: Launching batch NVMe read with %u blocks × %u threads for %u mappings\n",
+               blocks_needed, THREADS_PER_BLOCK, found_count);
+
+        // 动态并行调用批量NVMe读取kernel，直接传递mapping_entry_ptrs
+        nvme_batch_read_kernel<<<blocks_needed, THREADS_PER_BLOCK>>>(
+            d_fd, mapping_entry_ptrs, found_count, offset);
+        
+        printf("GPU_Read_kernel: Batch NVMe read kernel launched\n");
+     }
+}
+
+
+/**
+ * 批量NVMe读取kernel：每个线程处理一个PRP映射条目
+ * @param d_fd NVMe文件描述符
+ * @param mapping_entry_ptrs PRP映射条目指针数组
+ * @param found_count 找到的映射条目数量
+ * @param base_file_offset 文件基础偏移量
+ */
+__global__ void nvme_batch_read_kernel(NVMe_File* d_fd,
+                                      PRPMappingEntry** mapping_entry_ptrs,
+                                      uint32_t found_count,
+                                      size_t base_file_offset) {
+    uint32_t tid = threadIdx.x + blockIdx.x * blockDim.x;
+    
+    // 确保线程ID在有效范围内
+    if (tid >= found_count) {
+        return;
+    }
+    
+    // 获取当前线程对应的PRP映射条目
+    PRPMappingEntry* entry_ptr = mapping_entry_ptrs[tid];
+    if (!entry_ptr) {
+        printf("Thread[%u]: Null mapping entry pointer\n", tid);
+        return;
+    }
+    
+    // 从PRP映射条目中获取必要信息
+    uint64_t prp1 = entry_ptr->prp1;
+    uint64_t prp2 = entry_ptr->prp2;
+    uint32_t data_length = entry_ptr->data_length;
+    uint64_t tensor_offset = entry_ptr->tensor_offset;
+    
+    // 计算当前切片的文件偏移量
+    // base_file_offset: 对应granularity在文件中的起始偏移
+    // tensor_offset: 该PRP entry在granularity内的本地偏移
+    size_t slice_file_offset = base_file_offset + tensor_offset;
+    
+    // 调用NVMe读取函数
+    nvme_controller_g_read(d_fd, prp1, prp2, slice_file_offset, data_length);
+    
+    // 可选：打印调试信息
+    printf("Thread[%u]: NVMe read - tensor_offset=%lu, file_offset=%zu, len=%u, prp1=0x%lx, prp2=0x%lx\n",
+           tid, tensor_offset, slice_file_offset, data_length, prp1, prp2);
 }

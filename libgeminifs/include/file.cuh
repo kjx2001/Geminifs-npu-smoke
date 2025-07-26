@@ -123,6 +123,12 @@ public:
     __forceinline__ __device__ nvme_ofst_t get_nvme_offset(vaddr_t va) const {
         return __get_nvmeofst(va);
     }
+    
+    // Public method to get file virtual space size
+    __forceinline__ __device__ uint64_t get_file_size() const {
+        return hdr ? hdr->virtual_space_size : 0;
+    }
+    
     __forceinline__ __device__ void read_in(uint64_t prp1, uint64_t prp2 ,size_t file_offset, size_t nbytes) {
         nvme_xfer(file_offset, nbytes, prp1, prp2 ,FILE_XFER_READ);
     }
