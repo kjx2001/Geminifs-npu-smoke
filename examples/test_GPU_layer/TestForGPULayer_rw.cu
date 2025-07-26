@@ -61,84 +61,7 @@ void show_fd_limits() {
     }
 }
 
-// CUDA kernel to test PRP mapping order
-__global__ void test_prp_mapping_order_kernel(uint64_t tensor_ptr,
-                                             GPUHashEntry* hash_table,
-                                             GPUMappingNode* mapping_nodes,
-                                             PRPMappingEntry* mapping_entries) {
-    if (threadIdx.x == 0 && blockIdx.x == 0) {
-        PRPMappingEntry* result_ptrs[64];  // 假设最多64个映射条目
-        uint64_t tensor_size;
-        
-        uint32_t found_count = gpu_lookup_all_prp_mappings(
-            tensor_ptr, hash_table, mapping_nodes, mapping_entries,
-            result_ptrs, 64, &tensor_size
-        );
-        
-        printf("=== PRP Mapping Order Test ===\n");
-        printf("Tensor: 0x%lx, Size: %lu bytes, Found: %u mappings\n", 
-               tensor_ptr, tensor_size, found_count);
-        
-        for (uint32_t i = 0; i < found_count; ++i) {
-            PRPMappingEntry* entry = result_ptrs[i];
-            printf("Mapping[%u]: PRP1=0x%lx, PRP2=0x%lx, Type=%u\n",
-                   i, entry->prp1, entry->prp2, entry->transfer_type);
-        }
-        printf("=== End Test ===\n");
-    }
-}
 
-// 测试函数：验证链表插入顺序
-void test_mapping_order(int device_id) {
-    try {
-        std::cout << "\n=== Testing PRP Mapping Order ===\n";
-        
-        // 创建一个测试tensor（较大，需要多个PRP映射）
-        auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA, device_id);
-        auto tensor = torch::randn({1024, 1024}, options);  // 4MB tensor
-        
-        std::cout << "Created test tensor: " << tensor.sizes() << std::endl;
-        std::cout << "Tensor data pointer: " << tensor.data_ptr() << std::endl;
-        
-        // 注册tensor
-        bool register_success = geminifs_register_tensor_memory(tensor, device_id, 0);
-        if (!register_success) {
-            std::cerr << "Failed to register tensor memory" << std::endl;
-            return;
-        }
-        
-        std::cout << "Successfully registered tensor memory" << std::endl;
-        
-        // 获取GPU memory mapper的指针来调用测试kernel
-        GPUMemoryMapper* mapper = geminifs_get_gpu_memory_mapper(device_id);
-        if (!mapper) {
-            std::cerr << "Failed to get GPU memory mapper" << std::endl;
-            return;
-        }
-        
-        // 调用测试kernel
-        uint64_t tensor_ptr = reinterpret_cast<uint64_t>(tensor.data_ptr());
-        test_prp_mapping_order_kernel<<<1, 1>>>(
-            tensor_ptr,
-            mapper->getHashTablePtr(),
-            mapper->getMappingNodesPtr(),
-            mapper->getMappingEntriesPtr()
-        );
-        
-        cudaDeviceSynchronize();
-        cudaError_t cuda_error = cudaGetLastError();
-        if (cuda_error != cudaSuccess) {
-            std::cerr << "CUDA kernel error: " << cudaGetErrorString(cuda_error) << std::endl;
-        } else {
-            std::cout << "Test kernel executed successfully" << std::endl;
-        }
-        
-        std::cout << "=== Test Complete ===\n" << std::endl;
-        
-    } catch (const std::exception& e) {
-        std::cerr << "Test error: " << e.what() << std::endl;
-    }
-}
 
 int main(int argc, char** argv) {
 
@@ -248,15 +171,29 @@ int main(int argc, char** argv) {
             struct geminifs_dma* dma_context = gpu_controller->getDMAContext(key_cache.data_ptr());
             assert(dma_context != nullptr && dma_context->dma_ptr != nullptr);
             
-            debug_prp_mappings_from_gpu(gpu_controller->getMemoryMapper(),
-                                        reinterpret_cast<uint64_t>(key_cache.data_ptr()), 
-                                        key_cache.numel() * key_cache.element_size(), 
-                                        1024*1024*2); // 2MB granularity
-            cuda::std::span<uint64_t> file_ids;                              
-            GPU_Read(gpu_controller->getMemoryMapper(),
-                                        reinterpret_cast<uint64_t>(key_cache.data_ptr()), 
-                                        key_cache.numel() * key_cache.element_size(), 
-                                        1024*1024*2);
+            // debug_prp_mappings_from_gpu(gpu_controller->getMemoryMapper(),
+            //                             reinterpret_cast<uint64_t>(key_cache.data_ptr()), 
+            //                             key_cache.numel() * key_cache.element_size(), 
+            //                             1024*1024*2); // 2MB granularity
+
+            GPU_Read_kernel<<<1, 1, 0, nvme_stream>>>(
+                (NVMe_File *)device_fd,
+                reinterpret_cast<uint64_t>(key_cache.data_ptr()), 
+                0,
+                1024*1024*2,
+                gpu_controller->getMemoryMapper()->getDeviceViewPtr()); // 2MB granularity
+            
+                // 同步等待kernel完成
+                cudaError_t err = cudaDeviceSynchronize();
+                if (err != cudaSuccess) {
+                    geminifs_error("Debug PRP Mappings: Kernel execution failed: %s\n", 
+                                    cudaGetErrorString(err));
+                }
+            // cuda::std::span<uint64_t> file_ids;                              
+            // GPU_Read(gpu_controller->getMemoryMapper(),
+            //                             reinterpret_cast<uint64_t>(key_cache.data_ptr()), 
+            //                             key_cache.numel() * key_cache.element_size(), 
+            //                             1024*1024*2);
         //     // Record start time for bandwidth calculation
         //     auto bandwidth_start = std::chrono::high_resolution_clock::now();
         //     nvme_controller_g_write_kernel<<<1,1,0,nvme_stream>>>(device_fd,dma_context->prp_mappings.at(0).prp1,
