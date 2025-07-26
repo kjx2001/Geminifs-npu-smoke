@@ -21,7 +21,7 @@ __device__ uint32_t gpu_lookup_all_prp_mappings(uint64_t tensor_ptr,
     
     GPUHashEntry& hash_entry = hash_table[hash_index];
     
-    printf("tensor_ptr is %lx, hash id is %u\n",tensor_ptr, hash_index);
+    // printf("tensor_ptr is %lx, hash id is %u\n",tensor_ptr, hash_index);
     // 检查是否找到对应的tensor
     if (hash_entry.GPU_virtual_ptr != tensor_ptr || hash_entry.first_node == GPUMemoryMapper::INVALID_INDEX) {
         if (tensor_size) {
@@ -1596,43 +1596,65 @@ __global__ void GPU_Read_kernel(NVMe_File* d_fd,
                    blocks_needed, MAX_BLOCKS);
             blocks_needed = MAX_BLOCKS;
         }
-
-        printf("GPU_Read_kernel: Launching batch NVMe read with %u blocks × %u threads for %u mappings\n",
-               blocks_needed, THREADS_PER_BLOCK, found_count);
-
-        // 动态并行调用批量NVMe读取kernel，直接传递mapping_entry_ptrs
-        nvme_batch_read_kernel<<<blocks_needed, THREADS_PER_BLOCK>>>(
-            d_fd, mapping_entry_ptrs, found_count, offset);
+        // 动态并行调用批量NVMe读取kernel，传递必要参数让子kernel自行查询
+        nvme_batch_read_kernel_v2<<<blocks_needed, THREADS_PER_BLOCK>>>(
+            d_fd, tensor_ptr, found_count, offset, device_view);
         
-        printf("GPU_Read_kernel: Batch NVMe read kernel launched\n");
      }
 }
 
 
 /**
- * 批量NVMe读取kernel：每个线程处理一个PRP映射条目
+ * 批量NVMe读取kernel V2：每个线程直接查询自己的PRP映射条目
+ * 解决动态并行内存访问问题，避免传递指针数组
  * @param d_fd NVMe文件描述符
- * @param mapping_entry_ptrs PRP映射条目指针数组
- * @param found_count 找到的映射条目数量
+ * @param tensor_ptr GPU tensor指针
+ * @param total_count 总的映射条目数量
  * @param base_file_offset 文件基础偏移量
+ * @param device_view GPU内存映射器的设备视图
  */
-__global__ void nvme_batch_read_kernel(NVMe_File* d_fd,
-                                      PRPMappingEntry** mapping_entry_ptrs,
-                                      uint32_t found_count,
-                                      size_t base_file_offset) {
+__global__ void nvme_batch_read_kernel_v2(NVMe_File* d_fd,
+                                          uint64_t tensor_ptr,
+                                          uint32_t total_count,
+                                          size_t base_file_offset,
+                                          GPUMemoryMapperDeviceView* device_view) {
     uint32_t tid = threadIdx.x + blockIdx.x * blockDim.x;
     
     // 确保线程ID在有效范围内
+    if (tid >= total_count) {
+        return;
+    }
+    
+    // 每个线程重新查询PRP映射，但只取自己需要的那一个
+    PRPMappingEntry* temp_mapping_ptrs[64]; // 栈数组，足够大
+    uint64_t found_tensor_size = 0;
+    
+    // 查询当前tensor的所有PRP映射
+    uint32_t found_count = gpu_lookup_all_prp_mappings(
+        tensor_ptr,
+        device_view->d_hash_table,
+        device_view->d_mapping_nodes, 
+        device_view->d_mapping_entries,
+        temp_mapping_ptrs,
+        64,
+        &found_tensor_size
+    );
+    
+    // 检查是否有足够的映射条目
     if (tid >= found_count) {
+        printf("Thread[%u]: Index exceeds found mappings (%u)\n", tid, found_count);
         return;
     }
     
     // 获取当前线程对应的PRP映射条目
-    PRPMappingEntry* entry_ptr = mapping_entry_ptrs[tid];
+    PRPMappingEntry* entry_ptr = temp_mapping_ptrs[tid];
     if (!entry_ptr) {
         printf("Thread[%u]: Null mapping entry pointer\n", tid);
         return;
     }
+    
+    // printf("Thread[%u]: Found mapping entry: Type: %u, PRP1: 0x%lx, PRP2: 0x%lx, tensor_offset: %lu, len : %lu\n",
+    //        tid, entry_ptr->transfer_type, entry_ptr->prp1, entry_ptr->prp2, entry_ptr->tensor_offset, entry_ptr->data_length);
     
     // 从PRP映射条目中获取必要信息
     uint64_t prp1 = entry_ptr->prp1;
@@ -1648,9 +1670,9 @@ __global__ void nvme_batch_read_kernel(NVMe_File* d_fd,
     // 调用NVMe读取函数
     nvme_controller_g_read(d_fd, prp1, prp2, slice_file_offset, data_length);
     
-    // 可选：打印调试信息
-    printf("Thread[%u]: NVMe read - tensor_offset=%lu, file_offset=%zu, len=%u, prp1=0x%lx, prp2=0x%lx\n",
-           tid, tensor_offset, slice_file_offset, data_length, prp1, prp2);
+    // 打印调试信息
+    // printf("Thread[%u]: NVMe read completed - tensor_offset=%lu, file_offset=%zu, len=%u, prp1=0x%lx, prp2=0x%lx\n",
+    //        tid, tensor_offset, slice_file_offset, data_length, prp1, prp2);
 }
 
 /**
@@ -1660,23 +1682,48 @@ __global__ void nvme_batch_read_kernel(NVMe_File* d_fd,
  * @param found_count 找到的映射条目数量
  * @param base_file_offset 文件基础偏移量
  */
-__global__ void nvme_batch_write_kernel(NVMe_File* d_fd,
-                                       PRPMappingEntry** mapping_entry_ptrs,
-                                       uint32_t found_count,
-                                       size_t base_file_offset) {
+__global__ void nvme_batch_write_kernel_v2(NVMe_File* d_fd,
+                                          uint64_t tensor_ptr,
+                                          uint32_t total_count,
+                                          size_t base_file_offset,
+                                          GPUMemoryMapperDeviceView* device_view) {
     uint32_t tid = threadIdx.x + blockIdx.x * blockDim.x;
     
     // 确保线程ID在有效范围内
+    if (tid >= total_count) {
+        return;
+    }
+    
+    // 每个线程重新查询PRP映射，但只取自己需要的那一个
+    PRPMappingEntry* temp_mapping_ptrs[64]; // 栈数组，足够大
+    uint64_t found_tensor_size = 0;
+    
+    // 查询当前tensor的所有PRP映射
+    uint32_t found_count = gpu_lookup_all_prp_mappings(
+        tensor_ptr,
+        device_view->d_hash_table,
+        device_view->d_mapping_nodes, 
+        device_view->d_mapping_entries,
+        temp_mapping_ptrs,
+        64,
+        &found_tensor_size
+    );
+    
+    // 检查是否有足够的映射条目
     if (tid >= found_count) {
+        printf("Thread[%u]: Index exceeds found mappings (%u)\n", tid, found_count);
         return;
     }
     
     // 获取当前线程对应的PRP映射条目
-    PRPMappingEntry* entry_ptr = mapping_entry_ptrs[tid];
+    PRPMappingEntry* entry_ptr = temp_mapping_ptrs[tid];
     if (!entry_ptr) {
         printf("Thread[%u]: Null mapping entry pointer\n", tid);
         return;
     }
+    
+    printf("Thread[%u]: Found mapping entry: Type: %u, PRP1: 0x%lx, PRP2: 0x%lx, tensor_offset: %lu\n",
+           tid, entry_ptr->transfer_type, entry_ptr->prp1, entry_ptr->prp2, entry_ptr->tensor_offset);
     
     // 从PRP映射条目中获取必要信息
     uint64_t prp1 = entry_ptr->prp1;
@@ -1689,13 +1736,14 @@ __global__ void nvme_batch_write_kernel(NVMe_File* d_fd,
     // tensor_offset: 该PRP entry在granularity内的本地偏移
     size_t slice_file_offset = base_file_offset + tensor_offset;
     
-    // 调用NVMe写入函数
-    nvme_controller_g_write_kernel(d_fd, prp1, prp2, slice_file_offset, data_length);
+    // 调用NVMe读取函数
+    nvme_controller_g_write(d_fd, prp1, prp2, slice_file_offset, data_length);
     
-    // 可选：打印调试信息
-    printf("Thread[%u]: NVMe write - tensor_offset=%lu, file_offset=%zu, len=%u, prp1=0x%lx, prp2=0x%lx\n",
+    // 打印调试信息
+    printf("Thread[%u]: NVMe write completed - tensor_offset=%lu, file_offset=%zu, len=%u, prp1=0x%lx, prp2=0x%lx\n",
            tid, tensor_offset, slice_file_offset, data_length, prp1, prp2);
 }
+
 
 /**
  * GPU写入kernel：查询PRP映射并动态并行发起NVMe IO
@@ -1756,9 +1804,9 @@ __global__ void GPU_Write_kernel(NVMe_File* d_fd,
         printf("GPU_Write_kernel: Launching batch NVMe write with %u blocks × %u threads for %u mappings\n",
                blocks_needed, THREADS_PER_BLOCK, found_count);
 
-        // 动态并行调用批量NVMe写入kernel，直接传递mapping_entry_ptrs
-        nvme_batch_write_kernel<<<blocks_needed, THREADS_PER_BLOCK>>>(
-            d_fd, mapping_entry_ptrs, found_count, offset);
+        // 动态并行调用批量NVMe写入kernel V2，传递必要参数让子kernel自行查询
+        nvme_batch_write_kernel_v2<<<blocks_needed, THREADS_PER_BLOCK>>>(
+            d_fd, tensor_ptr, found_count, offset, device_view);
         
         printf("GPU_Write_kernel: Batch NVMe write kernel launched\n");
      }

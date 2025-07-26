@@ -208,30 +208,36 @@ __global__ void gpu_debug_prp_mappings_kernel(GPUMemoryMapperDeviceView* device_
                                               size_t tensor_size,
                                               uint64_t granularity);
 
-/**
- * 批量NVMe读取kernel：每个线程处理一个PRP映射条目
+
+                                       /**
+ * 批量NVMe读取kernel V2：每个线程直接查询自己的PRP映射条目
+ * 解决动态并行内存访问问题，避免传递指针数组
  * @param d_fd NVMe文件描述符
- * @param mapping_entry_ptrs PRP映射条目指针数组
- * @param found_count 找到的映射条目数量
+ * @param tensor_ptr GPU tensor指针
+ * @param total_count 总的映射条目数量
  * @param base_file_offset 文件基础偏移量
+ * @param device_view GPU内存映射器的设备视图
  */
-__global__ void nvme_batch_read_kernel(NVMe_File* d_fd,
-                                      PRPMappingEntry** mapping_entry_ptrs,
-                                      uint32_t found_count,
-                                      size_t base_file_offset);
+__global__ void nvme_batch_read_kernel_v2(NVMe_File* d_fd,
+                                          uint64_t tensor_ptr,
+                                          uint32_t total_count,
+                                          size_t base_file_offset,
+                                          GPUMemoryMapperDeviceView* device_view);
 
 /**
- * 批量NVMe写入kernel：每个线程处理一个PRP映射条目
+ * 批量NVMe写入kernel V2：每个线程直接查询自己的PRP映射条目
+ * 解决动态并行内存访问问题，避免传递指针数组
  * @param d_fd NVMe文件描述符
- * @param mapping_entry_ptrs PRP映射条目指针数组
- * @param found_count 找到的映射条目数量
+ * @param tensor_ptr GPU tensor指针
+ * @param total_count 总的映射条目数量
  * @param base_file_offset 文件基础偏移量
+ * @param device_view GPU内存映射器的设备视图
  */
-__global__ void nvme_batch_write_kernel(NVMe_File* d_fd,
-                                       PRPMappingEntry** mapping_entry_ptrs,
-                                       uint32_t found_count,
-                                       size_t base_file_offset);
-
+__global__ void nvme_batch_write_kernel_v2(NVMe_File* d_fd,
+                                           uint64_t tensor_ptr,
+                                           uint32_t total_count,
+                                           size_t base_file_offset,
+                                           GPUMemoryMapperDeviceView* device_view);
 /**
  * GPU读取kernel：查询PRP映射并动态并行发起NVMe IO
  * @param d_fd NVMe文件描述符
@@ -527,5 +533,7 @@ private:
     GPUControllerRegistry(const GPUControllerRegistry&) = delete;
     GPUControllerRegistry& operator=(const GPUControllerRegistry&) = delete;
 };
+
+
 
 #endif // __GPU_CONTROLLER_H__
