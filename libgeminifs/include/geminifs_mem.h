@@ -6,9 +6,10 @@
 #include <cstdint>
 #include <cstring>
 #include "buffer.h"
+#include "prp_mapping_entry.h"
 
 // 前向声明
-struct PRPMappingEntry;
+// struct PRPMappingEntry;
 
 
 // PRP List 相关常量

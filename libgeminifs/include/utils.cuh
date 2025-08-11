@@ -66,7 +66,6 @@ using cuda_device_lock = cuda::binary_semaphore<cuda::thread_scope_device>;
 using cuda_device_ref = cuda::atomic<uint32_t, cuda::thread_scope_device>;
 using FileGroupId = int32_t;
 using GPUFileId = uint64_t;
-using GPUPoolId = int32_t;
 
 
 

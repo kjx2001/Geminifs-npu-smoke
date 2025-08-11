@@ -48,6 +48,7 @@
 #include "geminifs.cuh"
 #include "nvme_controller.cuh"
 #include "geminifs_helper.h"
+#include "gpu_controller.cuh"
 static char snvme_control_path[] = "/dev/snvm_control";
 static char sys_config_path[] = "/mnt/sys_GPU_NVMe_topology.json";
 
@@ -729,10 +730,7 @@ struct DMAInfo{
 //                                             key_caches, value_caches,
 //                                             start_layer_idx, num_layers, type);
 // }
-
-/**
- * Create and register a GPU controller for a specific device
- */
+// 保持兼容性，之后可以去除
 __host__ GPUControllerPtr geminifs_create_gpu_controller(int device_id, const std::string& mount_base_path) {
     auto gpu_controller = std::make_shared<GPUController>(device_id, mount_base_path);
     
@@ -753,9 +751,36 @@ __host__ GPUControllerPtr geminifs_create_gpu_controller(int device_id, const st
 }
 
 /**
+ * Create and register a GPU controller for a specific device
+ */
+__host__ GPUControllerPtr GeminiFS::geminifs_create_gpu_controller(int device_id, const std::string& mount_base_path) {
+    auto gpu_controller = std::make_shared<GPUController>(device_id, mount_base_path);
+    
+    if (!gpu_controller->isInitialized()) {
+        geminifs_error("geminifs_create_gpu_controller: Failed to initialize GPU controller for device %d\n", device_id);
+        return nullptr;
+    }
+    
+    // Register with the global registry
+    auto& registry = GPUControllerRegistry::getInstance();
+    if (!registry.registerGPUController(device_id, gpu_controller)) {
+        geminifs_error("geminifs_create_gpu_controller: Failed to register GPU controller for device %d\n", device_id);
+        return nullptr;
+    }
+    
+    geminifs_debug("geminifs_create_gpu_controller: Successfully created and registered GPU controller for device %d\n", device_id);
+    return gpu_controller;
+}
+
+__host__ GPUControllerPtr geminifs_get_gpu_controller(int device_id) {
+    auto& registry = GPUControllerRegistry::getInstance();
+    return registry.getGPUController(device_id);
+}
+
+/**
  * Get GPU controller for a specific device
  */
-__host__ GPUControllerPtr geminifs_get_gpu_controller(int device_id) {
+__host__ GPUControllerPtr GeminiFS::geminifs_get_gpu_controller(int device_id) {
     auto& registry = GPUControllerRegistry::getInstance();
     return registry.getGPUController(device_id);
 }
@@ -798,8 +823,42 @@ __host__ bool geminifs_add_nvme_to_gpu(int device_id, const nvme_ctrl_param& par
 }
 
 /**
- * Register tensor memory with GPU controller
+ * Add an NVMe controller to a GPU controller
  */
+__host__ bool GeminiFS::geminifs_add_nvme_to_gpu(int device_id, const nvme_ctrl_param& params) {
+    auto gpu_controller = geminifs_get_gpu_controller(device_id);
+    if (!gpu_controller) {
+        geminifs_error("geminifs_add_nvme_to_gpu: No GPU controller found for device %d\n", device_id);
+        return false;
+    }
+    
+    // Create modified parameters with mount path under GPU controller
+    nvme_ctrl_param modified_params = params;
+    std::filesystem::path gpu_mount_path = gpu_controller->getMountBasePath();
+    std::filesystem::path nvme_mount_path = gpu_mount_path / ("nvme-" + params.pci_addr);
+    modified_params.mount_path = nvme_mount_path.string();
+    
+    geminifs_debug("geminifs_add_nvme_to_gpu: Creating NVMe controller with mount path '%s' under GPU path '%s'\n", 
+                   modified_params.mount_path.c_str(), gpu_mount_path.c_str());
+    
+    // Create NVMe controller with modified mount path
+    auto nvme_controller = std::make_shared<NVMeController>(modified_params);
+    if (!nvme_controller->is_initialized()) {
+        geminifs_error("geminifs_add_nvme_to_gpu: Failed to initialize NVMe controller\n");
+        return false;
+    }
+    
+    // Add to GPU controller
+    if (!gpu_controller->addNVMeController(nvme_controller)) {
+        geminifs_error("geminifs_add_nvme_to_gpu: Failed to add NVMe controller to GPU %d\n", device_id);
+        return false;
+    }
+    
+    geminifs_debug("geminifs_add_nvme_to_gpu: Successfully added NVMe controller to GPU %d with mount path '%s'\n", 
+                   device_id, modified_params.mount_path.c_str());
+    return true;
+}
+
 __host__ bool geminifs_register_tensor_with_gpu(const torch::Tensor& tensor, uint64_t granularity) {
     int device_id = tensor.device().index();
     auto gpu_controller = geminifs_get_gpu_controller(device_id);
@@ -813,8 +872,20 @@ __host__ bool geminifs_register_tensor_with_gpu(const torch::Tensor& tensor, uin
 }
 
 /**
- * Unregister tensor memory from GPU controller
+ * Register tensor memory with GPU controller
  */
+__host__ bool GeminiFS::geminifs_register_tensor_with_gpu(const torch::Tensor& tensor, uint64_t granularity) {
+    int device_id = tensor.device().index();
+    auto gpu_controller = geminifs_get_gpu_controller(device_id);
+    
+    if (!gpu_controller) {
+        geminifs_error("geminifs_register_tensor_with_gpu: No GPU controller found for device %d\n", device_id);
+        return false;
+    }
+    
+    return gpu_controller->registerTensorMemory(tensor, granularity);
+}
+
 __host__ bool geminifs_unregister_tensor_from_gpu(const torch::Tensor& tensor) {
     int device_id = tensor.device().index();
     auto gpu_controller = geminifs_get_gpu_controller(device_id);
@@ -828,8 +899,20 @@ __host__ bool geminifs_unregister_tensor_from_gpu(const torch::Tensor& tensor) {
 }
 
 /**
- * Get DMA context from GPU controller
+ * Unregister tensor memory from GPU controller
  */
+__host__ bool GeminiFS::geminifs_unregister_tensor_from_gpu(const torch::Tensor& tensor) {
+    int device_id = tensor.device().index();
+    auto gpu_controller = geminifs_get_gpu_controller(device_id);
+    
+    if (!gpu_controller) {
+        geminifs_error("geminifs_unregister_tensor_from_gpu: No GPU controller found for device %d\n", device_id);
+        return false;
+    }
+    
+    return gpu_controller->unregisterTensorMemory(tensor.data_ptr());
+}
+
 __host__ struct geminifs_dma* geminifs_get_tensor_dma_from_gpu(const torch::Tensor& tensor) {
     int device_id = tensor.device().index();
     auto gpu_controller = geminifs_get_gpu_controller(device_id);
@@ -842,22 +925,251 @@ __host__ struct geminifs_dma* geminifs_get_tensor_dma_from_gpu(const torch::Tens
     return gpu_controller->getDMAContext(tensor.data_ptr());
 }
 
-// /**
-//  * Open file using GPU controller
-//  */
-// __host__ void* geminifs_gpu_open_file(int device_id, const std::string& filename, size_t file_size, uint32_t o_flag, size_t controller_index = 0) {
-//     auto gpu_controller = geminifs_get_gpu_controller(device_id);
-//     if (!gpu_controller) {
-//         geminifs_error("geminifs_gpu_open_file: No GPU controller found for device %d\n", device_id);
-//         return nullptr;
-//     }
+/**
+ * Get DMA context from GPU controller
+ */
+__host__ struct geminifs_dma* GeminiFS::geminifs_get_tensor_dma_from_gpu(const torch::Tensor& tensor) {
+    int device_id = tensor.device().index();
+    auto gpu_controller = geminifs_get_gpu_controller(device_id);
     
-//     return gpu_controller->openFile(filename, file_size, o_flag, controller_index);
-// }
+    if (!gpu_controller) {
+        geminifs_error("geminifs_get_tensor_dma_from_gpu: No GPU controller found for device %d\n", device_id);
+        return nullptr;
+    }
+    
+    return gpu_controller->getDMAContext(tensor.data_ptr());
+}
 
 /**
- * Cleanup all GPU controllers
+ * Open file using GPU controller
  */
+__host__ void* GeminiFS::geminifs_gpu_open_file(int device_id, GPUFileId gpu_file_id, size_t file_size, uint32_t o_flag) {
+    auto gpu_controller = geminifs_get_gpu_controller(device_id);
+    if (!gpu_controller) {
+        geminifs_error("geminifs_gpu_open_file: No GPU controller found for device %d\n", device_id);
+        return nullptr;
+    }
+    
+    return gpu_controller->openFile(gpu_file_id, file_size, o_flag, nvme_params_, gpu_file_manager_);
+}
+
+// --- NVMe_Link LRU cache helpers ---
+bool GeminiFS::get_links_cached(GPUFileId file_id, std::vector<NVMe_Link>& out_links) {
+    auto it = links_cache_.find(file_id);
+    if (it == links_cache_.end()) return false;
+    out_links = it->second.links;
+    touch_links_cache(file_id);
+    return true;
+}
+
+void GeminiFS::put_links_cache(GPUFileId file_id, const std::vector<NVMe_Link>& links) {
+    size_t bytes = links.size() * sizeof(NVMe_Link);
+    auto it = links_cache_.find(file_id);
+    if (it != links_cache_.end()) {
+        // update existing
+        links_cache_bytes_ -= it->second.bytes;
+        it->second.links = links;
+        it->second.bytes = bytes;
+        touch_links_cache(file_id);
+    } else {
+        links_cache_lru_.push_front(file_id);
+        links_cache_[file_id] = {links, bytes, links_cache_lru_.begin()};
+        links_cache_bytes_ += bytes;
+    }
+    evict_links_cache_if_needed();
+}
+
+void GeminiFS::touch_links_cache(GPUFileId file_id) {
+    auto it = links_cache_.find(file_id);
+    if (it == links_cache_.end()) return;
+    links_cache_lru_.erase(it->second.lru_it);
+    links_cache_lru_.push_front(file_id);
+    it->second.lru_it = links_cache_lru_.begin();
+}
+
+void GeminiFS::evict_links_cache_if_needed() {
+    while (links_cache_bytes_ > LINKS_CACHE_MAX_BYTES && !links_cache_lru_.empty()) {
+        GPUFileId victim = links_cache_lru_.back();
+        links_cache_lru_.pop_back();
+        auto it = links_cache_.find(victim);
+        if (it != links_cache_.end()) {
+            links_cache_bytes_ -= it->second.bytes;
+            links_cache_.erase(it);
+        }
+    }
+}
+
+__host__ bool GeminiFS::geminifs_GPU_read_kernel(torch::Tensor& tensor, GPUFileId gpu_file_id, GPUControllerPtr gpu_controller) {
+    if (!gpu_controller || !gpu_controller->isInitialized()) {
+         geminifs_error("GPU_read_kernel: GPU controller is not initialized\n");
+          return false;
+    }
+
+    if (!tensor.is_cuda()) { 
+        geminifs_error("GPU_read_kernel: tensor must be on CUDA device\n");
+         return false;
+    }
+
+    GPUFileDesc desc;
+    if (!gpu_file_manager_.getGPUFileDesc(gpu_file_id, desc)) { 
+        geminifs_error("GPU_read_kernel: GPUFileId %lu not found\n", gpu_file_id); 
+        return false;
+    }
+
+    // Do not auto-register here; only validate tensor already registered
+    auto dma_ctx = gpu_controller->getDMAContext(tensor.data_ptr());
+    if (!dma_ctx) {
+        geminifs_error("GPU_read_kernel: tensor not registered; call geminifs_register_tensor_with_gpu before IO\n");
+        return false;
+    }
+
+    // 优先从缓存取链接，未命中则用 getLinksForFile 一次性拉取并缓存
+    std::vector<NVMe_Link> links;
+    if (!get_links_cached(gpu_file_id, links)) {
+        if (!gpu_file_manager_.getLinksForFile(gpu_file_id, links)) {
+            geminifs_error("GPU_read_kernel: failed to get links for file %lu\n", gpu_file_id);
+            return false;
+        }
+        put_links_cache(gpu_file_id, links);
+    }
+
+    auto* device_view = gpu_controller->getMemoryMapper()->getDeviceViewPtr();
+    if (!device_view) {
+        geminifs_error("GPU_read_kernel: device view is null\n");
+        return false;
+    }
+
+    // 准备 NVMe_File* 列表（与 links 对齐）
+    std::vector<NVMe_File*> nvme_fds;
+    nvme_fds.reserve(links.size());
+    for (const auto& link : links) {
+        auto nvme_ctrl = gpu_controller->getNVMeController(link.controller_index);
+        if (!nvme_ctrl) {
+            geminifs_error("GPU_read_kernel: NVMe controller %zu not found\n", link.controller_index);
+            return false;
+        }
+        void* device_fd = nvme_ctrl->g_open(std::string(link.name), link.file_size, O_DEVICE);
+        if (!device_fd) {
+            geminifs_error("GPU_read_kernel: g_open failed for %s\n", link.name);
+            return false;
+        }
+        nvme_fds.push_back(reinterpret_cast<NVMe_File*>(device_fd));
+    }
+
+    // 拷贝 NVMe_File** 到设备
+    NVMe_File** d_fds = nullptr;
+    size_t num_fds = nvme_fds.size();
+    cudaError_t err = cudaMalloc(&d_fds, num_fds * sizeof(NVMe_File*));
+    if (err != cudaSuccess) {
+        geminifs_error("GPU_read_kernel: cudaMalloc d_fds failed: %s\n", cudaGetErrorString(err));
+        return false;
+    }
+    err = cudaMemcpy(d_fds, nvme_fds.data(), num_fds * sizeof(NVMe_File*), cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        cudaFree(d_fds);
+        geminifs_error("GPU_read_kernel: cudaMemcpy d_fds failed: %s\n", cudaGetErrorString(err));
+        return false;
+    }
+
+    // 启动多FD内核（内核内部根据 tid%num_fds 分发并触发 v3 批量）
+    uint64_t tensor_ptr = reinterpret_cast<uint64_t>(tensor.data_ptr());
+    size_t offset = 0;
+    size_t len = static_cast<size_t>(tensor.numel()) * static_cast<size_t>(tensor.element_size());
+    GPU_Read_kernel_multi<<<1,1>>>(d_fds, static_cast<uint32_t>(num_fds), tensor_ptr, offset, len, device_view);
+    err = cudaDeviceSynchronize();
+
+    cudaFree(d_fds);
+    if (err != cudaSuccess) {
+        geminifs_error("GPU_read_kernel: GPU_Read_kernel_multi failed: %s\n", cudaGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+__host__ bool GeminiFS::geminifs_GPU_write_kernel(const torch::Tensor& tensor, GPUFileId gpu_file_id, GPUControllerPtr gpu_controller) {
+    if (!gpu_controller || !gpu_controller->isInitialized()) {
+        geminifs_error("GPU_write_kernel: GPU controller is not initialized\n");
+        return false;
+    }
+    if (!tensor.is_cuda()) {
+        geminifs_error("GPU_write_kernel: tensor must be on CUDA device\n");
+        return false;
+    }
+    GPUFileDesc desc;
+    if (!gpu_file_manager_.getGPUFileDesc(gpu_file_id, desc)) {
+        geminifs_error("GPU_write_kernel: GPUFileId %lu not found\n", gpu_file_id);
+        return false;
+    }
+
+    // Do not auto-register here; only validate tensor already registered
+    auto dma_ctx = gpu_controller->getDMAContext(const_cast<void*>(tensor.data_ptr()));
+    if (!dma_ctx) {
+        geminifs_error("GPU_write_kernel: tensor not registered; call geminifs_register_tensor_with_gpu before IO\n");
+        return false;
+    }
+
+    std::vector<NVMe_Link> links;
+    if (!get_links_cached(gpu_file_id, links)) {
+        if (!gpu_file_manager_.getLinksForFile(gpu_file_id, links)) {
+            geminifs_error("GPU_write_kernel: failed to get links for file %lu\n", gpu_file_id);
+            return false;
+        }
+        put_links_cache(gpu_file_id, links);
+    }
+
+    auto* device_view = gpu_controller->getMemoryMapper()->getDeviceViewPtr();
+    if (!device_view) {
+        geminifs_error("GPU_write_kernel: device view is null\n");
+        return false;
+    }
+
+    // 准备 NVMe_File* 列表（与 links 对齐）
+    std::vector<NVMe_File*> nvme_fds;
+    nvme_fds.reserve(links.size());
+    for (const auto& link : links) {
+        auto nvme_ctrl = gpu_controller->getNVMeController(link.controller_index);
+        if (!nvme_ctrl) {
+            geminifs_error("GPU_write_kernel: NVMe controller %zu not found\n", link.controller_index);
+            return false;
+        }
+        void* device_fd = nvme_ctrl->g_open(std::string(link.name), link.file_size, O_DEVICE);
+        if (!device_fd) {
+            geminifs_error("GPU_write_kernel: g_open failed for %s\n", link.name);
+            return false;
+        }
+        nvme_fds.push_back(reinterpret_cast<NVMe_File*>(device_fd));
+    }
+
+    // 拷贝 NVMe_File** 到设备
+    NVMe_File** d_fds = nullptr;
+    size_t num_fds = nvme_fds.size();
+    cudaError_t err = cudaMalloc(&d_fds, num_fds * sizeof(NVMe_File*));
+    if (err != cudaSuccess) {
+        geminifs_error("GPU_write_kernel: cudaMalloc d_fds failed: %s\n", cudaGetErrorString(err));
+        return false;
+    }
+    err = cudaMemcpy(d_fds, nvme_fds.data(), num_fds * sizeof(NVMe_File*), cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        cudaFree(d_fds);
+        geminifs_error("GPU_write_kernel: cudaMemcpy d_fds failed: %s\n", cudaGetErrorString(err));
+        return false;
+    }
+
+    // 启动多FD内核
+    uint64_t tensor_ptr = reinterpret_cast<uint64_t>(tensor.data_ptr());
+    size_t offset = 0;
+    size_t len = static_cast<size_t>(tensor.numel()) * static_cast<size_t>(tensor.element_size());
+    GPU_Write_kernel_multi<<<1,1>>>(d_fds, static_cast<uint32_t>(num_fds), tensor_ptr, offset, len, device_view);
+    err = cudaDeviceSynchronize();
+
+    cudaFree(d_fds);
+    if (err != cudaSuccess) {
+        geminifs_error("GPU_write_kernel: GPU_Write_kernel_multi failed: %s\n", cudaGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
 __host__ void geminifs_cleanup_all_gpu_controllers() {
     auto& registry = GPUControllerRegistry::getInstance();
     registry.clearAll();
@@ -865,8 +1177,14 @@ __host__ void geminifs_cleanup_all_gpu_controllers() {
 }
 
 /**
- * Clean all files managed by a specific NVMe controller
+ * Cleanup all GPU controllers
  */
+__host__ void GeminiFS::geminifs_cleanup_all_gpu_controllers() {
+    auto& registry = GPUControllerRegistry::getInstance();
+    registry.clearAll();
+    geminifs_debug("geminifs_cleanup_all_gpu_controllers: Cleaned up all GPU controllers\n");
+}
+
 __host__ bool geminifs_nvme_delete_all_files(int device_id, size_t controller_index) {
     auto gpu_controller = geminifs_get_gpu_controller(device_id);
     if (!gpu_controller) {
@@ -893,3 +1211,64 @@ __host__ bool geminifs_nvme_delete_all_files(int device_id, size_t controller_in
     return success;
 }
 
+/**
+ * Clean all files managed by a specific NVMe controller
+ */
+__host__ bool GeminiFS::geminifs_nvme_delete_all_files(int device_id, size_t controller_index) {
+    auto gpu_controller = geminifs_get_gpu_controller(device_id);
+    if (!gpu_controller) {
+        geminifs_error("geminifs_nvme_delete_all_files: No GPU controller found for device %d\n", device_id);
+        return false;
+    }
+    
+    auto nvme_controller = gpu_controller->getNVMeController(controller_index);
+    if (!nvme_controller) {
+        geminifs_error("geminifs_nvme_delete_all_files: No NVMe controller found at index %zu for device %d\n", 
+                       controller_index, device_id);
+        return false;
+    }
+    
+    bool success = nvme_controller->device_file_delete_all_files_managed();
+    if (success) {
+        geminifs_debug("geminifs_nvme_delete_all_files: Successfully cleaned all files for device %d controller %zu\n", 
+                       device_id, controller_index);
+    } else {
+        geminifs_error("geminifs_nvme_delete_all_files: Failed to clean all files for device %d controller %zu\n", 
+                       device_id, controller_index);
+    }
+    
+    return success;
+}
+
+__host__ void GeminiFS::init(const std::string& config_file_path) {
+    auto& registry = GPUControllerRegistry::getInstance();
+    registry.clearAll();
+    auto_configure_fd_limits(NUM_FILES);
+    geminifs_debug("geminifs_cleanup_all_gpu_controllers: Cleaned up all GPU controllers\n");
+
+    ParsedSystemConfig config = parse_system_config(config_file_path);
+    if (config.valid) {
+        // 转换为nvme_ctrl_param格式
+        nvme_params_ = convert_to_nvme_ctrl_params(config);
+
+        for (const auto& group : config.groups) {
+            geminifs_debug("geminifs_init: Creating GPU controller for device %d with mount path %s\n", group.gpu.cudaDevice, group.gpu.mount_path.c_str());
+            geminifs_create_gpu_controller(group.gpu.cudaDevice, group.gpu.mount_path);
+            for (const auto& nvme_ctrl_param : nvme_params_) {
+                if (!nvme_ctrl_param.pci_addr.empty()) {
+                    geminifs_debug("geminifs_init: Adding NVMe controller for device %d with mount path %s\n", group.gpu.cudaDevice, nvme_ctrl_param.mount_path.c_str());
+                    geminifs_add_nvme_to_gpu(group.gpu.cudaDevice, nvme_ctrl_param);
+                }
+            }
+        }
+    } else {
+        std::cerr << "Config parsing failed: " << config.error_message << std::endl;
+        return ;
+    }
+
+    geminifs_debug("geminifs_init: Successfully initialized GeminiFS\n");
+}
+
+__host__ void GeminiFS::cleanup() {
+    geminifs_cleanup_all_gpu_controllers();
+}

@@ -2,6 +2,8 @@
 #include "helper.cuh"
 #include "geminifs_helper.h"
 #include "nvm_cmd.h"
+#include "geminifs.h"
+
 #include <cuda_runtime.h>
 #include <unistd.h>
 #include <cassert>
@@ -283,7 +285,7 @@ host_fd_t NVMeController::host_file_create_managed(int block_size, size_t file_s
     auto nvpage_size = controller->page_size;
     assert(block_size % nvpage_size == 0);
 
-    auto hdr_size = ROUND_UP(GEMINI_HDR_MAX_SIZE, block_size);
+    auto hdr_size = GEMINI_HDR_MAX_SIZE;
 
     // Allocate host memory for the header
     struct geminiFS_hdr *hdr = (struct geminiFS_hdr *)malloc(hdr_size);
@@ -412,7 +414,7 @@ dev_fd_t NVMeController::device_file_create_managed(int block_size, size_t file_
     }
     
     // Calculate header size
-    size_t hdr_size = ROUND_UP(GEMINI_HDR_MAX_SIZE, block_size);
+    size_t hdr_size = GEMINI_HDR_MAX_SIZE;
     
     // Copy host file descriptor to device
     dev_fd_t device_fd = copy_host_fd_to_device(host_fd, hdr_size);

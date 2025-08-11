@@ -14,3 +14,5 @@ third_pkgs/*
 .ccls-cache/
 *.swp
 *~
+.clangd
+db/

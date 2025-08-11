@@ -14,8 +14,6 @@
 
 using ControllerPtr = std::shared_ptr<Controller>;
 
-
-
 // Forward declarations
 struct nvme_ctrl_param;
 struct DeviceFileHandle;
@@ -68,7 +66,7 @@ public:
     // Check if controller is properly initialized
     bool is_initialized() const { return is_initialized_; }
 
-
+    size_t next_nvme_file_id() { return next_nvme_file_id_++; }
 
 
 private:
@@ -83,7 +81,7 @@ private:
     
     // Initialization state
     bool is_initialized_;
-    
+    size_t next_nvme_file_id_ = 0;
     // Device file descriptor management
     std::vector<DeviceFileHandle> device_files_;
     mutable std::mutex device_files_mtx_;

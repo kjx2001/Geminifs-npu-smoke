@@ -9,7 +9,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
-#include <linux/fiemap.h>
+#include "gemini_fiemap.h"
 
 // GeminiFS specific file open flags
 #define O_HOST      0x10000000  // Open for host-side operations
@@ -29,11 +29,11 @@ struct geminiFS_hdr {
 	int fd; /* dummy */
         uint8_t block_bit; /* block_size, in the form of bit num */
         uint8_t extent_count;
-	struct fiemap_extent extents[];
+	struct gemini_fiemap_extent extents[];
 };
 
 #define GEMINI_HDR_MAX_SIZE (512)
-#define GEMINI_HDR_MAX_EXTENTS ((GEMINI_HDR_MAX_SIZE - sizeof(struct geminiFS_hdr)) / sizeof(struct fiemap_extent))
+#define GEMINI_HDR_MAX_EXTENTS ((GEMINI_HDR_MAX_SIZE - sizeof(struct geminiFS_hdr)) / sizeof(struct gemini_fiemap_extent))
 
 extern union geminiFS_magic {
 	uint64_t magic_num;

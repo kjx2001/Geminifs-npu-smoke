@@ -11,23 +11,9 @@
 #include <torch/all.h>
 #include "nvme_controller.cuh"
 #include "geminifs_mem.h"
+#include "gpu_file_manager.cuh"
+#include "prp_mapping_entry.h"
 
-/**
- * PRP映射条目结构 (32字节)
- */
-struct PRPMappingEntry {
-    uint32_t transfer_type; // NVMe cmd transfer type (4字节)
-    uint32_t data_length;   // 数据长度 (4字节)
-    uint64_t prp1;          // PRP1 (8字节)
-    uint64_t prp2;          // PRP2 may be NULL (8字节)
-    uint64_t tensor_offset; // 该PRP entry在granularity内的偏移位置 (8字节)
-    
-    __device__ __host__ PRPMappingEntry() : transfer_type(0), data_length(0), prp1(0), prp2(0), tensor_offset(0) {}
-    __device__ __host__ PRPMappingEntry(uint32_t transfer_type, uint32_t data_len, uint64_t p1, uint64_t p2) 
-        : transfer_type(transfer_type), data_length(data_len), prp1(p1), prp2(p2), tensor_offset(0) {}
-    __device__ __host__ PRPMappingEntry(uint32_t transfer_type, uint32_t data_len, uint64_t p1, uint64_t p2, uint64_t offset) 
-        : transfer_type(transfer_type), data_length(data_len), prp1(p1), prp2(p2), tensor_offset(offset) {}
-};
 
 /**
  * GPU端映射链表节点 (16字节)
@@ -150,7 +136,7 @@ public:
      * 获取Device侧视图结构体指针 (用于GPU kernel)
      */
     GPUMemoryMapperDeviceView* getDeviceViewPtr() const { return d_device_view_; }
-    
+
     /**
      * 获取统计信息
      */
@@ -253,6 +239,16 @@ __global__ void GPU_Read_kernel(NVMe_File* d_fd,
                                GPUMemoryMapperDeviceView* device_view);
 
 /**
+ * Multi-FD variant: distribute mappings by tid % num_fds
+ */
+__global__ void GPU_Read_kernel_multi(NVMe_File** d_fds,
+                                      uint32_t num_fds,
+                                      uint64_t tensor_ptr,
+                                      size_t offset,
+                                      size_t len,
+                                      GPUMemoryMapperDeviceView* device_view);
+
+/**
  * GPU写入kernel：查询PRP映射并动态并行发起NVMe IO
  * @param d_fd NVMe文件描述符
  * @param tensor_ptr GPU tensor指针
@@ -265,6 +261,48 @@ __global__ void GPU_Write_kernel(NVMe_File* d_fd,
                                 size_t offset,
                                 size_t len, 
                                 GPUMemoryMapperDeviceView* device_view);
+
+/**
+ * Multi-FD variant: distribute mappings by tid % num_fds
+ */
+__global__ void GPU_Write_kernel_multi(NVMe_File** d_fds,
+                                       uint32_t num_fds,
+                                       uint64_t tensor_ptr,
+                                       size_t offset,
+                                       size_t len,
+                                       GPUMemoryMapperDeviceView* device_view);
+
+// New: per-slice by (offset,len), resolve PRP inside kernel at execution time
+__global__ void nvme_read_slices_by_range_kernel(NVMe_File** d_fds,
+                                                 uint64_t* tensor_ptrs,
+                                                 uint64_t* offsets,
+                                                 uint32_t* lengths,
+                                                 uint32_t total_count,
+                                                 GPUMemoryMapperDeviceView* device_view);
+
+__global__ void nvme_write_slices_by_range_kernel(NVMe_File** d_fds,
+                                                  uint64_t* tensor_ptrs,
+                                                  uint64_t* offsets,
+                                                  uint32_t* lengths,
+                                                  uint32_t total_count,
+                                                  GPUMemoryMapperDeviceView* device_view);
+
+// Batch v3: distribute by tid % num_fds
+__global__ void nvme_batch_read_kernel_v3(NVMe_File** d_fds,
+                                          uint32_t num_fds,
+                                          uint64_t tensor_ptr,
+                                          uint32_t total_count,
+                                          size_t base_file_offset,
+                                          PRPMappingEntry** mapping_entries,
+                                          GPUMemoryMapperDeviceView* device_view);
+
+__global__ void nvme_batch_write_kernel_v3(NVMe_File** d_fds,
+                                           uint32_t num_fds,
+                                           uint64_t tensor_ptr,
+                                           uint32_t total_count,
+                                           size_t base_file_offset,
+                                           PRPMappingEntry** mapping_entries,
+                                           GPUMemoryMapperDeviceView* device_view);
 
 /**
  * Host端函数用于调用GPU kernel查询和打印PRP映射
@@ -370,13 +408,14 @@ public:
     
     /**
      * Open a file using one of the managed NVMe controllers
-     * @param filename Name of the file to open
+     * @param gpu_file_id GPU file ID
      * @param file_size Size of the file
      * @param o_flag Open flags
-     * @param controller_index Index of the controller to use (default: 0)
+     * @param nvme_params Vector of NVMe controller parameters
+     * @param gpu_file_manager GPU file manager
      * @return File descriptor or nullptr if failed
      */
-    void* openFile(const std::string& filename, size_t file_size, uint32_t o_flag, size_t controller_index = 0);
+    void* openFile(GPUFileId gpu_file_id, size_t file_size, uint32_t o_flag, const std::vector<nvme_ctrl_param>& nvme_params, GPUFileManager& gpu_file_manager);
     
     // === GPU Management Methods ===
     

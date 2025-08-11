@@ -12,12 +12,13 @@
 #include <sys/stat.h>
 #include <sys/mman.h>
 #include <sys/ioctl.h>
-#include <linux/fiemap.h>
 #include <linux/fs.h>
 #include <cuda_runtime.h>
 
 #include "geminifs.h"
+#include "geminifs_helper.h"
 #include "nvm_error.h"
+#include "gemini_fiemap.h"
 
 // Definition of the global magic number
 union geminiFS_magic the_geminiFS_magic = {
@@ -69,7 +70,7 @@ host_fd_t host_create_geminifs_file(const char *filename,
 
 	my_assert(virtual_space_size % block_size == 0);
 
-	auto hdr_size = ROUND_UP(GEMINI_HDR_MAX_SIZE, block_size);
+	auto hdr_size = GEMINI_HDR_MAX_SIZE;
 
 	hdr = (struct geminiFS_hdr *)malloc(hdr_size);
 	hdr->magic_num = the_geminiFS_magic.magic_num;
@@ -99,7 +100,7 @@ host_fd_t host_create_geminifs_file(void *buf,
 	my_assert(virtual_space_size % block_size == 0);
 
 	hdr->magic_num = the_geminiFS_magic.magic_num;
-	hdr->first_block_base = ROUND_UP(GEMINI_HDR_MAX_SIZE, block_size);
+	hdr->first_block_base = GEMINI_HDR_MAX_SIZE;
 	hdr->virtual_space_size = ROUND_UP(virtual_space_size, block_size);
 	hdr->block_bit = one_nr__of__binary_int(block_size - 1);
 	
@@ -292,11 +293,18 @@ void host_refine_nvmeofst(host_fd_t fd) {
 										fd->fd,
 										0);
 	my_assert(MAP_FAILED != file_mmap);
+
 	struct fiemap *mapping = read_fiemap(hdr->fd, hdr->first_block_base, hdr->virtual_space_size);
 	my_assert(NULL != mapping);
-	if (mapping->fm_mapped_extents > GEMINI_HDR_MAX_EXTENTS) {
+
+	
+    gemini_fiemap* gemini_map = convert_fiemap_to_gemini_fiemap(mapping);
+    my_assert(NULL != gemini_map);
+    free(mapping); // Original fiemap is no longer needed
+	
+	if (gemini_map->fm_mapped_extents > GEMINI_HDR_MAX_EXTENTS) {
 		fprintf(stderr, "FATAL: Allocated file has too many extents: %u, max allowed: %ld\n",
-				mapping->fm_mapped_extents, GEMINI_HDR_MAX_EXTENTS);
+				gemini_map->fm_mapped_extents, GEMINI_HDR_MAX_EXTENTS);
 		exit(EXIT_FAILURE);
 	}
 
@@ -305,9 +313,10 @@ void host_refine_nvmeofst(host_fd_t fd) {
 	file_mmap->virtual_space_size = hdr->virtual_space_size;
 	file_mmap->fd = hdr->fd;
 	file_mmap->block_bit = hdr->block_bit;
-	file_mmap->extent_count = mapping->fm_mapped_extents;
-	memcpy(file_mmap->extents, mapping->fm_extents,
-		   mapping->fm_mapped_extents * sizeof(struct fiemap_extent));
+	file_mmap->extent_count = gemini_map->fm_mapped_extents;
+	memcpy(file_mmap->extents, gemini_map->fm_extents,
+		   gemini_map->fm_mapped_extents * sizeof(struct gemini_fiemap_extent));
 
+    free(gemini_map); // Clean up the converted map
 	munmap(file_mmap, hdr->first_block_base);
 }

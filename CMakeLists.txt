@@ -4,6 +4,10 @@ set (CMAKE_CUDA_ARCHITECTURES 90)
 set (CMAKE_C_STANDARD 99)
 set (CMAKE_CXX_STANDARD 20)
 set (CMAKE_CUDA_STANDARD 20)
+set(CMAKE_EXPORT_COMPILE_COMMANDS on CACHE INTERNAL "" FORCE)
+# set(CMAKE_CUDA_USE_RESPONSE_FILE_FOR_INCLUDES 0)
+# set(CMAKE_CUDA_USE_RESPONSE_FILE_FOR_LIBRARIES 0)
+# set(CMAKE_CUDA_USE_RESPONSE_FILE_FOR_OBJECTS 0)
 
 project (libnvm LANGUAGES CUDA C CXX)
 
@@ -205,6 +209,8 @@ add_library(libgeminifs ${libgeminifs_cuda_source} ${libgeminifs_cpp_source} ${l
 # Add Torch related configurations
 target_link_libraries(libgeminifs PRIVATE "${TORCH_LIBRARIES}")
 target_include_directories(libgeminifs PRIVATE "${TORCH_INCLUDE_DIRS}")
+
+target_link_libraries(libgeminifs PRIVATE rocksdb)
 
 target_include_directories(libgeminifs PRIVATE "${libgeminifs_root}")
 target_link_libraries(libgeminifs PRIVATE libnvm CUDA::cudart "${TORCH_LIBRARIES}")

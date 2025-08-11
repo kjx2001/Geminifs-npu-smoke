@@ -13,7 +13,6 @@
 #include <sys/stat.h>
 #include <sys/mman.h>
 #include <sys/ioctl.h>
-#include <linux/fiemap.h>
 #include <linux/fs.h>
 #include <iostream>
 #include <cuda_runtime.h>
@@ -25,6 +24,7 @@
 #include <set>
 #include <sstream>
 #include "ioctl.h"
+#include "gemini_fiemap.h"
 
 // Include for PyTorch TORCH_CHECK macro
 #ifdef TORCH_CHECK
