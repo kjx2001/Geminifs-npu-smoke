@@ -14,7 +14,7 @@ GPUFileManager::GPUFileManager(const std::string& file_prefix, size_t gpu_heap_s
       metadata_file_handle_(nullptr),
       links_file_handle_(nullptr),
       d_heap_memory_(nullptr),
-      heap_size_bytes_(gpu_heap_size_gb * 1024 * 1024),
+      heap_size_bytes_(gpu_heap_size_gb * 1024 * 1024 * 1024),
       d_lookup_table_(nullptr),
       max_gpu_files_(max_files),
       next_file_id_(1) {

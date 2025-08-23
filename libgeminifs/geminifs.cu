@@ -49,26 +49,26 @@
 #include "nvme_controller.cuh"
 #include "geminifs_helper.h"
 #include "gpu_controller.cuh"
-static char snvme_control_path[] = "/dev/snvm_control";
-static char sys_config_path[] = "/mnt/sys_GPU_NVMe_topology.json";
+// static char snvme_control_path[] = "/dev/snvm_control";
+// static char sys_config_path[] = "/mnt/sys_GPU_NVMe_topology.json";
 
     
 // Global helper functions for checking system components
-static inline bool check_snvme_control_exists() {
-    if (access(snvme_control_path, F_OK) != 0) {
-        geminifs_error("SNVM control device '%s' does not exist. Please ensure the kernel module is properly installed.\n", snvme_control_path);
-        return false;
-    }
-    return true;
-}
+// static inline bool check_snvme_control_exists() {
+//     if (access(snvme_control_path, F_OK) != 0) {
+//         geminifs_error("SNVM control device '%s' does not exist. Please ensure the kernel module is properly installed.\n", snvme_control_path);
+//         return false;
+//     }
+//     return true;
+// }
 
-static inline bool check_sys_config_exists() {
-    if (access(sys_config_path, F_OK) != 0) {
-        geminifs_error("Sys GPU-NVMe topology '%s' does not exist. Please ensure the kernel module is properly installed.\n", sys_config_path);
-        return false;
-    }
-    return true;
-}
+// static inline bool check_sys_config_exists() {
+//     if (access(sys_config_path, F_OK) != 0) {
+//         geminifs_error("Sys GPU-NVMe topology '%s' does not exist. Please ensure the kernel module is properly installed.\n", sys_config_path);
+//         return false;
+//     }
+//     return true;
+// }
 
 // static inline void host_close_ctrls(struct geminifs_metadata *metadata){
 //     for (auto &ctrl : metadata->ctrls) {
@@ -949,7 +949,6 @@ __host__ void* GeminiFS::geminifs_gpu_open_file(int device_id, GPUFileId gpu_fil
         geminifs_error("geminifs_gpu_open_file: No GPU controller found for device %d\n", device_id);
         return nullptr;
     }
-    
     return gpu_controller->openFile(gpu_file_id, file_size, o_flag, nvme_params_, gpu_file_manager_);
 }
 
@@ -1240,33 +1239,198 @@ __host__ bool GeminiFS::geminifs_nvme_delete_all_files(int device_id, size_t con
     return success;
 }
 
-__host__ void GeminiFS::init(const std::string& config_file_path) {
+__host__ void GeminiFS::init(const std::string& config_file_path, size_t num_files, size_t file_size, bool reset) {
+    // 记录初始化GPU file 参数
+    init_GPU_num_files_ = num_files;
+    init_GPU_file_size_ = file_size;
+    size_t per_nvme_controller_files = 0;
+    size_t per_nvme_file_size = 0;
+    geminifs_debug("GeminiFS::init: config_file_path=%s, num_files=%zu, file_size=%zu, reset=%s\n", 
+                   config_file_path.c_str(), num_files, file_size, reset ? "true" : "false");
+    
     auto& registry = GPUControllerRegistry::getInstance();
-    registry.clearAll();
+    
+    // 确认进程可以打开足够的文件描述符
     auto_configure_fd_limits(NUM_FILES);
-    geminifs_debug("geminifs_cleanup_all_gpu_controllers: Cleaned up all GPU controllers\n");
+    
+    // 获取当前进程所在的GPU ID
+    int current_gpu_id;
+    cudaError_t err = cudaGetDevice(&current_gpu_id);
+    if (err != cudaSuccess) {
+        geminifs_error("geminifs_init: Failed to get current GPU device: %s\n", cudaGetErrorString(err));
+        return;
+    }
+    
+
+    
+    if (is_init_ && !reset) {
+        geminifs_debug("geminifs_init: GeminiFS is already initialized, skipping re-initialization\n");
+        return;
+    }
 
     ParsedSystemConfig config = parse_system_config(config_file_path);
     if (config.valid) {
-        // 转换为nvme_ctrl_param格式
-        nvme_params_ = convert_to_nvme_ctrl_params(config);
-
+        // 查找当前GPU对应的config group
+        bool found_group = false;
         for (const auto& group : config.groups) {
-            geminifs_debug("geminifs_init: Creating GPU controller for device %d with mount path %s\n", group.gpu.cudaDevice, group.gpu.mount_path.c_str());
-            geminifs_create_gpu_controller(group.gpu.cudaDevice, group.gpu.mount_path);
-            for (const auto& nvme_ctrl_param : nvme_params_) {
-                if (!nvme_ctrl_param.pci_addr.empty()) {
-                    geminifs_debug("geminifs_init: Adding NVMe controller for device %d with mount path %s\n", group.gpu.cudaDevice, nvme_ctrl_param.mount_path.c_str());
-                    geminifs_add_nvme_to_gpu(group.gpu.cudaDevice, nvme_ctrl_param);
+            if (group.gpu.cudaDevice == current_gpu_id) {
+                found_group = true;
+                nvme_params_ = convert_to_nvme_ctrl_params_group(group);
+                // 检查文件总数是否超过限制
+                
+                if(nvme_params_.size()*init_GPU_num_files_ >NUM_FILES)
+                {
+                    geminifs_error("geminifs_init: The total number of files (%zu) exceeds the limit (%d). Please increase NUM_FILES in geminifs.h and recompile.\n", nvme_params_.size()*init_GPU_num_files_, NUM_FILES);
+                    return;
                 }
+                geminifs_debug("geminifs_init: Creating GPU controller for device %d with mount path %s\n", group.gpu.cudaDevice, group.gpu.mount_path.c_str());
+                geminifs_create_gpu_controller(group.gpu.cudaDevice, group.gpu.mount_path);
+                for (const auto& nvme_ctrl_param : nvme_params_) {
+                    if (!nvme_ctrl_param.pci_addr.empty()) {
+                        geminifs_debug("geminifs_init: Adding NVMe controller for device %d with mount path %s\n", group.gpu.cudaDevice, nvme_ctrl_param.mount_path.c_str());
+                        geminifs_add_nvme_to_gpu(group.gpu.cudaDevice, nvme_ctrl_param);
+                    }
+                }
+                break; // 找到对应的group后退出循环
             }
+        }
+        
+        if (!found_group) {
+            geminifs_error("geminifs_init: No config group found for current GPU device %d\n", current_gpu_id);
+            return;
         }
     } else {
         std::cerr << "Config parsing failed: " << config.error_message << std::endl;
         return ;
     }
 
-    geminifs_debug("geminifs_init: Successfully initialized GeminiFS\n");
+        // 如果需要reset，清空已存在的GPU controller下所有NVMe controller的文件
+    if (reset) {
+        // 询问用户确认
+        std::string operation_desc = "Reset GeminiFS for GPU device " + std::to_string(current_gpu_id) + 
+                                    "\n  - Clear all managed NVMe files" +
+                                    "\n  - Clear memory caches and links cache";
+        
+        if (!confirm_dangerous_operation(operation_desc)) {
+            geminifs_debug("geminifs_init: Reset operation cancelled by user, continuing with normal initialization\n");
+            // 用户取消了 reset，但继续正常初始化
+        } else {
+            auto existing_gpu_controller = geminifs_get_gpu_controller(current_gpu_id);
+            if (existing_gpu_controller) {
+                geminifs_debug("geminifs_init: Reset mode - cleaning all NVMe files for GPU device %d\n", current_gpu_id);
+                
+                // 获取所有NVMe controller并清空其文件
+                size_t nvme_count = existing_gpu_controller->getControllerCount();
+                for (size_t i = 0; i < nvme_count; ++i) {
+                    auto nvme_controller = existing_gpu_controller->getNVMeController(i);
+                    if (nvme_controller) {
+                        geminifs_debug("geminifs_init: Cleaning files for NVMe controller %zu\n", i);
+                        bool success = nvme_controller->device_file_delete_all_files_managed();
+                        if (success) {
+                            geminifs_debug("geminifs_init: Successfully cleaned all files for NVMe controller %zu\n", i);
+                        } else {
+                            geminifs_error("geminifs_init: Failed to clean files for NVMe controller %zu\n", i);
+                        }
+                    }
+                }
+                
+                // 清理GPU controller的缓存
+                links_cache_.clear();
+                links_cache_lru_.clear();
+                links_cache_bytes_ = 0;
+                
+                geminifs_debug("geminifs_init: Reset completed - all NVMe files and caches cleared\n");
+            } else {
+                geminifs_debug("geminifs_init: No existing GPU controller found for reset on device %d\n", current_gpu_id);
+            }
+        }
+    }
+
+    // 设置每个nvme controller管理的文件的大小 
+    per_nvme_controller_files = num_files;
+    per_nvme_file_size = (nvme_params_.empty()) ? 0 : file_size / nvme_params_.size();
+    // 判断per_nvme_file_size是否大于64KB 且 64KB对齐
+    if (per_nvme_file_size < __64KB__ || (per_nvme_file_size % __64KB__) != 0) {
+        geminifs_error("geminifs_init: Each NVMe controller must manage files of at least 64KB and aligned to 64KB. Current per controller file size: %zu bytes\n", per_nvme_file_size);
+        return;
+    }
+    
+    // 检查并创建每个NVMe控制器中的文件
+    auto gpu_controller = geminifs_get_gpu_controller(current_gpu_id);
+    if (gpu_controller) {
+        size_t nvme_count = gpu_controller->getControllerCount();
+        geminifs_debug("geminifs_init: Checking files for %zu NVMe controllers\n", nvme_count);
+        
+        for (size_t i = 0; i < nvme_count; ++i) {
+            auto nvme_controller = gpu_controller->getNVMeController(i);
+            if (nvme_controller) {
+                geminifs_debug("geminifs_init: Checking files for NVMe controller %zu\n", i);
+                
+                // 检查符合预期大小的有效文件数量
+                size_t expected_file_size = per_nvme_file_size;
+                size_t valid_file_count = nvme_controller->device_file_validate_sizes(expected_file_size);
+                
+                geminifs_info("geminifs_init: NVMe controller %zu has %zu valid files of size %zu bytes, expected %zu files\n", 
+                              i, valid_file_count, expected_file_size, per_nvme_controller_files);
+                
+                // 如果有效文件数量不够，创建缺失的文件
+                if (valid_file_count < per_nvme_controller_files) {
+                    size_t files_to_create = per_nvme_controller_files - valid_file_count;
+                    geminifs_info("geminifs_init: Need to create %zu additional files for NVMe controller %zu\n", 
+                                  files_to_create, i);
+                    
+                    // 获取现有文件总数用于命名新文件
+                    size_t existing_file_count = nvme_controller->device_file_get_managed_file_count();
+                    
+                    for (size_t j = 0; j < files_to_create; ++j) {
+                        std::string filename = std::to_string(existing_file_count + j) + ".KV";
+                        
+                        // Use host_file_create_only_managed to create the file without opening it
+                        bool success = nvme_controller->host_file_create_only_managed(nvme_controller->controller->page_size, expected_file_size, filename);
+                        
+                        if (success) {
+                            geminifs_debug("geminifs_init: Successfully created file '%s' of size %zu bytes on NVMe controller %zu\n", 
+                                          filename.c_str(), expected_file_size, i);
+                        } else {
+                            geminifs_error("geminifs_init: Failed to create file '%s' on NVMe controller %zu\n", 
+                                          filename.c_str(), i);
+                            return;
+                        }
+                    }
+                    // 重新验证文件数量
+                    size_t final_valid_count = nvme_controller->device_file_validate_sizes(expected_file_size);
+                    if (final_valid_count < per_nvme_controller_files) {
+                        geminifs_error("geminifs_init: After file creation, still have insufficient valid files (%zu) for NVMe controller %zu\n", 
+                                      final_valid_count, i);
+                        return;
+                    }
+                    geminifs_info("geminifs_init: File creation successful, now have %zu valid files for NVMe controller %zu\n", 
+                                  final_valid_count, i);
+                } else if (valid_file_count > per_nvme_controller_files) {
+                    geminifs_warn("geminifs_init: NVMe controller %zu has more valid files (%zu) than expected (%zu)\n", 
+                                 i, valid_file_count, per_nvme_controller_files);
+                }
+                
+                geminifs_debug("geminifs_init: NVMe controller %zu file setup completed successfully\n", i);
+            } else {
+                geminifs_error("geminifs_init: Failed to get NVMe controller %zu\n", i);
+                return;
+            }
+        }
+        
+        geminifs_debug("geminifs_init: All NVMe controllers file setup completed successfully\n");
+    } else {
+        geminifs_error("geminifs_init: Failed to get GPU controller for device %d\n", current_gpu_id);
+        return;
+    }
+
+    // 标记初始化完成
+    is_init_ = true;
+    
+    geminifs_debug("geminifs_init: Successfully initialized GeminiFS for GPU device %d (reset=%s)\n", 
+                   current_gpu_id, reset ? "true" : "false");
+    geminifs_debug("geminifs_init: File configuration - num_files: %zu, file_size: %zu bytes, total_size: %zu bytes\n", 
+                   init_num_files_, init_file_size_, init_num_files_ * init_file_size_);
 }
 
 __host__ void GeminiFS::cleanup() {

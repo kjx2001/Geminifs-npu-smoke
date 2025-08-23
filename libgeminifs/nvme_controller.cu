@@ -12,6 +12,7 @@
 #include <errno.h>
 #include <filesystem>
 #include <fcntl.h>  // For fallocate
+
 // Static paths for system components
 static char snvme_control_path[] = "/dev/snvm_control";
 static char sys_config_path[] = "/mnt/sys_GPU_NVMe_topology.json";
@@ -53,13 +54,13 @@ NVMeController::NVMeController(const nvme_ctrl_param& params) : is_initialized_(
     
     // Check if maxIOsize is within supported limits (params.maxIOsize is in KB)
     if (params.maxIOsize > 1024) {
-        geminifs_error("NVMeController initialization failed: maxIOsize (%llu KB) exceeds maximum supported size (1024 KB). Current system only supports up to 1MB NVMe I/O\n", params.maxIOsize);
+        geminifs_error("NVMeController initialization failed: maxIOsize (%lu KB) exceeds maximum supported size (1024 KB). Current system only supports up to 1MB NVMe I/O\n", params.maxIOsize);
         throw std::runtime_error("maxIOsize exceeds supported limit of 1024 KB");
     }
     
     // Check if maxIOsize is 4K aligned
     if (maxIOsize % 4096 != 0) {
-        geminifs_error("NVMeController initialization failed: maxIOsize (%llu bytes) is not 4K aligned. maxIOsize must be a multiple of 4096 bytes\n", maxIOsize);
+        geminifs_error("NVMeController initialization failed: maxIOsize (%lu bytes) is not 4K aligned. maxIOsize must be a multiple of 4096 bytes\n", maxIOsize);
         throw std::runtime_error("maxIOsize is not 4K aligned");
     }
     
@@ -259,16 +260,16 @@ void * NVMeController::g_open(std::string filename, size_t file_size, uint32_t o
     return result_fd;
 }
 
-// Helper function for binary bit counting (needed by NVMeController member functions)
-static int one_nr__of__binary_int(unsigned long long i) {
-    int count = 0;
-    while (i != 0) {
-        if ((i & 1) == 1)
-            count++;
-        i = i >> 1;
-    }
-    return count;
-}
+// // Helper function for binary bit counting (needed by NVMeController member functions)
+// static int one_nr__of__binary_int(unsigned long long i) {
+//     int count = 0;
+//     while (i != 0) {
+//         if ((i & 1) == 1)
+//             count++;
+//         i = i >> 1;
+//     }
+//     return count;
+// }
 
 /**
  * NVMeController member function to create a file with automatic FileManager integration
@@ -825,6 +826,94 @@ bool NVMeController::device_file_delete_all_files_managed() {
     return true;
 }
 
+/**
+ * Get the count of files managed by this NVMe controller
+ */
+size_t NVMeController::device_file_get_managed_file_count() const {
+    // Check if controller is properly initialized
+    if (!is_initialized()) {
+        geminifs_error("device_file_get_managed_file_count: NVMeController is not properly initialized\n");
+        return 0;
+    }
+    
+    if (!file_manager) {
+        geminifs_error("device_file_get_managed_file_count: FileManager is not initialized\n");
+        return 0;
+    }
+    
+    // Get all filenames from the FileManager log
+    std::vector<std::string> all_filenames = file_manager->getAllFilenames();
+    
+    geminifs_debug("device_file_get_managed_file_count: Found %zu managed files\n", all_filenames.size());
+    
+    return all_filenames.size();
+}
+
+/**
+ * Validate that all managed files have the expected size
+ */
+size_t NVMeController::device_file_validate_sizes(size_t expected_size) const {
+    // Check if controller is properly initialized
+    if (!is_initialized()) {
+        geminifs_error("device_file_validate_sizes: NVMeController is not properly initialized\n");
+        return 0;
+    }
+    
+    if (!file_manager) {
+        geminifs_error("device_file_validate_sizes: FileManager is not initialized\n");
+        return 0;
+    }
+    
+    // Get all filenames from the FileManager log
+    std::vector<std::string> all_filenames = file_manager->getAllFilenames();
+    
+    if (all_filenames.empty()) {
+        geminifs_debug("device_file_validate_sizes: No files to validate\n");
+        return 0;
+    }
+    
+    geminifs_debug("device_file_validate_sizes: Validating %zu files for expected size %zu bytes\n", 
+                   all_filenames.size(), expected_size);
+    
+    size_t valid_files = 0;
+    
+    for (const auto& filename : all_filenames) {
+        // Build file path using C-style string operations
+        std::string file_path = controller->dev_mount_path;
+        if (file_path.back() != '/') {
+            file_path += "/";
+        }
+        file_path += filename;
+        
+        // Use stat to get file size
+        struct stat file_stat;
+        if (stat(file_path.c_str(), &file_stat) == 0) {
+            size_t file_size = static_cast<size_t>(file_stat.st_size);
+            
+            // For GeminiFS files, we need to account for the header size
+            // The actual data size should be expected_size, but the file includes header
+            size_t expected_total_size = expected_size + GEMINI_HDR_MAX_SIZE;
+            
+            if (file_size == expected_total_size) {
+                valid_files++;
+                geminifs_debug("device_file_validate_sizes: File '%s' has correct size %zu bytes\n", 
+                              filename.c_str(), file_size);
+            } else {
+                geminifs_debug("device_file_validate_sizes: File '%s' has incorrect size %zu bytes (expected %zu bytes), skipping\n", 
+                              filename.c_str(), file_size, expected_total_size);
+            }
+        } else {
+            geminifs_debug("device_file_validate_sizes: Failed to get size of file '%s': %s, skipping\n", 
+                          file_path.c_str(), strerror(errno));
+        }
+    }
+    
+    geminifs_debug("device_file_validate_sizes: Validation complete. Valid files with expected size: %zu out of %zu total files\n", 
+                   valid_files, all_filenames.size());
+    
+    return valid_files;
+}
+
 // GPU device-side read/write interface using NVMeFile pointer
 
 // Global wrapper for external calling from host
@@ -845,7 +934,7 @@ void nvme_controller_g_write_kernel(dev_fd_t device_fd, uint64_t prp1, uint64_t 
 }
 
 __device__
-void * nvme_controller_g_read(dev_fd_t device_fd, uint64_t prp1, uint64_t prp2, size_t file_offset, size_t nbytes)
+void nvme_controller_g_read(dev_fd_t device_fd, uint64_t prp1, uint64_t prp2, size_t file_offset, size_t nbytes)
 {
     auto *nvme_file = (NVMe_File*)device_fd;
     // Call the read method on the NVMe_File instance
@@ -853,10 +942,110 @@ void * nvme_controller_g_read(dev_fd_t device_fd, uint64_t prp1, uint64_t prp2, 
 }
 
 __device__
-void * nvme_controller_g_write(dev_fd_t device_fd, uint64_t prp1, uint64_t prp2, size_t file_offset, size_t nbytes)
+void nvme_controller_g_write(dev_fd_t device_fd, uint64_t prp1, uint64_t prp2, size_t file_offset, size_t nbytes)
 {
     auto *nvme_file = (NVMe_File*)device_fd;
     // Call the write method on the NVMe_File instance
     nvme_file->write_out(prp1, prp2, file_offset, nbytes);
+}
+
+/**
+ * Create a managed file without opening it - only creates the file with proper header and size
+ * This function is optimized for file creation without the overhead of maintaining file descriptors
+ */
+bool NVMeController::host_file_create_only_managed(int block_size, size_t file_size, const std::string& filename) {
+    // Check if controller is properly initialized
+    if (!is_initialized()) {
+        geminifs_error("host_file_create_only_managed: NVMeController is not properly initialized\n");
+        return false;
+    }
+    
+    assert(file_size % block_size == 0);
+
+    auto nvpage_size = controller->page_size;
+    assert(block_size % nvpage_size == 0);
+
+    auto hdr_size = GEMINI_HDR_MAX_SIZE;
+
+    // Allocate host memory for the header
+    struct geminiFS_hdr *hdr = (struct geminiFS_hdr *)malloc(hdr_size);
+    if (!hdr) {
+        geminifs_error("host_file_create_only_managed: Failed to allocate memory for header\n");
+        return false;
+    }
+    
+    // Build file path using helper function (avoiding std::filesystem)
+    std::string file_path = build_file_path(controller->dev_mount_path, filename);
+    
+    // Create directory if it doesn't exist
+    if (!create_directories(controller->dev_mount_path)) {
+        geminifs_error("host_file_create_only_managed: Failed to create directory '%s'\n", controller->dev_mount_path.c_str());
+        free(hdr);
+        return false;
+    }
+    
+    // Initialize header
+    hdr->magic_num = the_geminiFS_magic.magic_num;
+    hdr->first_block_base = hdr_size;
+    hdr->virtual_space_size = file_size;
+    hdr->block_bit = __builtin_clzll(block_size); // Block size in bits
+
+    // Create and write file, then immediately close
+    int fd = open(file_path.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0666);
+    if (fd < 0) {
+        geminifs_error("host_file_create_only_managed: Failed to create file '%s': %s\n", 
+                      file_path.c_str(), strerror(errno));
+        free(hdr);
+        return false;
+    }
+    
+    // Set file size using fallocate to actually allocate space
+    if (fallocate(fd, 0, 0, hdr_size + file_size) != 0) {
+        geminifs_error("host_file_create_only_managed: Failed to allocate file space for '%s': %s\n", 
+                      file_path.c_str(), strerror(errno));
+        close(fd);
+        free(hdr);
+        return false;
+    }
+    
+    // Set temporary fd for header operations
+    hdr->fd = fd;
+    
+    // Refine NVMe offsets
+    host_refine_nvmeofst(hdr);
+    
+    // Write header to file
+    if (write(fd, hdr, hdr_size) != (ssize_t)hdr_size) {
+        geminifs_error("host_file_create_only_managed: Failed to write header to file '%s': %s\n", 
+                      file_path.c_str(), strerror(errno));
+        close(fd);
+        free(hdr);
+        return false;
+    }
+    
+    // Close file immediately - we only created it, don't need to keep it open
+    close(fd);
+    
+    // Create file record in log for consistency with g_open behavior
+    if (file_manager != nullptr) {
+        NVMeFileDesc new_desc;
+        if (!file_manager->createFile(filename, new_desc, file_size)) {
+            geminifs_error("host_file_create_only_managed: Failed to create file record in log for '%s'\n", filename.c_str());
+            // Clean up the created physical file
+            unlink(file_path.c_str());
+            free(hdr);
+            return false;
+        }
+        geminifs_debug("host_file_create_only_managed: Created file record in log for '%s' with slot %u\n", 
+                      filename.c_str(), new_desc.slot_index);
+    }
+    
+    // Clean up header memory
+    free(hdr);
+    
+    geminifs_debug("host_file_create_only_managed: Created file '%s' with size %zu, hdr_size %zu (file closed)\n", 
+                   filename.c_str(), file_size, hdr_size);
+    
+    return true;
 }
 

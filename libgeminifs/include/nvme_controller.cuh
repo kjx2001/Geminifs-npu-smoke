@@ -52,6 +52,7 @@ public:
 
     // Managed file operations - automatically handle file descriptor tracking
     host_fd_t host_file_create_managed(int block_size, size_t file_size, const std::string& filename);
+    bool host_file_create_only_managed(int block_size, size_t file_size, const std::string& filename);
     host_fd_t host_file_open_managed(const std::string& filepath, uint32_t o_flag);
     void host_file_close_managed(host_fd_t fd);
 
@@ -62,6 +63,12 @@ public:
     
     // delete up all files managed by this controller
     bool device_file_delete_all_files_managed();
+    
+    // Get the count of managed files
+    size_t device_file_get_managed_file_count() const;
+    
+    // Validate files with expected size and return count of valid files
+    size_t device_file_validate_sizes(size_t expected_size) const;
     
     // Check if controller is properly initialized
     bool is_initialized() const { return is_initialized_; }
@@ -91,10 +98,10 @@ private:
 using NVMeControllerPtr = std::shared_ptr<NVMeController>;
 
 __device__
-void * nvme_controller_g_read(dev_fd_t device_fd, uint64_t prp1, uint64_t prp2, size_t file_offset, size_t nbytes);
+void nvme_controller_g_read(dev_fd_t device_fd, uint64_t prp1, uint64_t prp2, size_t file_offset, size_t nbytes);
 
 __device__
-void * nvme_controller_g_write(dev_fd_t device_fd, uint64_t prp1, uint64_t prp2, size_t file_offset, size_t nbytes);
+void nvme_controller_g_write(dev_fd_t device_fd, uint64_t prp1, uint64_t prp2, size_t file_offset, size_t nbytes);
 
 __global__
 void nvme_controller_g_read_kernel(dev_fd_t device_fd, uint64_t prp1, uint64_t prp2, size_t file_offset, size_t nbytes);

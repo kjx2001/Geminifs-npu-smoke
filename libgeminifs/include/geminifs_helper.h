@@ -91,9 +91,12 @@ bool is_ptr_aligned(const void* ptr, size_t alignment = 65536ul);
 bool is_device_pointer(const void* ptr, const char* error_msg = nullptr);
 cudaError_t cudaMallocAligned(void** alignedPtr, void** rawPtr, size_t size, size_t alignment=4096);
 
+// User confirmation for destructive operations
+bool confirm_dangerous_operation(const std::string& operation_description);
+
 ParsedSystemConfig parse_system_config(const std::string& config_file_path);
 std::vector<nvme_ctrl_param> convert_to_nvme_ctrl_params(const ParsedSystemConfig& config);
-
+std::vector<nvme_ctrl_param> convert_to_nvme_ctrl_params_group(const SystemConfigGroup & group_config);
 #define geminifs_info(fmt, ...) \
     printf("[INFO][%s:%d] %s: " fmt "", __FILE__, __LINE__, __func__, ##__VA_ARGS__);
 
@@ -111,5 +114,9 @@ std::vector<nvme_ctrl_param> convert_to_nvme_ctrl_params(const ParsedSystemConfi
 #define geminifs_debug(fmt, ...) \
 
 #endif
+
+// File system utility functions
+std::string build_file_path(const std::string& directory, const std::string& filename);
+bool create_directories(const std::string& path);
 
 #endif

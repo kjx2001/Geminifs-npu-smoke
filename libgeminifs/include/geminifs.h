@@ -87,11 +87,7 @@ host_create_geminifs_file(void *buf,
                           const char *filename,
                           uint64_t block_size,
                           uint64_t virtual_space_size);
-extern host_fd_t
-host_create_geminifs_file_1(const char *filename,
-                          uint64_t block_size,
-                          uint64_t page_size,
-                          uint64_t virtual_space_size);
+
 
 extern host_fd_t
 host_open_geminifs_file(const char *filename);

@@ -38,10 +38,10 @@ __host__ DmaPtr createDmaTest(int idx, size_t block_size, int device);
 __host__
 DmaPtr getdeviceDmaTest(int idx, void* buffer, size_t size, int cudaDevice);
 
-/**
- * Create and register a GPU controller for a specific device
- */
-__host__ GPUControllerPtr geminifs_create_gpu_controller(int device_id, const std::string& mount_base_path);
+// /**
+//  * Create and register a GPU controller for a specific device
+//  */
+// __host__ GPUControllerPtr geminifs_create_gpu_controller(int device_id, const std::string& mount_base_path);
 
 /**
  * Get GPU controller for a specific device
@@ -85,9 +85,10 @@ __host__ bool geminifs_nvme_delete_all_files(int device_id, size_t controller_in
 
 class GeminiFS {
     public:
-        GeminiFS(const std::string& config_file_path) {
-            init(config_file_path);
+        GeminiFS(const std::string& config_file_path, size_t num_files = 0, size_t file_size = 0, bool reset = false) {
+            init(config_file_path, num_files, file_size, reset);
         }
+
         ~GeminiFS() {
             cleanup();
         }
@@ -141,6 +142,14 @@ class GeminiFS {
          * Delete all files managed by a specific NVMe controller
          */
         __host__ bool geminifs_nvme_delete_all_files(int device_id, size_t controller_index = 0);
+
+        /**
+         * Get initialization parameters - file configuration
+         */
+        __host__ size_t get_init_num_files() const { return init_GPU_num_files_; }
+        __host__ size_t get_init_file_size() const { return init_GPU_file_size_; }
+        __host__ size_t get_total_init_storage_size() const { return init_GPU_num_files_ * init_GPU_file_size_; }
+        __host__ bool is_initialized() const { return is_init_; }
     private:
         /**
          * Add an NVMe controller to a GPU controller
@@ -150,7 +159,7 @@ class GeminiFS {
         /**
          * Initialize GeminiFS
          */
-        __host__ void init(const std::string& config_file_path);
+        __host__ void init(const std::string& config_file_path, size_t num_files = 0, size_t file_size = 0, bool reset = false);
 
         /**
          * Cleanup GeminiFS
@@ -174,6 +183,11 @@ class GeminiFS {
         std::list<GPUFileId> links_cache_lru_;
 
         bool is_init_ = false;
+        
+        // 初始化参数 - 文件配置
+        size_t init_GPU_num_files_ = 0;      // 需要创建的文件个数
+        size_t init_GPU_file_size_ = 0;      // 每个文件的大小
+        
         GPUFileManager gpu_file_manager_;
         std::vector<GPUControllerPtr> gpu_controllers_;
         std::vector<nvme_ctrl_param> nvme_params_;

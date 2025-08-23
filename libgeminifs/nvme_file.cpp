@@ -371,7 +371,7 @@ void FileManager::persistBitmap() {
 
     fflush(log_file_handle_);
 
-    std::cout << "Bitmap and header persisted. " << pending_writes_count_ << " pending writes cleared." << std::endl;
+    // std::cout << "Bitmap and header persisted. " << pending_writes_count_ << " pending writes cleared." << std::endl;
     pending_writes_count_ = 0;
 }
 

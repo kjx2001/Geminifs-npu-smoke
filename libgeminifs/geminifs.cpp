@@ -52,12 +52,6 @@ static rawfile_ofst_t host__convert_va__to(host_fd_t host_fd, vaddr_t va) {
 
 
 #define ROUND_UP(x, align)(((uint64_t) (x) + ((uint64_t)align - 1)) & ~((uint64_t)align - 1))
-host_fd_t host_create_geminifs_file_1(const char *filename,
-                          uint64_t block_size,
-			  uint64_t page_size,
-                          uint64_t virtual_space_size) {
-	return host_create_geminifs_file(filename, block_size, ROUND_UP(virtual_space_size, page_size));
-}
 
 #define FILE_BLOCK_SIZE 512 // disk block size
 static inline struct fiemap *read_fiemap(int fd, u_int64_t fiemap_start, u_int64_t fiemap_length);

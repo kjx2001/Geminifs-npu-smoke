@@ -56,6 +56,7 @@ static __device__ void cuda_device_assert(cudaError_t code, const char *file, in
 #define cuda_device_check_error(ans) { cuda_device_assert((ans), __FILE__, __LINE__); }
 // page macros
 #define __128KB__ 128 * (1ull << 10)
+#define __64KB__  64 * (1ull << 10)
 #define __4KB__  4096ul
 #define __WORD__ 8
 #define MAX_BLOCK_SIZE __128KB__

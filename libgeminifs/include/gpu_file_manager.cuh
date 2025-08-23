@@ -81,7 +81,7 @@ public:
      * @param max_files GPU端查找表能容纳的最大文件数
      */
     explicit GPUFileManager(const std::string& file_prefix = default_db_path_prefix, 
-                            size_t gpu_heap_size_gb = 70,
+                            size_t gpu_heap_size_gb = 1,
                             uint32_t max_files = NUM_FILES); // Default to 100k files
     
     /**

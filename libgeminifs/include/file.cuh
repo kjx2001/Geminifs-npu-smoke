@@ -22,7 +22,7 @@
 #include "geminifs_helper.h"
 #include "geminifs.h"
 
-constexpr uint32_t NUM_FILES = 100000;
+constexpr uint32_t NUM_FILES = 1000000;
 
 typedef enum FileXferType {
     FILE_XFER_READ = 0,
@@ -80,17 +80,15 @@ private:
         }
 
         assert(false && "Invalid virtual address for NVMe offset calculation");
+        return 0;
     }
 
     __forceinline__ __device__ void nvme_xfer(size_t file_offset, size_t nbytes,
          uint64_t prp1, uint64_t prp2, FileXferType type)
     {
-        auto nvme_page_size = this->nvme_page_size;
-
-
         auto queue_acquire_helper = this->queue_acquire_helper;
-        assert(nbytes % nvme_page_size == 0);
-        assert(file_offset % nvme_page_size == 0);
+        assert(nbytes % this->nvme_page_size == 0);
+        assert(file_offset % this->nvme_page_size == 0);
         nvme_ofst_t nvme_ofst = __get_nvmeofst(file_offset);
         uint64_t starting_lba = nvme_ofst >> hqps_block_size_log;
         // printf("NVMe_File: nvme_ofst: %lx, starting_lba: %lx, nbytes: %zu\n", 
@@ -100,7 +98,6 @@ private:
 
         uint64_t n_blocks = nbytes >> hqps_block_size_log;
         uint16_t cid;
-        uint16_t sq_pos;
         // printf("NVMe_File: queue %d, n_blocks %lu, starting_lba %lx\n", 
         //        queue, (unsigned long)n_blocks, (unsigned long)starting_lba);
         queue_acquire_helper->issue_nvme_cmd(qp,

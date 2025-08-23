@@ -602,7 +602,7 @@ bool GPUController::registerTensorMemory(const torch::Tensor& tensor, uint64_t g
     
     // Check 4K alignment for granularity (if specified)
     if (granularity > 0 && granularity % 4096 != 0) {
-        geminifs_error("GPU Controller: Granularity %llu is not 4K aligned. Memory registration failed.\n", granularity);
+        geminifs_error("GPU Controller: Granularity %lu is not 4K aligned. Memory registration failed.\n", granularity);
         return false;
     }
     
@@ -772,7 +772,6 @@ void* GPUController::openFile(GPUFileId gpu_file_id,
     std::vector<size_t> all_controller_indexes;
     std::vector<size_t> all_nvme_file_sizes; // per-link sizes
 
-    size_t cumulative_offset = 0;
     size_t remaining_file_size = file_size;
     for (size_t i = 0; i < nvme_controllers_.size(); ++i) {
         auto& nvme_controller = nvme_controllers_[i];
@@ -1028,7 +1027,7 @@ geminifs_dma* GPUController::createDMAContext(const torch::Tensor& tensor, uint6
     // 如果指定了切割粒度（非0），检查tensor大小是否为粒度的整数倍
     if (granularity > 0 && tensor_size > tensor_size) {
         if (tensor_size % granularity != 0) {
-            geminifs_error("GPU Controller: Tensor size %zu is not a multiple of granularity %llu. Memory registration failed.\n", 
+            geminifs_error("GPU Controller: Tensor size %zu is not a multiple of granularity %lu. Memory registration failed.\n", 
                           tensor_size, granularity);
             return nullptr;
         }
