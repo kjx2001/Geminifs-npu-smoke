@@ -85,8 +85,8 @@ __host__ bool geminifs_nvme_delete_all_files(int device_id, size_t controller_in
 
 class GeminiFS {
     public:
-        GeminiFS(const std::string& config_file_path, size_t num_files = 0, size_t file_size = 0, bool reset = false) {
-            init(config_file_path, num_files, file_size, reset);
+        GeminiFS(const std::string& config_file_path, int GPU_file_nums, const std::vector<size_t>& GPU_file_shape, bool reset = false) {
+            init(config_file_path, GPU_file_nums, GPU_file_shape, reset);
         }
 
         ~GeminiFS() {
@@ -159,28 +159,25 @@ class GeminiFS {
         /**
          * Initialize GeminiFS
          */
-        __host__ void init(const std::string& config_file_path, size_t num_files = 0, size_t file_size = 0, bool reset = false);
+        __host__ void init(const std::string& config_file_path, int GPU_file_nums ,const std::vector<size_t>& GPU_file_shape, bool reset = false);
+
+        /**
+         * Parse and setup GPU and NVMe controllers from config file
+         */
+        __host__ bool parse_and_setup_controllers(const std::string& config_file_path, int current_gpu_id);
+
+        /**
+         * Handle GPU file reset operations
+         */
+        __host__ void handle_gpu_file_reset(int current_gpu_id);
 
         /**
          * Cleanup GeminiFS
          */
         __host__ void cleanup();
         
-        // NVMe_Link 主机端缓存（LRU，最大 5GB）
-        struct CachedLinksEntry {
-            std::vector<NVMe_Link> links;
-            size_t bytes;
-            std::list<GPUFileId>::iterator lru_it;
-        };
-        bool get_links_cached(GPUFileId file_id, std::vector<NVMe_Link>& out_links);
-        void put_links_cache(GPUFileId file_id, const std::vector<NVMe_Link>& links);
-        void touch_links_cache(GPUFileId file_id);
-        void evict_links_cache_if_needed();
 
-        static constexpr size_t LINKS_CACHE_MAX_BYTES = 5ULL * 1024ULL * 1024ULL * 1024ULL;
-        size_t links_cache_bytes_ = 0;
-        std::unordered_map<GPUFileId, CachedLinksEntry> links_cache_;
-        std::list<GPUFileId> links_cache_lru_;
+
 
         bool is_init_ = false;
         
@@ -188,7 +185,7 @@ class GeminiFS {
         size_t init_GPU_num_files_ = 0;      // 需要创建的文件个数
         size_t init_GPU_file_size_ = 0;      // 每个文件的大小
         
-        GPUFileManager gpu_file_manager_;
+        std::unique_ptr<GPUFileManager> gpu_file_manager_; // 用于GPU文件管理（open create delete）， 以及相应的持久化
         std::vector<GPUControllerPtr> gpu_controllers_;
         std::vector<nvme_ctrl_param> nvme_params_;
 };

@@ -98,8 +98,7 @@ private:
 
         uint64_t n_blocks = nbytes >> hqps_block_size_log;
         uint16_t cid;
-        // printf("NVMe_File: queue %d, n_blocks %lu, starting_lba %lx\n", 
-        //        queue, (unsigned long)n_blocks, (unsigned long)starting_lba);
+
         queue_acquire_helper->issue_nvme_cmd(qp,
             prp1,
             prp2, // fixme
@@ -145,68 +144,50 @@ struct NVMe_Link {
     size_t   controller_index;
     size_t   file_size;       // per-link NVMe file size (chunk size)
 };
-/**
- * @class GPU_File
- * @brief A __host__ __device__ compatible class that represents a file in GPU memory.
- *
- * This class acts as a handle. An instance of this class is stored in the GPU heap,
- * and it points to an array of NVMeFileLink objects, which are also in the GPU heap.
- * Kernels can access file metadata through this object.
- */
-class GPU_File {
-private:
-    NVMe_Link* links_;          // Pointer to the array of links in the GPU heap
-    uint32_t      num_links_;      // Number of links in the array
-    size_t        total_file_size_;
-    size_t        block_size_;
+// /**
+//  * @class GPU_File
+//  * @brief A __host__ __device__ compatible class that represents a file in GPU memory.
+//  *
+//  * This class acts as a handle. An instance of this class is stored in the GPU heap,
+//  * and it points to an array of NVMeFileLink objects, which are also in the GPU heap.
+//  * Kernels can access file metadata through this object.
+//  */
+// class GPU_File {
+// private:
+//     NVMe_Link* links_;          // Pointer to the array of links in the GPU heap
+//     uint32_t      num_links_;      // Number of links in the array
+//     size_t        total_file_size_; // Total size of the GPU file (sum of all NVMe file sizes) 
 
-public:
-    // Constructor usable from both host and device
-    __host__ __device__ GPU_File(NVMe_Link* links, uint32_t num_links, size_t total_size, size_t blk_size)
-        : links_(links), num_links_(num_links), total_file_size_(total_size), block_size_(blk_size) {}
+// public:
+//     // Constructor usable from both host and device
+//     __host__ __device__ GPU_File(NVMe_Link* links, uint32_t num_links, size_t total_size, size_t blk_size)
+//         : links_(links), num_links_(num_links), total_file_size_(total_size) {}
 
-    // --- Device-side Accessors for Kernels ---
+//     // --- Device-side Accessors for Kernels ---
 
-    __device__ uint32_t getNrFiles() const {
-        return num_links_;
-    }
+//     __device__ uint32_t getNrFiles() const {
+//         return num_links_;
+//     }
 
-    /**
-     * @brief Retrieves a specific NVMe file link by index.
-     * @param index The index of the link to retrieve.
-     * @param out_link [out] The retrieved link data.
-     * @return True if the index is valid, false otherwise.
-     */
-    __device__ bool getNVMeFileLink(uint32_t index, NVMe_Link& out_link) const {
-        if (links_ == nullptr || index >= num_links_) {
-            return false;
-        }
-        // Direct memory copy from the GPU heap (pointed to by links_) to the kernel's local memory (out_link)
-        out_link = links_[index];
-        return true;
-    }
+//     /**
+//      * @brief Retrieves a specific NVMe file link by index.
+//      * @param index The index of the link to retrieve.
+//      * @param out_link [out] The retrieved link data.
+//      * @return True if the index is valid, false otherwise.
+//      */
+//     __device__ bool getNVMeFileLink(uint32_t index, NVMe_Link& out_link) const {
+//         if (links_ == nullptr || index >= num_links_) {
+//             return false;
+//         }
+//         // Direct memory copy from the GPU heap (pointed to by links_) to the kernel's local memory (out_link)
+//         out_link = links_[index];
+//         return true;
+//     }
 
-    __device__ size_t getTotalFileSize() const { return total_file_size_; }
-    __device__ size_t getBlockSize() const { return block_size_; }
-};
+//     __device__ size_t getTotalFileSize() const { return total_file_size_; }
+//     __device__ size_t getBlockSize() const { return block_size_; }
+// };
 
-
-/**
- * @brief Device function to look up a GPU_File pointer from the GPU-side lookup table.
- *
- * This is the main entry point for a kernel to get access to a file's metadata.
- *
- * @param lookup_table The base pointer to the GPU-side lookup table (GPU_File**).
- * @param file_id The ID of the file to retrieve.
- * @param max_files The maximum number of files the lookup table can hold (for bounds checking).
- * @return A pointer to the GPU_File object in the GPU heap, or nullptr if not found or out of bounds.
- */
-__device__ inline GPU_File* get_gpu_file_by_id(GPU_File** lookup_table, GPUFileId file_id, uint32_t max_files) {
-    if (lookup_table == nullptr || file_id >= max_files) {
-        return nullptr;
-    }
-    return lookup_table[file_id];
-}
 
 
 #endif

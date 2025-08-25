@@ -439,11 +439,7 @@ public:
     
     GPUMemoryMapper* getMemoryMapper() const { return memory_mapper_.get(); }
 
-    /**
-     * Get memory usage statistics
-     * @return Pair of (used_memory, total_registered_tensors)
-     */
-    std::pair<size_t, size_t> getMemoryStats() const;
+
 
 private:
     // === Private Members ===

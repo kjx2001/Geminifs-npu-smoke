@@ -49,52 +49,6 @@
 #include "nvme_controller.cuh"
 #include "geminifs_helper.h"
 #include "gpu_controller.cuh"
-// static char snvme_control_path[] = "/dev/snvm_control";
-// static char sys_config_path[] = "/mnt/sys_GPU_NVMe_topology.json";
-
-    
-// Global helper functions for checking system components
-// static inline bool check_snvme_control_exists() {
-//     if (access(snvme_control_path, F_OK) != 0) {
-//         geminifs_error("SNVM control device '%s' does not exist. Please ensure the kernel module is properly installed.\n", snvme_control_path);
-//         return false;
-//     }
-//     return true;
-// }
-
-// static inline bool check_sys_config_exists() {
-//     if (access(sys_config_path, F_OK) != 0) {
-//         geminifs_error("Sys GPU-NVMe topology '%s' does not exist. Please ensure the kernel module is properly installed.\n", sys_config_path);
-//         return false;
-//     }
-//     return true;
-// }
-
-// static inline void host_close_ctrls(struct geminifs_metadata *metadata){
-//     for (auto &ctrl : metadata->ctrls) {
-//         ctrl.reset();
-//     }
-//     metadata->ctrls.clear();
-// }
-
-// void host_close_all(){
-//     for (auto &kv : global_metadata) {
-//         auto metadata = kv.second;
-//         if (metadata->is_init) {
-//             host_close_ctrls(metadata);
-//             metadata->is_init = false;
-//         }
-//     }
-//     global_metadata.clear();
-// }
-
-// force close all controllers when the program exits
-// __attribute__((destructor))
-// static void clean_geminifs() {
-//     host_close_all();
-// }
-
-
 
 
 
@@ -108,628 +62,6 @@ struct DMAInfo{
 
 
 
-
-
-
-
-
-
-
-// static inline geminifs_metadata* __geminifs_init(struct geminifs_ctrl_params &ctrl_params, 
-//                                                 size_t nr_files, size_t file_size, size_t file_block_size) {
-//     assert(nr_files > 0);
-
-//     // check current device 
-//     int current_device;
-//     cuda_check_error(cuda_getDevice(&current_device));
-//     if (current_device != ctrl_params.cudaDevice) {
-//         geminifs_warn("geminifs_init_fds_wrapper_cuda: current device %d is not the same as ctrl_params.cudaDevice %d\n", 
-//                         current_device, ctrl_params.cudaDevice);
-//         // cuda_check_error(cudaSetDevice(ctrl_params.cudaDevice));
-//     }
-
-//     geminifs_debug("geminifs_init_fds_wrapper_cuda: current device %d, ctrl_params.cudaDevice %d\n", 
-//                         current_device, ctrl_params.cudaDevice);
-//     file_size = ROUND_UP(file_size, file_block_size);
-//     GPUPoolId this_pool_id = (GPUPoolId)time(NULL); //unique pool id
-//     std::vector<ControllerPtr> ctrls = host_open_ctrls(&ctrl_params);
-//     auto files = geminifs_batch_create(ctrls, this_pool_id, nr_files, 
-//         file_block_size, file_size, ctrl_params.cudaDevice);
-
-//     GPUFilePool *pool;
-//     uint16_t *is_allocated;
-//     cuda_check_error(cudaMalloc(&pool, sizeof(GPUFilePool)));
-//     cuda_check_error(cudaMalloc(&is_allocated, nr_files  * sizeof(uint16_t)));
-//     cuda_check_error(cudaMemset(is_allocated, 0x0, nr_files * sizeof(uint16_t)));
-    
-    
-//     RUN_ON_DEVICE({
-//         new (pool) GPUFilePool(files, is_allocated, file_size, file_block_size, nr_files);
-//         pool->set_pool_id(this_pool_id);
-//     });
-
-//     std::vector<cudaStream_t> streams(32);
-//     for (size_t i = 0; i < 32; i++) {
-//         cudaStreamCreateWithFlags(&streams[i], cudaStreamNonBlocking);
-//     }
-
-//     return new geminifs_metadata{
-//         .ctrls = std::move(ctrls),
-//         .is_init = true,
-//         .global_pool = thrust::device_pointer_cast(pool),
-//         .pool_id = this_pool_id,
-//         .file_size = file_size,
-//         .file_block_size = file_block_size,
-//         .streams = std::move(streams)
-//     };
-// }
-
-
-// /*----------------------Xfer-------------------*/
-// __global__ void 
-// __geminifs_device_batch_xfer(GPUFilePool *global_pool, 
-//                             cuda::std::span<GPUFileId> file_ids,
-//                             cuda::std::span<uint64_t> ioaddr,
-//                             size_t file_offset, 
-//                             size_t nbytes, enum FileXferType type){
-//     size_t nr_block = gridDim.x;
-//     size_t nr_thread_per_block = blockDim.x;
-//     assert(nr_block == file_ids.size());
-//     assert(nr_thread_per_block == 32);
-//     assert(nbytes % GPU_PAGE_SIZE == 0);
-    
-//     size_t nbytes__per_thread = std::max(nbytes / 32, GPU_PAGE_SIZE);
-
-//     int lane = my_lane_id();
-//     geminifs_debug("file_ids[blockIdx.x] %ld\n", file_ids[blockIdx.x]);
-//     auto file = global_pool->get_file(file_ids[blockIdx.x]);
-//     if (lane == 0) {
-//         file->scatter_ioaddrs(ioaddr, file_offset, nbytes);
-//     }
-
-//     __syncwarp();
-//     size_t this_thread_file_offset = file_offset + lane * nbytes__per_thread;
-//     if (lane * nbytes__per_thread  + nbytes__per_thread > nbytes) {
-//         return;
-//     }
-
-//     if (type == FILE_XFER_READ) {
-//         file->read_in(this_thread_file_offset, nbytes__per_thread);
-//     } else {
-//         file->write_out(this_thread_file_offset, nbytes__per_thread);
-//     }
-// }
-
-// __global__ void 
-// __geminifs_device_batch_xfer_once(GPUFilePool *global_pool, 
-//                             GPUFileId file_id, uint64_t ioaddr,
-//                             size_t file_offset, size_t nbytes, 
-//                             enum FileXferType type){
-//     size_t nr_block = gridDim.x;
-//     size_t nr_thread_per_block = blockDim.x;
-//     assert(nr_block == 1);
-//     assert(nr_thread_per_block == 32);
-//     assert(nbytes % GPU_PAGE_SIZE == 0);
-    
-//     size_t nbytes__per_thread = std::max(nbytes / 32, GPU_PAGE_SIZE);
-
-//     int lane = my_lane_id();
-//     auto file = global_pool->get_file(file_id);
-//     if (lane == 0) {
-//         file->scatter_ioaddrs(ioaddr, file_offset, nbytes);
-//     }
-
-//     __syncwarp();
-//     size_t this_thread_file_offset = file_offset + lane * nbytes__per_thread;
-//     if (lane * nbytes__per_thread  + nbytes__per_thread > nbytes) {
-//         return;
-//     }
-
-//     if (type == FILE_XFER_READ) {
-//         file->read_in(this_thread_file_offset, nbytes__per_thread);
-//     } else {
-//         file->write_out(this_thread_file_offset, nbytes__per_thread);
-//     }
-// }
-
-// __global__ void 
-// __geminifs_device_batch_xfer_once2(GPUFilePool *global_pool, 
-//                             GPUFileId file_id, cuda::std::span<uint64_t> ioaddr,
-//                             size_t file_offset, size_t nbytes, 
-//                             enum FileXferType type){
-//     size_t nr_block = gridDim.x;
-//     size_t nr_thread_per_block = blockDim.x;
-//     assert(nr_block == 1);
-//     assert(nr_thread_per_block == 32);
-//     assert(nbytes % GPU_PAGE_SIZE == 0);
-    
-//     size_t nbytes__per_thread = std::max(nbytes / 32, GPU_PAGE_SIZE);
-
-//     int lane = my_lane_id();
-//     auto file = global_pool->get_file(file_id);
-//     if (lane == 0) {
-//         file->scatter_ioaddrs(ioaddr, file_offset, nbytes);
-//     }
-
-//     __syncwarp();
-//     size_t this_thread_file_offset = file_offset + lane * nbytes__per_thread;
-//     if (lane * nbytes__per_thread  + nbytes__per_thread > nbytes) {
-//         return;
-//     }
-
-//     if (type == FILE_XFER_READ) {
-//         file->read_in(this_thread_file_offset, nbytes__per_thread);
-//     } else {
-//         file->write_out(this_thread_file_offset, nbytes__per_thread);
-//     }
-// }
-
-// __global__ void 
-// __geminifs_device_batch_xfer(GPUFilePool *global_pool, 
-//                             cuda::std::span<GPUFileId> file_ids,
-//                             cuda::std::span<uint64_t> block_ids,
-//                             cuda::std::span<uint64_t> ioaddr, 
-//                             size_t per_chuck_size, // per_chuck_size = chuck_size * block_size
-//                             size_t file_offset, enum FileXferType type){
-//     size_t nr_block = gridDim.x;
-//     size_t nr_thread_per_block = blockDim.x;
-//     assert(nr_block == file_ids.size());
-//     assert(nr_thread_per_block == 32);
-//     assert(per_chuck_size % global_pool->file_block_size == 0);
-    
-//     size_t nbytes__per_thread = std::max(per_chuck_size / 32, global_pool->file_block_size);
-
-//     int lane = my_lane_id();
-//     auto file = global_pool->get_file(file_ids[blockIdx.x]);
-//     if (lane == 0) {
-//         // fixme
-//         file->scatter_ioaddrs(ioaddr, file_offset, per_chuck_size);
-//         // file
-//     }
-
-//     __syncwarp();
-//     size_t this_thread_file_offset = file_offset + lane * nbytes__per_thread;
-//     if (lane * nbytes__per_thread  + nbytes__per_thread > per_chuck_size) {
-//         return;
-//     }
-
-//     if (type == FILE_XFER_READ) {
-//         file->read_in(this_thread_file_offset, nbytes__per_thread);
-//     } else {
-//         file->write_out(this_thread_file_offset, nbytes__per_thread);
-//     }
-// }
-
-
-// __global__ void 
-// __geminifs_device_batch_xfer(GPUFilePool *global_pool, 
-//                             cuda::std::span<GPUFileId> file_ids,
-//                             cuda::std::span<uint64_t> block_ids,
-//                             uint64_t ioaddr, size_t per_chuck_size, // per_chuck_size = chuck_size * block_size
-//                             size_t file_offset, enum FileXferType type){
-//     size_t nr_block = gridDim.x;
-//     size_t nr_thread_per_block = blockDim.x;
-//     assert(nr_block == file_ids.size());
-//     assert(nr_thread_per_block == 32);
-//     assert(per_chuck_size % global_pool->file_block_size == 0);
-    
-//     size_t nbytes__per_thread = std::max(per_chuck_size / 32, global_pool->file_block_size);
-//     int lane = my_lane_id();
-//     auto file = global_pool->get_file(file_ids[blockIdx.x]);
-    
-//     if (lane == 0) {
-//         auto this_block_ioaddr = ioaddr + block_ids[blockIdx.x] * per_chuck_size;
-//         file->scatter_ioaddrs(this_block_ioaddr, file_offset, per_chuck_size);
-//     }
-//     __syncwarp();
-
-
-//     size_t this_thread_file_offset = file_offset + lane * nbytes__per_thread;
-//     if (lane * nbytes__per_thread  + nbytes__per_thread > per_chuck_size) {
-//         return;
-//     }
-//     if (type == FILE_XFER_READ) {
-//         // geminifs_debug("read_in, file[%p]:this_thread_file_offset %ld, nbytes__per_thread %ld\n", file, this_thread_file_offset, nbytes__per_thread);
-//         file->read_in(this_thread_file_offset, nbytes__per_thread);
-//         // geminifs_debug("read_in done\n");
-//     } else {
-//         file->write_out(this_thread_file_offset, nbytes__per_thread);
-//     }
-//     global_pool->put_file(file_ids[blockIdx.x]);
-// }
-
-
-
-
-
-
-
-// static inline bool __geimifs_device_one_layer_xfer(
-//     const torch::Tensor &cached_file_ids,   //shape = [num_cached_files,]
-//     const torch::Tensor &inner_block_ids,  // shape = [num_cached_files,]
-//     const torch::Tensor &key_cache,         // shape = [max_num_block, block_size, num_heads, head_size]
-//     const torch::Tensor &value_cache,       // shape = [max_num_block, block_size, num_heads, head_size]
-//     int64_t start_layer_idx, enum FileXferType type,
-//     struct geminifs_metadata *metadata, 
-//     cudaStream_t stream) {
-    
-//     int max_num_block = key_cache.size(0);
-//     int block_size = key_cache.size(1);
-//     int num_heads = key_cache.size(2);
-//     int head_size = key_cache.size(3);
-    
-//     uint64_t block_nbytes = block_size * num_heads * head_size * key_cache.element_size();
-//     uint64_t layer_stride = 2 * block_nbytes;
-//     uint64_t key_file_offset = start_layer_idx * layer_stride;
-//     uint64_t value_file_offset = key_file_offset + block_nbytes;
-
-//     if (block_nbytes & (metadata->file_block_size - 1)) { // to avoid xfer to other page
-//         geminifs_error("block_nbytes %ld is not aligned to file block size\n", block_nbytes);
-//         return false;
-//     }
-
-//     struct geminifs_dma *key_dma_ctx, *value_dma_ctx;
-//     if ((key_dma_ctx = geminifs_get_dma(key_cache)) == nullptr) {
-//         geminifs_error("geminifs_device_xfer_wrapper_cuda: key_cache.data_ptr() %p has not been initialized\n", key_cache.data_ptr());
-//         return false;
-//     }
-
-//     if ((value_dma_ctx = geminifs_get_dma(value_cache)) == nullptr) {
-//         geminifs_error("geminifs_device_xfer_wrapper_cuda: value_cache.data_ptr() %p has not been initialized\n", value_cache.data_ptr());
-//         return false;
-//     }
-
-//     dim3 grid(cached_file_ids.numel());
-//     dim3 block(32);
-//     const at::cuda::OptionalCUDAGuard device_guard(device_of(key_cache));
-
-//     cuda::std::span<GPUFileId> file_ids = {(GPUFileId *)cached_file_ids.data_ptr(), (size_t)cached_file_ids.numel()};
-//     cuda::std::span<uint64_t> block_ids = {(uint64_t *)inner_block_ids.data_ptr(), (size_t)inner_block_ids.numel()};
-
-//     auto * pool = metadata->global_pool.get();
-//     if (key_dma_ctx->dma_ptr->contiguous) {
-//         __geminifs_device_batch_xfer<<<grid, block, 0, stream>>>
-//                         (pool, file_ids, block_ids, key_dma_ctx->dma_ptr->ioaddrs[0], 
-//                             block_nbytes, key_file_offset, type);
-//     }
-    
-//     if (value_dma_ctx->dma_ptr->contiguous) {
-//         __geminifs_device_batch_xfer<<<grid, block, 0, stream>>>
-//                         (pool, file_ids, block_ids, value_dma_ctx->dma_ptr->ioaddrs[0], 
-//                             block_nbytes, value_file_offset, type);
-//     }
-    
-//     if (!key_dma_ctx->dma_ptr->contiguous) { // assert that ioaddrs is not null
-//         __geminifs_device_batch_xfer<<<grid, block, 0, stream>>>
-//                         (pool, file_ids, block_ids, 
-//                         {key_dma_ctx->ioaddrs, key_dma_ctx->dma_ptr->n_ioaddrs}, 
-//                         block_nbytes, key_file_offset, type);
-//     }   
-    
-//     if (!value_dma_ctx->dma_ptr->contiguous) { // assert that ioaddrs is not null
-//         __geminifs_device_batch_xfer<<<grid, block, 0, stream>>>
-//                         (pool, file_ids, block_ids, 
-//                         {value_dma_ctx->ioaddrs, value_dma_ctx->dma_ptr->n_ioaddrs}, 
-//                         block_nbytes, value_file_offset, type);
-//     }
-
-//     return true;
-// }
-
-// static inline bool geminifs_device_mutiple_layer_xfer(
-//     const torch::Tensor& cached_file_ids,  // shape = [num_cached_files,]
-//     const torch::Tensor& inner_block_ids,  // shape = [num_cached_files,]
-//     const std::vector<torch::Tensor>& key_caches, // shape = List[num_layers, max_num_block, block_size, num_heads, head_size]
-//     const std::vector<torch::Tensor>& value_caches, // shape = List[num_layers, max_num_block, block_size, num_heads, head_size]
-//     int64_t start_layer_idx, int64_t num_layers,
-//     enum FileXferType type) {
-
-//     // Input validation
-//     if (num_layers <= 0) {
-//         geminifs_error("geminifs_device_mutiple_layer_xfer: num_layers must be positive, got %lld\n", num_layers);
-//         return false;
-//     }
-//     // printf("num_layers %lld, key_caches.size() %zu, value_caches.size() %zu\n", num_layers, key_caches.size(), value_caches.size());
-//     if (key_caches.size() != num_layers || value_caches.size() != num_layers) {
-//         geminifs_error("geminifs_device_mutiple_layer_xfer: key_caches (%zu) or value_caches (%zu) size mismatch with num_layers (%lld)\n", key_caches.size(), value_caches.size(), num_layers);
-//         return false;
-//     }
-//     if (cached_file_ids.numel() != inner_block_ids.numel()) {
-//         geminifs_error("geminifs_device_mutiple_layer_xfer: cached_file_ids and inner_block_ids must have same number of elements (%lld vs %lld)\n", cached_file_ids.numel(), inner_block_ids.numel());
-//         return false;
-//     }
-//     if (key_caches.empty() || !key_caches[0].is_cuda()) {
-//         geminifs_error("geminifs_device_mutiple_layer_xfer: key_caches are empty or not on a CUDA device.\n");
-//         return false;
-//     }
-
-//     auto device = key_caches[0].device().index();
-//     struct geminifs_metadata* metadata = geminifs_get_metadata(device);
-
-//     if (metadata == nullptr) {
-//         geminifs_error("geminifs_device_mutiple_layer_xfer: device %d has not been initialized.\n", device);
-//         return false;
-//     }
-
-//     const size_t num_available_streams = metadata->streams.size();
-//     if (num_available_streams == 0) {
-//         geminifs_error("geminifs_device_mutiple_layer_xfer: No CUDA streams available in metadata for device %d.\n", device);
-//         return false;
-//     }
-
-//     // Create a vector to hold CUDA events for each layer's transfer
-//     std::vector<cudaEvent_t> completion_events(num_layers);
-//     for (int i = 0; i < num_layers; ++i) {
-//         // Ensure event creation is successful
-//         cudaError_t err = cudaEventCreate(&completion_events[i]);
-//         if (err != cudaSuccess) {
-//             geminifs_error("geminifs_device_mutiple_layer_xfer: Failed to create CUDA event %d: %s\n", i, cudaGetErrorString(err));
-//             // Clean up already created events before returning
-//             for (int j = 0; j < i; ++j) {
-//                 cudaEventDestroy(completion_events[j]);
-//             }
-//             return false;
-//         }
-//     }
-
-//     // Launch transfers on different streams
-//     for (int i = 0; i < num_layers; ++i) {
-//         cudaStream_t stream = metadata->streams[i % num_available_streams];
-
-//         // Perform the transfer for the current layer
-//         __geimifs_device_one_layer_xfer(
-//             cached_file_ids,
-//             inner_block_ids,
-//             key_caches[i],
-//             value_caches[i],
-//             i + start_layer_idx, // Absolute layer index
-//             type,
-//             metadata,
-//             stream
-//         );
-
-//         // Record an event in the stream after the transfer is submitted
-//         cudaError_t err = cudaEventRecord(completion_events[i], stream);
-//         if (err != cudaSuccess) {
-//             geminifs_error("geminifs_device_mutiple_layer_xfer: Failed to record CUDA event %d for stream %p: %s\n", i, (void*)stream, cudaGetErrorString(err));
-//             // This is a critical error, might need more robust cleanup
-//             for (auto& event : completion_events) { // Clean up all events
-//                 if (event) cudaEventDestroy(event);
-//             }
-//             return false;
-//         }
-//     }
-
-
-//     return true; // All transfers are guaranteed to be complete on the GPU
-// }
-
-
-// static inline bool geminifs_device_xfer_wrapper_cuda(
-//     const torch::Tensor &cached_file_ids,   //shape = [num_cached_files,]
-//     const torch::Tensor &inner_block_ids,  // shape = [num_cached_files,]
-//     const torch::Tensor &key_cache,         // shape = [max_num_block, block_size, num_heads, head_size]
-//     const torch::Tensor &value_cache,       // shape = [max_num_block, block_size, num_heads, head_size]
-//     int64_t start_layer_idx, enum FileXferType type) {
-    
-//     int max_num_block = key_cache.size(0);
-//     int block_size = key_cache.size(1);
-//     int num_heads = key_cache.size(2);
-//     int head_size = key_cache.size(3);
-//     int device = key_cache.device().index();
-
-//     // layer -> file offset, block id -> key/value cache offset
-//     uint64_t block_nbytes = block_size * num_heads * head_size * key_cache.element_size();
-//     uint64_t layer_stride = 2 * block_nbytes;
-//     uint64_t key_file_offset = start_layer_idx * layer_stride;
-//     uint64_t value_file_offset = key_file_offset + block_nbytes;
-
-//     struct geminifs_metadata *metadata;
-//     if ((metadata = geminifs_get_metadata(device)) == nullptr) {
-//         geminifs_error("geminifs_device_xfer_wrapper_cuda: device %d has not been initialized\n", device);
-//         return false;
-//     }
-    
-//     if (block_nbytes & (metadata->file_block_size - 1)) { // to avoid xfer to other page
-//         geminifs_error("block_nbytes %ld is not aligned to file block size\n", block_nbytes);
-//         return false;
-//     }
-    
-//     auto * pool = metadata->global_pool.get();
-//     is_device_pointer(pool, "global_pool must be device ptr");
-
-//     if (!is_ptr_aligned(key_cache.data_ptr())) {
-//         geminifs_error("key_cache.data_ptr() %p, block_nbytes %ld\n", key_cache.data_ptr(), block_nbytes);
-//         return false;
-//     }
-
-//     if (!is_ptr_aligned(value_cache.data_ptr())) {
-//         geminifs_error("value_cache.data_ptr() %p, block_nbytes %ld\n", value_cache.data_ptr(), block_nbytes);
-//         return false;
-//     }
-
-//     struct geminifs_dma *key_dma_ctx, *value_dma_ctx;
-//     if ((key_dma_ctx = geminifs_get_dma(key_cache)) == nullptr) {
-//         geminifs_error("geminifs_device_xfer_wrapper_cuda: key_cache.data_ptr() %p has not been initialized\n", key_cache.data_ptr());
-//         return false;
-//     }
-
-//     if ((value_dma_ctx = geminifs_get_dma(value_cache)) == nullptr) {
-//         geminifs_error("geminifs_device_xfer_wrapper_cuda: value_cache.data_ptr() %p has not been initialized\n", value_cache.data_ptr());
-//         return false;
-//     }
-
-//     dim3 grid(cached_file_ids.numel());
-//     dim3 block(32);
-//     const at::cuda::OptionalCUDAGuard device_guard(device_of(key_cache));
-//     // const at::cuda::OptionalCUDAGuard device_guard(device_of(value_cache));
-//     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-
-//     // geminifs_debug("tensor info: key_cache.data_ptr() %p, value_cache.data_ptr() %p, block_nbytes %ld, key_file_offset %ld, value_file_offset %ld\n", 
-//     //                 key_cache.data_ptr(), value_cache.data_ptr(), block_nbytes, key_file_offset, value_file_offset);
-
-//     cuda::std::span<GPUFileId> file_ids = {(GPUFileId *)cached_file_ids.data_ptr(), (size_t)cached_file_ids.numel()};
-//     cuda::std::span<uint64_t> block_ids = {(uint64_t *)inner_block_ids.data_ptr(), (size_t)inner_block_ids.numel()};
-//     if (key_dma_ctx->dma_ptr->contiguous) {
-//         // geminifs_debug("key dma is contiguous, ready to transfer key\n");
-//         __geminifs_device_batch_xfer<<<grid, block, 0, stream>>>
-//                         (pool, file_ids, block_ids, key_dma_ctx->dma_ptr->ioaddrs[0], 
-//                             block_nbytes, key_file_offset, type);
-//         // geminifs_debug("key transfer done\n");
-//     }
-
-//     if (value_dma_ctx->dma_ptr->contiguous) {
-//         // geminifs_debug("value dma is contiguous, ready to transfer value\n");
-//         __geminifs_device_batch_xfer<<<grid, block, 0, stream>>>
-//                         (pool, file_ids, block_ids, value_dma_ctx->dma_ptr->ioaddrs[0], 
-//                             block_nbytes, value_file_offset, type);
-//         // geminifs_debug("value transfer done\n");
-//     }
-
-//     if (!key_dma_ctx->dma_ptr->contiguous) { // assert that ioaddrs is not null
-//         __geminifs_device_batch_xfer<<<grid, block, 0, stream>>>
-//                         (pool, file_ids, block_ids, 
-//                         {key_dma_ctx->ioaddrs, key_dma_ctx->dma_ptr->n_ioaddrs}, 
-//                         block_nbytes, key_file_offset, type);
-//     }
-
-//     if (!value_dma_ctx->dma_ptr->contiguous) { // assert that ioaddrs is not null
-//         __geminifs_device_batch_xfer<<<grid, block, 0, stream>>>
-//                         (pool, file_ids, block_ids, 
-//                         {value_dma_ctx->ioaddrs, value_dma_ctx->dma_ptr->n_ioaddrs}, 
-//                         block_nbytes, value_file_offset, type);
-//     }
-//     cudaDeviceSynchronize();
-//     // geminifs_debug("xfer done\n");
-//     return true;
-// }
-
-// bool batch_write_direct(const torch::Tensor& cached_file_ids,   //shape = [num_cached_files,]
-//                         const torch::Tensor& inner_block_ids,  // shape = [num_cached_files,]
-//                         const torch::Tensor& key_cache,               // shape = [max_num_block, block_size, num_heads, head_size]
-//                         const torch::Tensor& value_cache,             // shape = [max_num_block, block_size, num_heads, head_size]
-//                         int64_t start_layer_idx) {
-
-//     return geminifs_device_xfer_wrapper_cuda(cached_file_ids, inner_block_ids, 
-//                                             key_cache, value_cache, 
-//                                             start_layer_idx, FILE_XFER_WRITE);
-// }
-
-// bool batch_read_direct(const torch::Tensor& cached_file_ids,   //shape = [num_cached_files,]
-//                         const torch::Tensor& inner_block_ids,  // shape = [num_cached_files,]
-//                         const torch::Tensor& key_cache,               // shape = [max_num_block, block_size, num_heads, head_size]
-//                         const torch::Tensor& value_cache,             // shape = [max_num_block, block_size, num_heads, head_size]
-//                         int64_t start_layer_idx) {
-
-//     return geminifs_device_xfer_wrapper_cuda(cached_file_ids, inner_block_ids, 
-//                                             key_cache, value_cache, 
-//                                             start_layer_idx, FILE_XFER_READ);
-// }
-
-// bool geminifs_device_mutiple_layer_read_wrapper_cuda(
-//                                         const torch::Tensor &cached_file_ids,   //shape = [num_cached_files,]
-//                                         const torch::Tensor &inner_block_ids,  // shape = [num_cached_files,]
-//                                         const std::vector<torch::Tensor> &key_caches, // shape = List[num_layers, max_num_block, block_size, num_heads, head_size]
-//                                         const std::vector<torch::Tensor> &value_caches, // shape = List[num_layers, max_num_block, block_size, num_heads, head_size]
-//                                         int64_t start_layer_idx, int64_t num_layers) {
-//     return geminifs_device_mutiple_layer_xfer(cached_file_ids, inner_block_ids, 
-//                                             key_caches, value_caches, 
-//                                             start_layer_idx, num_layers, FILE_XFER_READ);
-// }
-
-// bool geminifs_device_mutiple_layer_write_wrapper_cuda(
-//                                         const torch::Tensor &cached_file_ids,   //shape = [num_cached_files,]
-//                                         const torch::Tensor &inner_block_ids,  // shape = [num_cached_files,]
-//                                         const std::vector<torch::Tensor> &key_caches, // shape = List[num_layers, max_num_block, block_size, num_heads, head_size]
-//                                         const std::vector<torch::Tensor> &value_caches, // shape = List[num_layers, max_num_block, block_size, num_heads, head_size]
-//                                         int64_t start_layer_idx, int64_t num_layers) {
-//     return geminifs_device_mutiple_layer_xfer(cached_file_ids, inner_block_ids, 
-//                                             key_caches, value_caches,   
-//                                             start_layer_idx, num_layers, FILE_XFER_WRITE);
-// }
-
-// bool geminifs_init_fds_wrapper_cuda(const torch::Tensor& file_meta, 
-//                                     const std::string& mount_path, 
-//                                     const std::string& pcie_addr) {
-    
-
-//     TORCH_CHECK(file_meta.dim() == 1 && file_meta.numel() >= 2, "file_meta should be a 1D tensor with at least 2 elements");
-//     TORCH_CHECK(file_meta.scalar_type() == torch::kUInt64, "file_meta should have kUInt64 type");
-    
-    
-//     torch::Tensor file_meta_host = file_meta.cpu();
-//     const uint64_t* file_meta_ptr = file_meta_host.data_ptr<uint64_t>();
-//     uint64_t nr_files = file_meta_ptr[0];
-//     uint64_t file_size = file_meta_ptr[1];
-//     int64_t device_id = file_meta.device().index();
-
-//     geminifs_debug("geminifs_init_fds_wrapper_cuda: nr_files %ld, file_size %ld, device_id %ld\n", 
-//                     nr_files, file_size, device_id);
-
-//     assert(nr_files > 0 && file_size > 0 && device_id >= 0);
-
-//     std::vector<string> pcie_addr_vec = split(pcie_addr, ',');
-//     auto size = pcie_addr_vec.size();
-//     if (size == 0 || (size & (size - 1)) != 0) {
-//         geminifs_error("geminifs_init_fds_wrapper_cuda: pcie_addr %s is not a power of 2\n", pcie_addr.c_str());
-//         return false;
-//     }
-    
-//     struct geminifs_ctrl_params ctrl_params = {
-//         .mount_path = mount_path,
-//         .snvme_control_path = "/dev/snvm_control",
-//         .pci_addr = pcie_addr_vec,
-//         .cudaDevice = (int)device_id,
-//         .ns_id = 1,
-//         .queueDepth = 1024,
-//         .numQueues = 64
-//     };
-
-//     if (geminifs_get_metadata(ctrl_params.cudaDevice) != nullptr) {
-//         geminifs_error("geminifs_init_fds_wrapper_cuda: device %d has been initialized\n", ctrl_params.cudaDevice);
-//         return false;
-//     } else {
-//         global_metadata[ctrl_params.cudaDevice] = __geminifs_init(ctrl_params, nr_files,
-//                                                                     file_size,  __4KB__);
-//     }
-
-//     return true;
-// }
-
-
-
-
-// bool geminifs_init_fds_wrapper_cuda_test(int64_t nr_files, int64_t file_size, int64_t device_id, 
-//                                             const std::string& mount_path, const std::string& pcie_addr){
-//     // 指定 TensorOptions 来设置设备和数据类型为 int64
-//     torch::Tensor file_meta = torch::tensor({nr_files, file_size}, 
-//                                             torch::TensorOptions().device(torch::kCUDA, device_id).dtype(torch::kUInt64));
-//     return geminifs_init_fds_wrapper_cuda(file_meta, mount_path, pcie_addr);
-// }
-
-// bool geminifs_device_xfer_wrapper_test(
-//     const torch::Tensor &cached_file_ids,   //shape = [num_cached_files,]
-//     const torch::Tensor &inner_block_ids,  // shape = [num_cached_files,]
-//     const torch::Tensor &key_cache,         // shape = [max_num_block, block_size, num_heads, head_size]
-//     const torch::Tensor &value_cache,       // shape = [max_num_block, block_size, num_heads, head_size]
-//     int64_t start_layer_idx, enum FileXferType type) {
-    
-//     return geminifs_device_xfer_wrapper_cuda(cached_file_ids, inner_block_ids, 
-//                                             key_cache, value_cache,
-//                                             start_layer_idx, type);
-// }
-
-// bool geminifs_device_xfer_wrapper_test2(
-//     const torch::Tensor &cached_file_ids,   //shape = [num_cached_files,]
-//     const torch::Tensor &inner_block_ids,  // shape = [num_cached_files,]
-//     std::vector<torch::Tensor> &key_caches, // shape = List[num_layers, max_num_block, block_size, num_heads, head_size]
-//     std::vector<torch::Tensor> &value_caches, // shape = List[num_layers, max_num_block, block_size, num_heads, head_size]
-//     int64_t start_layer_idx, int64_t num_layers, enum FileXferType type) {
-
-//     return geminifs_device_mutiple_layer_xfer(cached_file_ids, inner_block_ids, 
-//                                             key_caches, value_caches,
-//                                             start_layer_idx, num_layers, type);
-// }
 // 保持兼容性，之后可以去除
 __host__ GPUControllerPtr geminifs_create_gpu_controller(int device_id, const std::string& mount_base_path) {
     auto gpu_controller = std::make_shared<GPUController>(device_id, mount_base_path);
@@ -949,225 +281,199 @@ __host__ void* GeminiFS::geminifs_gpu_open_file(int device_id, GPUFileId gpu_fil
         geminifs_error("geminifs_gpu_open_file: No GPU controller found for device %d\n", device_id);
         return nullptr;
     }
-    return gpu_controller->openFile(gpu_file_id, file_size, o_flag, nvme_params_, gpu_file_manager_);
+    
+    if (!gpu_file_manager_) {
+        geminifs_error("geminifs_gpu_open_file: GPUFileManager not initialized\n");
+        return nullptr;
+    }
+    
+    return gpu_controller->openFile(gpu_file_id, file_size, o_flag, nvme_params_, *gpu_file_manager_);
 }
 
-// --- NVMe_Link LRU cache helpers ---
-bool GeminiFS::get_links_cached(GPUFileId file_id, std::vector<NVMe_Link>& out_links) {
-    auto it = links_cache_.find(file_id);
-    if (it == links_cache_.end()) return false;
-    out_links = it->second.links;
-    touch_links_cache(file_id);
-    return true;
-}
 
-void GeminiFS::put_links_cache(GPUFileId file_id, const std::vector<NVMe_Link>& links) {
-    size_t bytes = links.size() * sizeof(NVMe_Link);
-    auto it = links_cache_.find(file_id);
-    if (it != links_cache_.end()) {
-        // update existing
-        links_cache_bytes_ -= it->second.bytes;
-        it->second.links = links;
-        it->second.bytes = bytes;
-        touch_links_cache(file_id);
-    } else {
-        links_cache_lru_.push_front(file_id);
-        links_cache_[file_id] = {links, bytes, links_cache_lru_.begin()};
-        links_cache_bytes_ += bytes;
-    }
-    evict_links_cache_if_needed();
-}
 
-void GeminiFS::touch_links_cache(GPUFileId file_id) {
-    auto it = links_cache_.find(file_id);
-    if (it == links_cache_.end()) return;
-    links_cache_lru_.erase(it->second.lru_it);
-    links_cache_lru_.push_front(file_id);
-    it->second.lru_it = links_cache_lru_.begin();
-}
 
-void GeminiFS::evict_links_cache_if_needed() {
-    while (links_cache_bytes_ > LINKS_CACHE_MAX_BYTES && !links_cache_lru_.empty()) {
-        GPUFileId victim = links_cache_lru_.back();
-        links_cache_lru_.pop_back();
-        auto it = links_cache_.find(victim);
-        if (it != links_cache_.end()) {
-            links_cache_bytes_ -= it->second.bytes;
-            links_cache_.erase(it);
-        }
-    }
-}
+// __host__ bool GeminiFS::geminifs_GPU_read_kernel(torch::Tensor& tensor, GPUFileId gpu_file_id, GPUControllerPtr gpu_controller) {
+//     if (!gpu_controller || !gpu_controller->isInitialized()) {
+//          geminifs_error("GPU_read_kernel: GPU controller is not initialized\n");
+//           return false;
+//     }
 
-__host__ bool GeminiFS::geminifs_GPU_read_kernel(torch::Tensor& tensor, GPUFileId gpu_file_id, GPUControllerPtr gpu_controller) {
-    if (!gpu_controller || !gpu_controller->isInitialized()) {
-         geminifs_error("GPU_read_kernel: GPU controller is not initialized\n");
-          return false;
-    }
+//     if (!tensor.is_cuda()) { 
+//         geminifs_error("GPU_read_kernel: tensor must be on CUDA device\n");
+//          return false;
+//     }
 
-    if (!tensor.is_cuda()) { 
-        geminifs_error("GPU_read_kernel: tensor must be on CUDA device\n");
-         return false;
-    }
+//     if (!gpu_file_manager_) {
+//         geminifs_error("GPU_read_kernel: GPUFileManager not initialized\n");
+//         return false;
+//     }
 
-    GPUFileDesc desc;
-    if (!gpu_file_manager_.getGPUFileDesc(gpu_file_id, desc)) { 
-        geminifs_error("GPU_read_kernel: GPUFileId %lu not found\n", gpu_file_id); 
-        return false;
-    }
+//     GPUFileDesc desc;
+//     if (!gpu_file_manager_->getGPUFileDesc(gpu_file_id, desc)) { 
+//         geminifs_error("GPU_read_kernel: GPUFileId %lu not found\n", gpu_file_id); 
+//         return false;
+//     }
 
-    // Do not auto-register here; only validate tensor already registered
-    auto dma_ctx = gpu_controller->getDMAContext(tensor.data_ptr());
-    if (!dma_ctx) {
-        geminifs_error("GPU_read_kernel: tensor not registered; call geminifs_register_tensor_with_gpu before IO\n");
-        return false;
-    }
+//     // Do not auto-register here; only validate tensor already registered
+//     auto dma_ctx = gpu_controller->getDMAContext(tensor.data_ptr());
+//     if (!dma_ctx) {
+//         geminifs_error("GPU_read_kernel: tensor not registered; call geminifs_register_tensor_with_gpu before IO\n");
+//         return false;
+//     }
 
-    // 优先从缓存取链接，未命中则用 getLinksForFile 一次性拉取并缓存
-    std::vector<NVMe_Link> links;
-    if (!get_links_cached(gpu_file_id, links)) {
-        if (!gpu_file_manager_.getLinksForFile(gpu_file_id, links)) {
-            geminifs_error("GPU_read_kernel: failed to get links for file %lu\n", gpu_file_id);
-            return false;
-        }
-        put_links_cache(gpu_file_id, links);
-    }
+//     // 优先从缓存取链接，未命中则用 getLinksForFile 一次性拉取并缓存
+//     std::vector<NVMe_Link> links;
+//     if (!get_links_cached(gpu_file_id, links)) {
+//         if (!gpu_file_manager_->getLinksForFile(gpu_file_id, links)) {
+//             geminifs_error("GPU_read_kernel: failed to get links for file %lu\n", gpu_file_id);
+//             return false;
+//         }
+//         put_links_cache(gpu_file_id, links);
+//     }
 
-    auto* device_view = gpu_controller->getMemoryMapper()->getDeviceViewPtr();
-    if (!device_view) {
-        geminifs_error("GPU_read_kernel: device view is null\n");
-        return false;
-    }
+//     auto* device_view = gpu_controller->getMemoryMapper()->getDeviceViewPtr();
+//     if (!device_view) {
+//         geminifs_error("GPU_read_kernel: device view is null\n");
+//         return false;
+//     }
 
-    // 准备 NVMe_File* 列表（与 links 对齐）
-    std::vector<NVMe_File*> nvme_fds;
-    nvme_fds.reserve(links.size());
-    for (const auto& link : links) {
-        auto nvme_ctrl = gpu_controller->getNVMeController(link.controller_index);
-        if (!nvme_ctrl) {
-            geminifs_error("GPU_read_kernel: NVMe controller %zu not found\n", link.controller_index);
-            return false;
-        }
-        void* device_fd = nvme_ctrl->g_open(std::string(link.name), link.file_size, O_DEVICE);
-        if (!device_fd) {
-            geminifs_error("GPU_read_kernel: g_open failed for %s\n", link.name);
-            return false;
-        }
-        nvme_fds.push_back(reinterpret_cast<NVMe_File*>(device_fd));
-    }
+//     // 准备 NVMe_File* 列表（与 links 对齐）
+//     std::vector<NVMe_File*> nvme_fds;
+//     nvme_fds.reserve(links.size());
+//     for (const auto& link : links) {
+//         auto nvme_ctrl = gpu_controller->getNVMeController(link.controller_index);
+//         if (!nvme_ctrl) {
+//             geminifs_error("GPU_read_kernel: NVMe controller %zu not found\n", link.controller_index);
+//             return false;
+//         }
+//         void* device_fd = nvme_ctrl->g_open(std::string(link.name), link.file_size, O_DEVICE);
+//         if (!device_fd) {
+//             geminifs_error("GPU_read_kernel: g_open failed for %s\n", link.name);
+//             return false;
+//         }
+//         nvme_fds.push_back(reinterpret_cast<NVMe_File*>(device_fd));
+//     }
 
-    // 拷贝 NVMe_File** 到设备
-    NVMe_File** d_fds = nullptr;
-    size_t num_fds = nvme_fds.size();
-    cudaError_t err = cudaMalloc(&d_fds, num_fds * sizeof(NVMe_File*));
-    if (err != cudaSuccess) {
-        geminifs_error("GPU_read_kernel: cudaMalloc d_fds failed: %s\n", cudaGetErrorString(err));
-        return false;
-    }
-    err = cudaMemcpy(d_fds, nvme_fds.data(), num_fds * sizeof(NVMe_File*), cudaMemcpyHostToDevice);
-    if (err != cudaSuccess) {
-        cudaFree(d_fds);
-        geminifs_error("GPU_read_kernel: cudaMemcpy d_fds failed: %s\n", cudaGetErrorString(err));
-        return false;
-    }
+//     // 拷贝 NVMe_File** 到设备
+//     NVMe_File** d_fds = nullptr;
+//     size_t num_fds = nvme_fds.size();
+//     cudaError_t err = cudaMalloc(&d_fds, num_fds * sizeof(NVMe_File*));
+//     if (err != cudaSuccess) {
+//         geminifs_error("GPU_read_kernel: cudaMalloc d_fds failed: %s\n", cudaGetErrorString(err));
+//         return false;
+//     }
+//     err = cudaMemcpy(d_fds, nvme_fds.data(), num_fds * sizeof(NVMe_File*), cudaMemcpyHostToDevice);
+//     if (err != cudaSuccess) {
+//         cudaFree(d_fds);
+//         geminifs_error("GPU_read_kernel: cudaMemcpy d_fds failed: %s\n", cudaGetErrorString(err));
+//         return false;
+//     }
 
-    // 启动多FD内核（内核内部根据 tid%num_fds 分发并触发 v3 批量）
-    uint64_t tensor_ptr = reinterpret_cast<uint64_t>(tensor.data_ptr());
-    size_t offset = 0;
-    size_t len = static_cast<size_t>(tensor.numel()) * static_cast<size_t>(tensor.element_size());
-    GPU_Read_kernel_multi<<<1,1>>>(d_fds, static_cast<uint32_t>(num_fds), tensor_ptr, offset, len, device_view);
-    err = cudaDeviceSynchronize();
+//     // 启动多FD内核（内核内部根据 tid%num_fds 分发并触发 v3 批量）
+//     uint64_t tensor_ptr = reinterpret_cast<uint64_t>(tensor.data_ptr());
+//     size_t offset = 0;
+//     size_t len = static_cast<size_t>(tensor.numel()) * static_cast<size_t>(tensor.element_size());
+//     GPU_Read_kernel_multi<<<1,1>>>(d_fds, static_cast<uint32_t>(num_fds), tensor_ptr, offset, len, device_view);
+//     err = cudaDeviceSynchronize();
 
-    cudaFree(d_fds);
-    if (err != cudaSuccess) {
-        geminifs_error("GPU_read_kernel: GPU_Read_kernel_multi failed: %s\n", cudaGetErrorString(err));
-        return false;
-    }
-    return true;
-}
+//     cudaFree(d_fds);
+//     if (err != cudaSuccess) {
+//         geminifs_error("GPU_read_kernel: GPU_Read_kernel_multi failed: %s\n", cudaGetErrorString(err));
+//         return false;
+//     }
+//     return true;
+// }
 
-__host__ bool GeminiFS::geminifs_GPU_write_kernel(const torch::Tensor& tensor, GPUFileId gpu_file_id, GPUControllerPtr gpu_controller) {
-    if (!gpu_controller || !gpu_controller->isInitialized()) {
-        geminifs_error("GPU_write_kernel: GPU controller is not initialized\n");
-        return false;
-    }
-    if (!tensor.is_cuda()) {
-        geminifs_error("GPU_write_kernel: tensor must be on CUDA device\n");
-        return false;
-    }
-    GPUFileDesc desc;
-    if (!gpu_file_manager_.getGPUFileDesc(gpu_file_id, desc)) {
-        geminifs_error("GPU_write_kernel: GPUFileId %lu not found\n", gpu_file_id);
-        return false;
-    }
+// __host__ bool GeminiFS::geminifs_GPU_write_kernel(const torch::Tensor& tensor, GPUFileId gpu_file_id, GPUControllerPtr gpu_controller) {
+//     if (!gpu_controller || !gpu_controller->isInitialized()) {
+//         geminifs_error("GPU_write_kernel: GPU controller is not initialized\n");
+//         return false;
+//     }
+//     if (!tensor.is_cuda()) {
+//         geminifs_error("GPU_write_kernel: tensor must be on CUDA device\n");
+//         return false;
+//     }
+    
+//     if (!gpu_file_manager_) {
+//         geminifs_error("GPU_write_kernel: GPUFileManager not initialized\n");
+//         return false;
+//     }
+    
+//     GPUFileDesc desc;
+//     if (!gpu_file_manager_->getGPUFileDesc(gpu_file_id, desc)) {
+//         geminifs_error("GPU_write_kernel: GPUFileId %lu not found\n", gpu_file_id);
+//         return false;
+//     }
 
-    // Do not auto-register here; only validate tensor already registered
-    auto dma_ctx = gpu_controller->getDMAContext(const_cast<void*>(tensor.data_ptr()));
-    if (!dma_ctx) {
-        geminifs_error("GPU_write_kernel: tensor not registered; call geminifs_register_tensor_with_gpu before IO\n");
-        return false;
-    }
+//     // Do not auto-register here; only validate tensor already registered
+//     auto dma_ctx = gpu_controller->getDMAContext(const_cast<void*>(tensor.data_ptr()));
+//     if (!dma_ctx) {
+//         geminifs_error("GPU_write_kernel: tensor not registered; call geminifs_register_tensor_with_gpu before IO\n");
+//         return false;
+//     }
 
-    std::vector<NVMe_Link> links;
-    if (!get_links_cached(gpu_file_id, links)) {
-        if (!gpu_file_manager_.getLinksForFile(gpu_file_id, links)) {
-            geminifs_error("GPU_write_kernel: failed to get links for file %lu\n", gpu_file_id);
-            return false;
-        }
-        put_links_cache(gpu_file_id, links);
-    }
+//     std::vector<NVMe_Link> links;
+//     if (!get_links_cached(gpu_file_id, links)) {
+//         if (!gpu_file_manager_->getLinksForFile(gpu_file_id, links)) {
+//             geminifs_error("GPU_write_kernel: failed to get links for file %lu\n", gpu_file_id);
+//             return false;
+//         }
+//         put_links_cache(gpu_file_id, links);
+//     }
 
-    auto* device_view = gpu_controller->getMemoryMapper()->getDeviceViewPtr();
-    if (!device_view) {
-        geminifs_error("GPU_write_kernel: device view is null\n");
-        return false;
-    }
+//     auto* device_view = gpu_controller->getMemoryMapper()->getDeviceViewPtr();
+//     if (!device_view) {
+//         geminifs_error("GPU_write_kernel: device view is null\n");
+//         return false;
+//     }
 
-    // 准备 NVMe_File* 列表（与 links 对齐）
-    std::vector<NVMe_File*> nvme_fds;
-    nvme_fds.reserve(links.size());
-    for (const auto& link : links) {
-        auto nvme_ctrl = gpu_controller->getNVMeController(link.controller_index);
-        if (!nvme_ctrl) {
-            geminifs_error("GPU_write_kernel: NVMe controller %zu not found\n", link.controller_index);
-            return false;
-        }
-        void* device_fd = nvme_ctrl->g_open(std::string(link.name), link.file_size, O_DEVICE);
-        if (!device_fd) {
-            geminifs_error("GPU_write_kernel: g_open failed for %s\n", link.name);
-            return false;
-        }
-        nvme_fds.push_back(reinterpret_cast<NVMe_File*>(device_fd));
-    }
+//     // 准备 NVMe_File* 列表（与 links 对齐）
+//     std::vector<NVMe_File*> nvme_fds;
+//     nvme_fds.reserve(links.size());
+//     for (const auto& link : links) {
+//         auto nvme_ctrl = gpu_controller->getNVMeController(link.controller_index);
+//         if (!nvme_ctrl) {
+//             geminifs_error("GPU_write_kernel: NVMe controller %zu not found\n", link.controller_index);
+//             return false;
+//         }
+//         void* device_fd = nvme_ctrl->g_open(std::string(link.name), link.file_size, O_DEVICE);
+//         if (!device_fd) {
+//             geminifs_error("GPU_write_kernel: g_open failed for %s\n", link.name);
+//             return false;
+//         }
+//         nvme_fds.push_back(reinterpret_cast<NVMe_File*>(device_fd));
+//     }
 
-    // 拷贝 NVMe_File** 到设备
-    NVMe_File** d_fds = nullptr;
-    size_t num_fds = nvme_fds.size();
-    cudaError_t err = cudaMalloc(&d_fds, num_fds * sizeof(NVMe_File*));
-    if (err != cudaSuccess) {
-        geminifs_error("GPU_write_kernel: cudaMalloc d_fds failed: %s\n", cudaGetErrorString(err));
-        return false;
-    }
-    err = cudaMemcpy(d_fds, nvme_fds.data(), num_fds * sizeof(NVMe_File*), cudaMemcpyHostToDevice);
-    if (err != cudaSuccess) {
-        cudaFree(d_fds);
-        geminifs_error("GPU_write_kernel: cudaMemcpy d_fds failed: %s\n", cudaGetErrorString(err));
-        return false;
-    }
+//     // 拷贝 NVMe_File** 到设备
+//     NVMe_File** d_fds = nullptr;
+//     size_t num_fds = nvme_fds.size();
+//     cudaError_t err = cudaMalloc(&d_fds, num_fds * sizeof(NVMe_File*));
+//     if (err != cudaSuccess) {
+//         geminifs_error("GPU_write_kernel: cudaMalloc d_fds failed: %s\n", cudaGetErrorString(err));
+//         return false;
+//     }
+//     err = cudaMemcpy(d_fds, nvme_fds.data(), num_fds * sizeof(NVMe_File*), cudaMemcpyHostToDevice);
+//     if (err != cudaSuccess) {
+//         cudaFree(d_fds);
+//         geminifs_error("GPU_write_kernel: cudaMemcpy d_fds failed: %s\n", cudaGetErrorString(err));
+//         return false;
+//     }
 
-    // 启动多FD内核
-    uint64_t tensor_ptr = reinterpret_cast<uint64_t>(tensor.data_ptr());
-    size_t offset = 0;
-    size_t len = static_cast<size_t>(tensor.numel()) * static_cast<size_t>(tensor.element_size());
-    GPU_Write_kernel_multi<<<1,1>>>(d_fds, static_cast<uint32_t>(num_fds), tensor_ptr, offset, len, device_view);
-    err = cudaDeviceSynchronize();
+//     // 启动多FD内核
+//     uint64_t tensor_ptr = reinterpret_cast<uint64_t>(tensor.data_ptr());
+//     size_t offset = 0;
+//     size_t len = static_cast<size_t>(tensor.numel()) * static_cast<size_t>(tensor.element_size());
+//     GPU_Write_kernel_multi<<<1,1>>>(d_fds, static_cast<uint32_t>(num_fds), tensor_ptr, offset, len, device_view);
+//     err = cudaDeviceSynchronize();
 
-    cudaFree(d_fds);
-    if (err != cudaSuccess) {
-        geminifs_error("GPU_write_kernel: GPU_Write_kernel_multi failed: %s\n", cudaGetErrorString(err));
-        return false;
-    }
-    return true;
-}
+//     cudaFree(d_fds);
+//     if (err != cudaSuccess) {
+//         geminifs_error("GPU_write_kernel: GPU_Write_kernel_multi failed: %s\n", cudaGetErrorString(err));
+//         return false;
+//     }
+//     return true;
+// }
 
 __host__ void geminifs_cleanup_all_gpu_controllers() {
     auto& registry = GPUControllerRegistry::getInstance();
@@ -1239,7 +545,96 @@ __host__ bool GeminiFS::geminifs_nvme_delete_all_files(int device_id, size_t con
     return success;
 }
 
-__host__ void GeminiFS::init(const std::string& config_file_path, size_t num_files, size_t file_size, bool reset) {
+__host__ bool GeminiFS::parse_and_setup_controllers(const std::string& config_file_path, int current_gpu_id) {
+    ParsedSystemConfig config = parse_system_config(config_file_path);
+    if (config.valid) {
+        // 查找当前GPU对应的config group
+        bool found_group = false;
+        for (const auto& group : config.groups) {
+            if (group.gpu.cudaDevice == current_gpu_id) {
+                found_group = true;
+                nvme_params_ = convert_to_nvme_ctrl_params_group(group);
+                // 检查文件总数是否超过限制
+                
+                if(nvme_params_.size()*init_GPU_num_files_ >NUM_FILES)
+                {
+                    geminifs_error("geminifs_init: The total number of files (%zu) exceeds the limit (%d). Please increase NUM_FILES in geminifs.h and recompile.\n", nvme_params_.size()*init_GPU_num_files_, NUM_FILES);
+                    return false;
+                }
+                geminifs_debug("geminifs_init: Creating GPU controller for device %d with mount path %s\n", group.gpu.cudaDevice, group.gpu.mount_path.c_str());
+                geminifs_create_gpu_controller(group.gpu.cudaDevice, group.gpu.mount_path);
+                for (const auto& nvme_ctrl_param : nvme_params_) {
+                    if (!nvme_ctrl_param.pci_addr.empty()) {
+                        geminifs_debug("geminifs_init: Adding NVMe controller for device %d with mount path %s\n", group.gpu.cudaDevice, nvme_ctrl_param.mount_path.c_str());
+                        geminifs_add_nvme_to_gpu(group.gpu.cudaDevice, nvme_ctrl_param);
+                    }
+                }
+                break; // 找到对应的group后退出循环
+            }
+        }
+        
+        if (!found_group) {
+            geminifs_error("geminifs_init: No config group found for current GPU device %d\n", current_gpu_id);
+            return false;
+        }
+    } else {
+        std::cerr << "Config parsing failed: " << config.error_message << std::endl;
+        return false;
+    }
+    return true;
+}
+
+__host__ void GeminiFS::handle_gpu_file_reset(int current_gpu_id) {
+    // 询问用户确认
+    std::string operation_desc = "Reset GeminiFS for GPU device " + std::to_string(current_gpu_id) + 
+                                "\n  - Clear all managed NVMe files" +
+                                "\n  - Clear memory caches and links cache";
+    
+    if (!confirm_dangerous_operation(operation_desc)) {
+        geminifs_debug("geminifs_init: Reset operation cancelled by user, continuing with normal initialization\n");
+        // 用户取消了 reset，但继续正常初始化
+    } else {
+        auto existing_gpu_controller = geminifs_get_gpu_controller(current_gpu_id);
+        if (existing_gpu_controller) {
+            geminifs_debug("geminifs_init: Reset mode - cleaning all NVMe files for GPU device %d\n", current_gpu_id);
+            
+            // 获取所有NVMe controller并清空其文件
+            size_t nvme_count = existing_gpu_controller->getControllerCount();
+            for (size_t i = 0; i < nvme_count; ++i) {
+                auto nvme_controller = existing_gpu_controller->getNVMeController(i);
+                if (nvme_controller) {
+                    geminifs_debug("geminifs_init: Cleaning files for NVMe controller %zu\n", i);
+                    bool success = nvme_controller->device_file_delete_all_files_managed();
+                    if (success) {
+                        geminifs_debug("geminifs_init: Successfully cleaned all files for NVMe controller %zu\n", i);
+                    } else {
+                        geminifs_error("geminifs_init: Failed to clean files for NVMe controller %zu\n", i);
+                    }
+                }
+            }
+                        
+            geminifs_debug("geminifs_init: Reset completed - all NVMe files and caches cleared\n");
+        } else {
+            geminifs_debug("geminifs_init: No existing GPU controller found for reset on device %d\n", current_gpu_id);
+        }
+    }
+}
+
+__host__ void GeminiFS::init(const std::string& config_file_path, int GPU_file_nums,const std::vector<size_t>& GPU_file_shape, bool reset) {
+    // 检查GPU_file_shape必须是三维的
+    if (GPU_file_shape.size() != 3) {
+        geminifs_error("GeminiFS::init: GPU_file_shape must be 3-dimensional, got %zu dimensions\n", GPU_file_shape.size());
+        return;
+    }
+    size_t num_files = GPU_file_nums;
+    // 根据GPU_file_shape计算参数
+    // GPU_file_shape[0] * GPU_file_shape[1] = GPUfile的数量 (例如: 2 * 32 = 64)
+    // GPU_file_shape[2] = block size大小 (例如: 524288)
+    size_t file_size = GPU_file_shape[0] * GPU_file_shape[1] * GPU_file_shape[2];
+    
+    geminifs_info("GeminiFS::init: GPU_file_shape=[%zu, %zu, %zu] -> num_files=%zu, file_size=%zu\n", 
+                   GPU_file_shape[0], GPU_file_shape[1], GPU_file_shape[2], num_files, file_size);
+    
     // 记录初始化GPU file 参数
     init_GPU_num_files_ = num_files;
     init_GPU_file_size_ = file_size;
@@ -1260,171 +655,165 @@ __host__ void GeminiFS::init(const std::string& config_file_path, size_t num_fil
         geminifs_error("geminifs_init: Failed to get current GPU device: %s\n", cudaGetErrorString(err));
         return;
     }
-    
 
-    
     if (is_init_ && !reset) {
         geminifs_debug("geminifs_init: GeminiFS is already initialized, skipping re-initialization\n");
         return;
     }
 
-    ParsedSystemConfig config = parse_system_config(config_file_path);
-    if (config.valid) {
-        // 查找当前GPU对应的config group
-        bool found_group = false;
-        for (const auto& group : config.groups) {
-            if (group.gpu.cudaDevice == current_gpu_id) {
-                found_group = true;
-                nvme_params_ = convert_to_nvme_ctrl_params_group(group);
-                // 检查文件总数是否超过限制
-                
-                if(nvme_params_.size()*init_GPU_num_files_ >NUM_FILES)
-                {
-                    geminifs_error("geminifs_init: The total number of files (%zu) exceeds the limit (%d). Please increase NUM_FILES in geminifs.h and recompile.\n", nvme_params_.size()*init_GPU_num_files_, NUM_FILES);
-                    return;
-                }
-                geminifs_debug("geminifs_init: Creating GPU controller for device %d with mount path %s\n", group.gpu.cudaDevice, group.gpu.mount_path.c_str());
-                geminifs_create_gpu_controller(group.gpu.cudaDevice, group.gpu.mount_path);
-                for (const auto& nvme_ctrl_param : nvme_params_) {
-                    if (!nvme_ctrl_param.pci_addr.empty()) {
-                        geminifs_debug("geminifs_init: Adding NVMe controller for device %d with mount path %s\n", group.gpu.cudaDevice, nvme_ctrl_param.mount_path.c_str());
-                        geminifs_add_nvme_to_gpu(group.gpu.cudaDevice, nvme_ctrl_param);
-                    }
-                }
-                break; // 找到对应的group后退出循环
-            }
-        }
-        
-        if (!found_group) {
-            geminifs_error("geminifs_init: No config group found for current GPU device %d\n", current_gpu_id);
-            return;
-        }
-    } else {
-        std::cerr << "Config parsing failed: " << config.error_message << std::endl;
-        return ;
+    if (!parse_and_setup_controllers(config_file_path, current_gpu_id)) {
+        return;
+    }
+
+    // 初始化GPUFileManager，log文件放在GPU controller的mount_path下
+    auto gpu_controller = geminifs_get_gpu_controller(current_gpu_id);
+    if (!gpu_controller) {
+        geminifs_error("GeminiFS::init: Failed to get GPU controller for device %d\n", current_gpu_id);
+        return;
+    }
+    
+    std::filesystem::path gpu_mount_path = gpu_controller->getMountBasePath();
+    std::filesystem::path gpu_file_manager_log_path = gpu_mount_path / "gpu_file_manager.log";
+    
+    geminifs_debug("GeminiFS::init: Initializing GPUFileManager with log path: %s\n", 
+                   gpu_file_manager_log_path.c_str());
+    
+    gpu_file_manager_ = std::make_unique<GPUFileManager>(gpu_file_manager_log_path.string());
+    
+    if (!gpu_file_manager_) {
+        geminifs_error("GeminiFS::init: Failed to initialize GPUFileManager\n");
+        return;
     }
 
         // 如果需要reset，清空已存在的GPU controller下所有NVMe controller的文件
     if (reset) {
-        // 询问用户确认
-        std::string operation_desc = "Reset GeminiFS for GPU device " + std::to_string(current_gpu_id) + 
-                                    "\n  - Clear all managed NVMe files" +
-                                    "\n  - Clear memory caches and links cache";
-        
-        if (!confirm_dangerous_operation(operation_desc)) {
-            geminifs_debug("geminifs_init: Reset operation cancelled by user, continuing with normal initialization\n");
-            // 用户取消了 reset，但继续正常初始化
-        } else {
-            auto existing_gpu_controller = geminifs_get_gpu_controller(current_gpu_id);
-            if (existing_gpu_controller) {
-                geminifs_debug("geminifs_init: Reset mode - cleaning all NVMe files for GPU device %d\n", current_gpu_id);
-                
-                // 获取所有NVMe controller并清空其文件
-                size_t nvme_count = existing_gpu_controller->getControllerCount();
-                for (size_t i = 0; i < nvme_count; ++i) {
-                    auto nvme_controller = existing_gpu_controller->getNVMeController(i);
-                    if (nvme_controller) {
-                        geminifs_debug("geminifs_init: Cleaning files for NVMe controller %zu\n", i);
-                        bool success = nvme_controller->device_file_delete_all_files_managed();
-                        if (success) {
-                            geminifs_debug("geminifs_init: Successfully cleaned all files for NVMe controller %zu\n", i);
-                        } else {
-                            geminifs_error("geminifs_init: Failed to clean files for NVMe controller %zu\n", i);
-                        }
-                    }
-                }
-                
-                // 清理GPU controller的缓存
-                links_cache_.clear();
-                links_cache_lru_.clear();
-                links_cache_bytes_ = 0;
-                
-                geminifs_debug("geminifs_init: Reset completed - all NVMe files and caches cleared\n");
-            } else {
-                geminifs_debug("geminifs_init: No existing GPU controller found for reset on device %d\n", current_gpu_id);
-            }
-        }
+        handle_gpu_file_reset(current_gpu_id);
     }
 
-    // 设置每个nvme controller管理的文件的大小 
-    per_nvme_controller_files = num_files;
-    per_nvme_file_size = (nvme_params_.empty()) ? 0 : file_size / nvme_params_.size();
-    // 判断per_nvme_file_size是否大于64KB 且 64KB对齐
-    if (per_nvme_file_size < __64KB__ || (per_nvme_file_size % __64KB__) != 0) {
-        geminifs_error("geminifs_init: Each NVMe controller must manage files of at least 64KB and aligned to 64KB. Current per controller file size: %zu bytes\n", per_nvme_file_size);
-        return;
-    }
-    
-    // 检查并创建每个NVMe控制器中的文件
-    auto gpu_controller = geminifs_get_gpu_controller(current_gpu_id);
-    if (gpu_controller) {
-        size_t nvme_count = gpu_controller->getControllerCount();
-        geminifs_debug("geminifs_init: Checking files for %zu NVMe controllers\n", nvme_count);
-        
-        for (size_t i = 0; i < nvme_count; ++i) {
-            auto nvme_controller = gpu_controller->getNVMeController(i);
-            if (nvme_controller) {
-                geminifs_debug("geminifs_init: Checking files for NVMe controller %zu\n", i);
-                
-                // 检查符合预期大小的有效文件数量
-                size_t expected_file_size = per_nvme_file_size;
-                size_t valid_file_count = nvme_controller->device_file_validate_sizes(expected_file_size);
-                
-                geminifs_info("geminifs_init: NVMe controller %zu has %zu valid files of size %zu bytes, expected %zu files\n", 
-                              i, valid_file_count, expected_file_size, per_nvme_controller_files);
-                
-                // 如果有效文件数量不够，创建缺失的文件
-                if (valid_file_count < per_nvme_controller_files) {
-                    size_t files_to_create = per_nvme_controller_files - valid_file_count;
-                    geminifs_info("geminifs_init: Need to create %zu additional files for NVMe controller %zu\n", 
-                                  files_to_create, i);
-                    
-                    // 获取现有文件总数用于命名新文件
-                    size_t existing_file_count = nvme_controller->device_file_get_managed_file_count();
-                    
-                    for (size_t j = 0; j < files_to_create; ++j) {
-                        std::string filename = std::to_string(existing_file_count + j) + ".KV";
-                        
-                        // Use host_file_create_only_managed to create the file without opening it
-                        bool success = nvme_controller->host_file_create_only_managed(nvme_controller->controller->page_size, expected_file_size, filename);
-                        
-                        if (success) {
-                            geminifs_debug("geminifs_init: Successfully created file '%s' of size %zu bytes on NVMe controller %zu\n", 
-                                          filename.c_str(), expected_file_size, i);
-                        } else {
-                            geminifs_error("geminifs_init: Failed to create file '%s' on NVMe controller %zu\n", 
-                                          filename.c_str(), i);
-                            return;
-                        }
-                    }
-                    // 重新验证文件数量
-                    size_t final_valid_count = nvme_controller->device_file_validate_sizes(expected_file_size);
-                    if (final_valid_count < per_nvme_controller_files) {
-                        geminifs_error("geminifs_init: After file creation, still have insufficient valid files (%zu) for NVMe controller %zu\n", 
-                                      final_valid_count, i);
-                        return;
-                    }
-                    geminifs_info("geminifs_init: File creation successful, now have %zu valid files for NVMe controller %zu\n", 
-                                  final_valid_count, i);
-                } else if (valid_file_count > per_nvme_controller_files) {
-                    geminifs_warn("geminifs_init: NVMe controller %zu has more valid files (%zu) than expected (%zu)\n", 
-                                 i, valid_file_count, per_nvme_controller_files);
-                }
-                
-                geminifs_debug("geminifs_init: NVMe controller %zu file setup completed successfully\n", i);
-            } else {
-                geminifs_error("geminifs_init: Failed to get NVMe controller %zu\n", i);
-                return;
-            }
-        }
-        
-        geminifs_debug("geminifs_init: All NVMe controllers file setup completed successfully\n");
-    } else {
-        geminifs_error("geminifs_init: Failed to get GPU controller for device %d\n", current_gpu_id);
-        return;
-    }
 
-    // 标记初始化完成
+
+    // // 设置每个nvme controller管理的文件的大小 
+    // per_nvme_controller_files = num_files;
+    // per_nvme_file_size = (nvme_params_.empty()) ? 0 : file_size / nvme_params_.size();
+    // // 判断per_nvme_file_size是否大于64KB 且 64KB对齐
+    // if (per_nvme_file_size < __64KB__ || (per_nvme_file_size % __64KB__) != 0) {
+    //     geminifs_error("geminifs_init: Each NVMe controller must manage files of at least 64KB and aligned to 64KB. Current per controller file size: %zu bytes\n", per_nvme_file_size);
+    //     return;
+    // }
+
+    // // 构建GPU file 创建相应 数量的GPU 检查GPU file manager 中是否有对应数量的GPUfileID 没有则创建 并建立 link
+    // for (size_t i = 0; i < per_nvme_controller_files; ++i) {
+    //     GPUFileId gpu_file_id;
+    //     if (!gpu_file_manager_.getGPUFileIdByIndex(i, gpu_file_id)) {
+    //         // 不存在则创建
+    //         if (!gpu_file_manager_.createGPUFile(per_nvme_file_size, gpu_file_id)) {
+    //             geminifs_error("geminifs_init: Failed to create GPU file %zu of size %zu bytes\n", i, per_nvme_file_size);
+    //             return;
+    //         }
+    //         geminifs_debug("geminifs_init: Created GPU file %zu with ID %lu of size %zu bytes\n", i, gpu_file_id, per_nvme_file_size);
+    //     } else {
+    //         geminifs_debug("geminifs_init: GPU file %zu already exists with ID %lu\n", i, gpu_file_id);
+    //     }
+
+    //     // 为每个GPU file 创建对应的 NVMe link
+    //     std::vector<NVMe_Link> links;
+    //     for (size_t ctrl_idx = 0; ctrl_idx < nvme_params_.size(); ++ctrl_idx) {
+    //         NVMe_Link link;
+    //         link.controller_index = ctrl_idx;
+    //         link.name = std::to_string(i) + ".KV"; // 文件命名为 "0.KV", "1.KV", ...
+    //         link.file_size = per_nvme_file_size;
+    //         links.push_back(link);
+    //     }
+
+    //     if (!gpu_file_manager_.setLinksForFile(gpu_file_id, links)) {
+    //         geminifs_error("geminifs_init: Failed to set links for GPU file ID %lu\n", gpu_file_id);
+    //         return;
+    //     }
+    //     geminifs_debug("geminifs_init: Set %zu links for GPU file ID %lu\n", links.size(), gpu_file_id);
+
+
+
+
+
+
+
+
+
+
+
+
+     /***************************************************/
+     //  NVMEe file 初始化以及检查
+     /***************************************************/
+    // // 检查并创建每个NVMe控制器中的文件
+    // auto gpu_controller = geminifs_get_gpu_controller(current_gpu_id);
+    // if (gpu_controller) {
+    //     size_t nvme_count = gpu_controller->getControllerCount();
+    //     geminifs_debug("geminifs_init: Checking files for %zu NVMe controllers\n", nvme_count);
+        
+    //     for (size_t i = 0; i < nvme_count; ++i) {
+    //         auto nvme_controller = gpu_controller->getNVMeController(i);
+    //         if (nvme_controller) {
+    //             geminifs_debug("geminifs_init: Checking files for NVMe controller %zu\n", i);
+                
+    //             // 检查符合预期大小的有效文件数量
+    //             size_t expected_file_size = per_nvme_file_size;
+    //             size_t valid_file_count = nvme_controller->device_file_validate_sizes(expected_file_size);
+                
+    //             geminifs_info("geminifs_init: NVMe controller %zu has %zu valid files of size %zu bytes, expected %zu files\n", 
+    //                           i, valid_file_count, expected_file_size, per_nvme_controller_files);
+                
+    //             // 如果有效文件数量不够，创建缺失的文件
+    //             if (valid_file_count < per_nvme_controller_files) {
+    //                 size_t files_to_create = per_nvme_controller_files - valid_file_count;
+    //                 geminifs_info("geminifs_init: Need to create %zu additional files for NVMe controller %zu\n", 
+    //                               files_to_create, i);
+                    
+    //                 // 获取现有文件总数用于命名新文件
+    //                 size_t existing_file_count = nvme_controller->device_file_get_managed_file_count();
+                    
+    //                 for (size_t j = 0; j < files_to_create; ++j) {
+    //                     std::string filename = std::to_string(existing_file_count + j) + ".KV";
+                        
+    //                     // Use host_file_create_only_managed to create the file without opening it
+    //                     bool success = nvme_controller->host_file_create_only_managed(nvme_controller->controller->page_size, expected_file_size, filename);
+                        
+    //                     if (success) {
+    //                         geminifs_debug("geminifs_init: Successfully created file '%s' of size %zu bytes on NVMe controller %zu\n", 
+    //                                       filename.c_str(), expected_file_size, i);
+    //                     } else {
+    //                         geminifs_error("geminifs_init: Failed to create file '%s' on NVMe controller %zu\n", 
+    //                                       filename.c_str(), i);
+    //                         return;
+    //                     }
+    //                 }
+    //                 // 重新验证文件数量
+    //                 size_t final_valid_count = nvme_controller->device_file_validate_sizes(expected_file_size);
+    //                 if (final_valid_count < per_nvme_controller_files) {
+    //                     geminifs_error("geminifs_init: After file creation, still have insufficient valid files (%zu) for NVMe controller %zu\n", 
+    //                                   final_valid_count, i);
+    //                     return;
+    //                 }
+    //                 geminifs_info("geminifs_init: File creation successful, now have %zu valid files for NVMe controller %zu\n", 
+    //                               final_valid_count, i);
+    //             } else if (valid_file_count > per_nvme_controller_files) {
+    //                 geminifs_warn("geminifs_init: NVMe controller %zu has more valid files (%zu) than expected (%zu)\n", 
+    //                              i, valid_file_count, per_nvme_controller_files);
+    //             }
+                
+    //             geminifs_debug("geminifs_init: NVMe controller %zu file setup completed successfully\n", i);
+    //         } else {
+    //             geminifs_error("geminifs_init: Failed to get NVMe controller %zu\n", i);
+    //             return;
+    //         }
+    //     }
+        
+    //     geminifs_debug("geminifs_init: All NVMe controllers file setup completed successfully\n");
+    // } else {
+    //     geminifs_error("geminifs_init: Failed to get GPU controller for device %d\n", current_gpu_id);
+    //     return;
+    // }
+    // }
     is_init_ = true;
     
     geminifs_debug("geminifs_init: Successfully initialized GeminiFS for GPU device %d (reset=%s)\n", 
@@ -1434,5 +823,12 @@ __host__ void GeminiFS::init(const std::string& config_file_path, size_t num_fil
 }
 
 __host__ void GeminiFS::cleanup() {
+    // 释放GPUFileManager
+    if (gpu_file_manager_) {
+        geminifs_debug("GeminiFS::cleanup: Releasing GPUFileManager\n");
+        gpu_file_manager_.reset();
+    }
+    
+    // 清理所有GPU controllers
     geminifs_cleanup_all_gpu_controllers();
 }
