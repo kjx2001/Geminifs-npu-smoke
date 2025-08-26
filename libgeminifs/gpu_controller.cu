@@ -753,101 +753,84 @@ size_t GPUController::getControllerCount() const {
 
 // === File Operations ===
 
-// void* GPUController::openFile(GPUFileId gpu_file_id, 
-//                                 size_t file_size, 
-//                                 uint32_t o_flag, // device or host
-//                                 const std::vector<nvme_ctrl_param>& nvme_params, 
-//                                 GPUFileManager& gpu_file_manager) {
-//     if (!isInitialized()) {
-//         geminifs_error("GPU Controller: Device %d is not initialized\n", device_id_);
-//         return nullptr;
-//     }
+void* GPUController::openFile(GPUFileId gpu_file_id, 
+                                size_t file_size, 
+                                uint32_t o_flag, // device or host
+                                const std::vector<nvme_ctrl_param>& nvme_params, 
+                                GPUFileManager& gpu_file_manager) {
+    // if (!isInitialized()) {
+    //     geminifs_error("GPU Controller: Device %d is not initialized\n", device_id_);
+    //     return nullptr;
+    // }
 
-//     if (nvme_controllers_.empty() || nvme_params.empty() || nvme_controllers_.size() != nvme_params.size()) {
-//         geminifs_error("GPU Controller: Mismatch between NVMe controllers and parameters, or none provided.\n");
-//         return nullptr;
-//     }
+    // if (nvme_controllers_.empty() || nvme_params.empty() || nvme_controllers_.size() != nvme_params.size()) {
+    //     geminifs_error("GPU Controller: Mismatch between NVMe controllers and parameters, or none provided.\n");
+    //     return nullptr;
+    // }
 
-//     std::vector<std::string> all_nvme_file_names;
-//     std::vector<size_t> all_controller_indexes;
-//     std::vector<size_t> all_nvme_file_sizes; // per-link sizes
+    // std::vector<std::string> all_nvme_file_names;
+    // std::vector<size_t> all_controller_indexes;
+    // std::vector<size_t> all_nvme_file_sizes; // per-link sizes
 
-//     size_t remaining_file_size = file_size;
-//     for (size_t i = 0; i < nvme_controllers_.size(); ++i) {
-//         auto& nvme_controller = nvme_controllers_[i];
-//         const auto& nvme_param = nvme_params[i];
+    // size_t remaining_file_size = file_size;
+    // for (size_t i = 0; i < nvme_controllers_.size(); ++i) {
+    //     auto& nvme_controller = nvme_controllers_[i];
+    //     const auto& nvme_param = nvme_params[i];
 
-//         size_t size_on_this_controller = std::min(remaining_file_size, file_size / nvme_controllers_.size());
-//         remaining_file_size -= size_on_this_controller;
+    //     size_t size_on_this_controller = std::min(remaining_file_size, file_size / nvme_controllers_.size());
+    //     remaining_file_size -= size_on_this_controller;
 
-//         size_t max_io_size = nvme_controller->maxIOsize;
-//         if (max_io_size == 0) {
-//             geminifs_warn("GPU Controller: maxIOsize for controller %zu is zero, skipping.\n", i);
-//             continue;
-//         }
+    //     size_t max_io_size = nvme_controller->maxIOsize;
+    //     if (max_io_size == 0) {
+    //         geminifs_warn("GPU Controller: maxIOsize for controller %zu is zero, skipping.\n", i);
+    //         continue;
+    //     }
 
-//         size_t remaining_size = size_on_this_controller;
+    //     size_t remaining_size = size_on_this_controller;
 
-//         while (remaining_size > 0) {
-//             size_t chunk_size = std::min(remaining_size, max_io_size);
+    //     while (remaining_size > 0) {
+    //         size_t chunk_size = std::min(remaining_size, max_io_size);
             
-//             std::string filename = std::to_string(nvme_controller->next_nvme_file_id());
+    //         std::string filename = std::to_string(nvme_controller->next_nvme_file_id());
             
-//             void* file_handle = nvme_controller->g_open(filename, chunk_size, o_flag);
-//             if (!file_handle) {
-//                 geminifs_error("GPU Controller: Failed to create NVMe file '%s' on controller %zu\n", filename.c_str(), i);
-//                 // In a real scenario, we might want to clean up already created files
-//                 return nullptr;
-//             }
+    //         void* file_handle = nvme_controller->g_open(filename, chunk_size, o_flag);
+    //         if (!file_handle) {
+    //             geminifs_error("GPU Controller: Failed to create NVMe file '%s' on controller %zu\n", filename.c_str(), i);
+    //             // In a real scenario, we might want to clean up already created files
+    //             return nullptr;
+    //         }
 
-//             all_nvme_file_names.push_back(filename);
-//             all_controller_indexes.push_back(i);
-//             all_nvme_file_sizes.push_back(chunk_size);
+    //         all_nvme_file_names.push_back(filename);
+    //         all_controller_indexes.push_back(i);
+    //         all_nvme_file_sizes.push_back(chunk_size);
 
-//             remaining_size -= chunk_size;
-//         }
-//     }
+    //         remaining_size -= chunk_size;
+    //     }
+    // }
 
-//     GPUFileDesc out_desc;
-//     GPU_File* new_gpu_file = gpu_file_manager.createGPUFile(
-//         gpu_file_id,
-//         file_size,
-//         4096,
-//         all_nvme_file_names,
-//         all_controller_indexes,
-//         all_nvme_file_sizes,
-//         out_desc
-//     );
+    // GPUFileDesc out_desc;
+    // GPU_File* new_gpu_file = gpu_file_manager.createGPUFile(
+    //     gpu_file_id,
+    //     file_size,
+    //     4096,
+    //     all_nvme_file_names,
+    //     all_controller_indexes,
+    //     all_nvme_file_sizes,
+    //     out_desc
+    // );
 
-//     if (new_gpu_file == nullptr) {
-//         geminifs_error("GPU Controller: Failed to register GPUFile with GPUFileManager.\n");
-//         // Cleanup logic for created files should be here
-//         return nullptr;
-//     }
+    // if (new_gpu_file == nullptr) {
+    //     geminifs_error("GPU Controller: Failed to register GPUFile with GPUFileManager.\n");
+    //     // Cleanup logic for created files should be here
+    //     return nullptr;
+    // }
 
-//     // This is a placeholder, as the exact return type would depend on how the user wants to identify/use the opened file.
-//     // Returning the new_file_id cast to void* is one option.
-//     return reinterpret_cast<void*>(new_gpu_file);
-// }
-
-// === Utility Methods ===
-
-std::pair<size_t, size_t> GPUController::getMemoryStats() const {
-    std::lock_guard<std::mutex> lock(memory_mutex_);
-    
-    size_t total_memory = 0;
-    size_t total_tensors = dma_contexts_.size();
-    
-    for (const auto& pair : dma_contexts_) {
-        const geminifs_dma* dma_ctx = pair.second;
-        if (dma_ctx->dma_ptr) {
-            // Calculate memory based on DMA size (this might need adjustment based on actual DMA structure)
-            total_memory += dma_ctx->dma_ptr->n_ioaddrs * GPU_PAGE_SIZE;
-        }
-    }
-    
-    return std::make_pair(total_memory, total_tensors);
+    // // This is a placeholder, as the exact return type would depend on how the user wants to identify/use the opened file.
+    // // Returning the new_file_id cast to void* is one option.
+    // return reinterpret_cast<void*>(new_gpu_file);
 }
+
+
 
 // === Private Methods ===
 

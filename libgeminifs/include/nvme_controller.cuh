@@ -51,7 +51,8 @@ public:
     void* g_open(std::string filename, size_t file_size, uint32_t o_flag);
 
     // Managed file operations - automatically handle file descriptor tracking
-    host_fd_t host_file_create_managed(int block_size, size_t file_size, const std::string& filename);
+    uint32_t host_file_create_managed(int block_size, size_t file_size, const std::string& filename);
+    uint32_t host_file_create_managed(int block_size, size_t file_size);  // Auto-generate filename based on file ID
     bool host_file_create_only_managed(int block_size, size_t file_size, const std::string& filename);
     host_fd_t host_file_open_managed(const std::string& filepath, uint32_t o_flag);
     void host_file_close_managed(host_fd_t fd);
@@ -63,6 +64,12 @@ public:
     
     // delete up all files managed by this controller
     bool device_file_delete_all_files_managed();
+    
+    // Delete a single file managed by this controller by filename
+    bool device_file_delete_single_managed(const std::string& filename);
+    
+    // Delete a single file managed by this controller by NVMe file ID
+    bool host_file_delete_managed(uint32_t nvme_file_id);
     
     // Get the count of managed files
     size_t device_file_get_managed_file_count() const;
@@ -81,6 +88,9 @@ private:
     bool check_sys_config_exists();
     bool check_snvme_control_exists();
     ControllerPtr open_single_controller(const std::string& pci_addr, const nvme_ctrl_param& params);
+    
+    // Internal helper to create host_fd_t (for device operations)
+    host_fd_t create_host_fd_internal(int block_size, size_t file_size, const std::string& filename);
     
     // Device file management helper methods
     dev_fd_t copy_host_fd_to_device(host_fd_t host_fd, size_t hdr_size);

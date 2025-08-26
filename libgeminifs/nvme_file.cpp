@@ -324,17 +324,17 @@ void FileManager::loadFromFile() {
                  continue;
             }
 
-            filename_to_file_map_[std::string(desc.filename)] = desc;
+            fileid_to_file_map_[desc.slot_index] = desc;
         }
     }
 
-    if(filename_to_file_map_.size() != header_.active_record_count) {
+    if(fileid_to_file_map_.size() != header_.active_record_count) {
         std::cerr << "Warning: Header count mismatch. Correcting..." << std::endl;
-        header_.active_record_count = filename_to_file_map_.size();
+        header_.active_record_count = fileid_to_file_map_.size();
         pending_writes_count_++; // Mark for persistence
     }
 
-    std::cout << "Successfully loaded " << filename_to_file_map_.size() << " active file records." << std::endl;
+    std::cout << "Successfully loaded " << fileid_to_file_map_.size() << " active file records." << std::endl;
 }
 
 void FileManager::forcePersist() {
@@ -357,7 +357,7 @@ void FileManager::persistBitmap() {
         }
     }
 
-    header_.active_record_count = filename_to_file_map_.size();
+    header_.active_record_count = fileid_to_file_map_.size();
 
     fseek(log_file_handle_, 0, SEEK_SET);
     if (fwrite(&header_, sizeof(LogHeader), 1, log_file_handle_) != 1) {
@@ -398,14 +398,27 @@ bool FileManager::createFile(const std::string& filename, NVMeFileDesc& out_desc
 
     std::lock_guard<std::mutex> lock(mtx_);
 
-    if (filename_to_file_map_.count(filename)) {
-        std::cerr << "Error: File with name '" << filename << "' already exists." << std::endl;
-        return false;
-    }
-
     long slot = findNextFreeSlot();
     if (slot == -1) {
         std::cerr << "Error: Log file is full. Cannot create new file." << std::endl;
+        return false;
+    }
+
+    // If filename follows NVMe ID rule (pure number), verify it matches the slot
+    uint32_t parsed_id = parseFileIdFromFilename(filename);
+    if (parsed_id != UINT32_MAX) {
+        if (parsed_id != static_cast<uint32_t>(slot)) {
+            std::cerr << "Warning: Filename '" << filename << "' doesn't match allocated slot " << slot 
+                     << ". Using slot-based naming." << std::endl;
+        }
+    } else {
+        // Non-numeric filename is okay, but warn about naming convention
+        std::cerr << "Warning: Filename '" << filename << "' doesn't follow NVMe ID naming convention (should be numeric)." << std::endl;
+    }
+
+    // Check if the slot is already in use (this should not happen, but be safe)
+    if (fileid_to_file_map_.find(slot) != fileid_to_file_map_.end()) {
+        std::cerr << "Error: Slot " << slot << " is already occupied (this should not happen)." << std::endl;
         return false;
     }
 
@@ -424,7 +437,7 @@ bool FileManager::createFile(const std::string& filename, NVMeFileDesc& out_desc
     }
 
     dirty_bitmap_[slot] = true;
-    filename_to_file_map_[filename] = new_desc;
+    fileid_to_file_map_[slot] = new_desc;
     out_desc = new_desc;
 
     pending_writes_count_++;
@@ -435,17 +448,60 @@ bool FileManager::createFile(const std::string& filename, NVMeFileDesc& out_desc
     return true;
 }
 
-bool FileManager::deleteFile(const std::string& filename) {
+bool FileManager::createFile(NVMeFileDesc& out_desc, size_t file_size) {
     std::lock_guard<std::mutex> lock(mtx_);
 
-    auto it = filename_to_file_map_.find(filename);
-    if (it == filename_to_file_map_.end()) return false;
+    long slot = findNextFreeSlot();
+    if (slot == -1) {
+        std::cerr << "Error: Log file is full. Cannot create new file." << std::endl;
+        return false;
+    }
 
-    const NVMeFileDesc& desc_to_delete = it->second;
+    // Generate filename based on NVMe ID rule: filename = slot_id.toString()
+    std::string auto_filename = generateFilenameFromId(static_cast<uint32_t>(slot));
+    
+    if (auto_filename.length() >= 16) {
+        std::cerr << "Error: Auto-generated filename too long: " << auto_filename << std::endl;
+        return false;
+    }
+
+    NVMeFileDesc new_desc = {};
+    strncpy(new_desc.filename, auto_filename.c_str(), sizeof(new_desc.filename) - 1);
+
+    uint64_t now = getCurrentTimestamp();
+    new_desc.slot_index = slot;
+    new_desc.create_time = now;
+    new_desc.modify_time = now;
+    new_desc.size = file_size;
+
+    if (!writeRecordToSlot(new_desc, slot)) {
+        std::cerr << "Error: Failed to write new record to log file." << std::endl;
+        return false;
+    }
+
+    dirty_bitmap_[slot] = true;
+    fileid_to_file_map_[slot] = new_desc;
+    out_desc = new_desc;
+
+    pending_writes_count_++;
+    if (persistence_threshold_ == 0 || (persistence_threshold_ > 0 && pending_writes_count_ >= persistence_threshold_)) {
+        persistBitmap();
+    }
+
+    return true;
+}
+
+bool FileManager::deleteFile(uint32_t file_id) {
+    std::lock_guard<std::mutex> lock(mtx_);
+
+    auto file_it = fileid_to_file_map_.find(file_id);
+    if (file_it == fileid_to_file_map_.end()) return false;
+
+    const NVMeFileDesc& desc_to_delete = file_it->second;
     uint64_t slot = desc_to_delete.slot_index;
 
     dirty_bitmap_[slot] = false;
-    filename_to_file_map_.erase(it);
+    fileid_to_file_map_.erase(file_it);
 
     pending_writes_count_++;
     if (persistence_threshold_ == 0 || (persistence_threshold_ > 0 && pending_writes_count_ >= persistence_threshold_)) {
@@ -463,24 +519,48 @@ uint64_t FileManager::getCurrentTimestamp() {
     ).count();
 }
 
-bool FileManager::getFileByFilename(const std::string& filename, NVMeFileDesc& out_desc) const {
+bool FileManager::getFileById(uint32_t file_id, NVMeFileDesc& out_desc) const {
     std::lock_guard<std::mutex> lock(mtx_);
-    auto it = filename_to_file_map_.find(filename);
-    if (it != filename_to_file_map_.end()) {
+    auto it = fileid_to_file_map_.find(file_id);
+    if (it != fileid_to_file_map_.end()) {
         out_desc = it->second;
         return true;
     }
     return false;
 }
 
-std::vector<std::string> FileManager::getAllFilenames() const {
-    std::lock_guard<std::mutex> lock(mtx_);
-    std::vector<std::string> filenames;
-    filenames.reserve(filename_to_file_map_.size());
-    for (const auto& pair : filename_to_file_map_) {
-        filenames.push_back(pair.first);
+uint32_t FileManager::getFileIdByFilename(const std::string& filename) const {
+    // Since NVMe file naming rule is: filename = nvme_id.toString()
+    // We can directly parse the filename to get the ID
+    uint32_t file_id = parseFileIdFromFilename(filename);
+    
+    if (file_id != UINT32_MAX) {
+        // Verify the file actually exists in our map
+        std::lock_guard<std::mutex> lock(mtx_);
+        if (fileid_to_file_map_.find(file_id) != fileid_to_file_map_.end()) {
+            return file_id;
+        }
     }
-    return filenames;
+    
+    // If parsing fails or file not found, fall back to scanning (for non-standard filenames)
+    std::lock_guard<std::mutex> lock(mtx_);
+    for (const auto& pair : fileid_to_file_map_) {
+        if (std::string(pair.second.filename) == filename) {
+            return pair.first;
+        }
+    }
+    
+    return UINT32_MAX; // Return invalid ID if not found
+}
+
+std::vector<uint32_t> FileManager::getAllFileIds() const {
+    std::lock_guard<std::mutex> lock(mtx_);
+    std::vector<uint32_t> file_ids;
+    file_ids.reserve(fileid_to_file_map_.size());
+    for (const auto& pair : fileid_to_file_map_) {
+        file_ids.push_back(pair.first);
+    }
+    return file_ids;
 }
 
 // Host file descriptor management methods
@@ -520,6 +600,19 @@ void FileManager::closeAllOpenFiles() {
     
     open_files_.clear();
     std::cout << "All open files have been automatically closed." << std::endl;
+}
+
+// Static utility methods for NVMe ID <-> filename conversion
+std::string FileManager::generateFilenameFromId(uint32_t file_id) {
+    return std::to_string(file_id);
+}
+
+uint32_t FileManager::parseFileIdFromFilename(const std::string& filename) {
+    try {
+        return std::stoul(filename);
+    } catch (const std::exception& e) {
+        return UINT32_MAX; // Return invalid ID if parsing fails
+    }
 }
 
 

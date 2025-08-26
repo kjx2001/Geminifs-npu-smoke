@@ -12,6 +12,10 @@
 #include "file.cuh"
 #include "nvme_file.h"  // 引入NVMeFileDesc
 
+// 前向声明
+class GPUController;
+using GPUControllerPtr = std::shared_ptr<GPUController>;
+
 // GPUFile的唯一标识符
 using GPUFileId = uint32_t;
 
@@ -79,7 +83,7 @@ struct GPUFileDesc {
 
 class GPUFileManager {
 public:
-    explicit GPUFileManager(const std::string& log_path, size_t persistence_threshold = 1000);
+    explicit GPUFileManager(const std::string& log_path, GPUControllerPtr gpu_controller, size_t persistence_threshold = 1000);
     ~GPUFileManager();
     
     // 禁用拷贝和移动构造函数
@@ -88,10 +92,8 @@ public:
     GPUFileManager(GPUFileManager&&) = delete;
     GPUFileManager& operator=(GPUFileManager&&) = delete;
 
-    // 核心文件操作接口
-    bool createGPUFile(const std::vector<uint32_t>& nvme_file_ids, 
-                       const std::vector<size_t>& tensor_shape, GPUFileDesc& out_desc, 
-                       size_t total_size = 0, size_t block_size = 4096);
+    // 核心文件操作接口 - 重新设计为直接管理NVMe文件
+    bool createGPUFile(size_t total_file_size, const std::vector<size_t>& tensor_shape, GPUFileId& out_file_id);
     bool deleteGPUFile(GPUFileId file_id);
     bool getGPUFileById(GPUFileId file_id, GPUFileDesc& out_desc) const;
     std::vector<GPUFileId> getAllGPUFileIds() const;
@@ -121,6 +123,13 @@ private:
 
     size_t persistence_threshold_;
     size_t pending_writes_count_;
+    
+    // GPU控制器管理
+    GPUControllerPtr gpu_controller_;
+    
+    // 辅助方法：管理NVMe文件
+    bool createNVMeFilesForGPUFile(size_t file_size, std::vector<uint32_t>& nvme_file_ids);
+    bool deleteNVMeFilesForGPUFile(const CompactNVMeMapping& nvme_mapping);
 };
 
 

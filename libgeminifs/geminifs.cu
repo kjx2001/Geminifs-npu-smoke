@@ -1,4 +1,5 @@
 #include <atomic>
+#include <algorithm>
 #include <cassert>
 #include <cerrno>
 #include <cstddef>
@@ -587,6 +588,7 @@ __host__ bool GeminiFS::parse_and_setup_controllers(const std::string& config_fi
 __host__ void GeminiFS::handle_gpu_file_reset(int current_gpu_id) {
     // 询问用户确认
     std::string operation_desc = "Reset GeminiFS for GPU device " + std::to_string(current_gpu_id) + 
+                                "\n  - Clear all managed GPU files" +
                                 "\n  - Clear all managed NVMe files" +
                                 "\n  - Clear memory caches and links cache";
     
@@ -595,27 +597,51 @@ __host__ void GeminiFS::handle_gpu_file_reset(int current_gpu_id) {
         // 用户取消了 reset，但继续正常初始化
     } else {
         auto existing_gpu_controller = geminifs_get_gpu_controller(current_gpu_id);
-        if (existing_gpu_controller) {
-            geminifs_debug("geminifs_init: Reset mode - cleaning all NVMe files for GPU device %d\n", current_gpu_id);
+        if (existing_gpu_controller && gpu_file_manager_) {
+            geminifs_debug("geminifs_init: Reset mode - clearing all GPU files and NVMe files for GPU device %d\n", current_gpu_id);
             
-            // 获取所有NVMe controller并清空其文件
+            // 第一步：删除所有GPU文件（这会自动清理对应的NVMe文件映射）
+            auto gpu_file_ids = gpu_file_manager_->getAllGPUFileIds();
+            geminifs_info("geminifs_init: Found %zu GPU files to delete\n", gpu_file_ids.size());
+            
+            for (auto gpu_file_id : gpu_file_ids) {
+                geminifs_debug("geminifs_init: Deleting GPU file ID %u\n", gpu_file_id);
+                bool success = gpu_file_manager_->deleteGPUFile(gpu_file_id);
+                if (success) {
+                    geminifs_debug("geminifs_init: Successfully deleted GPU file ID %u and its NVMe files\n", gpu_file_id);
+                } else {
+                    geminifs_error("geminifs_init: Failed to delete GPU file ID %u\n", gpu_file_id);
+                }
+            }
+            
+            // 第二步：清空所有NVMe控制器中的剩余文件（确保彻底清理）
             size_t nvme_count = existing_gpu_controller->getControllerCount();
+            geminifs_debug("geminifs_init: Cleaning remaining files from %zu NVMe controllers\n", nvme_count);
+            
             for (size_t i = 0; i < nvme_count; ++i) {
                 auto nvme_controller = existing_gpu_controller->getNVMeController(i);
                 if (nvme_controller) {
-                    geminifs_debug("geminifs_init: Cleaning files for NVMe controller %zu\n", i);
+                    geminifs_debug("geminifs_init: Cleaning remaining files for NVMe controller %zu\n", i);
                     bool success = nvme_controller->device_file_delete_all_files_managed();
                     if (success) {
-                        geminifs_debug("geminifs_init: Successfully cleaned all files for NVMe controller %zu\n", i);
+                        geminifs_info("geminifs_init: Successfully cleaned remaining files for NVMe controller %zu\n", i);
                     } else {
-                        geminifs_error("geminifs_init: Failed to clean files for NVMe controller %zu\n", i);
+                        geminifs_error("geminifs_init: Failed to clean remaining files for NVMe controller %zu\n", i);
                     }
                 }
             }
+            
+            // 第三步：强制持久化GPUFileManager的更改
+            gpu_file_manager_->forcePersist();
                         
-            geminifs_debug("geminifs_init: Reset completed - all NVMe files and caches cleared\n");
+            geminifs_debug("geminifs_init: Reset completed - all GPU files, NVMe files and caches cleared\n");
         } else {
-            geminifs_debug("geminifs_init: No existing GPU controller found for reset on device %d\n", current_gpu_id);
+            if (!existing_gpu_controller) {
+                geminifs_debug("geminifs_init: No existing GPU controller found for reset on device %d\n", current_gpu_id);
+            }
+            if (!gpu_file_manager_) {
+                geminifs_debug("geminifs_init: GPUFileManager not initialized yet for reset on device %d\n", current_gpu_id);
+            }
         }
     }
 }
@@ -640,7 +666,7 @@ __host__ void GeminiFS::init(const std::string& config_file_path, int GPU_file_n
     init_GPU_file_size_ = file_size;
     size_t per_nvme_controller_files = 0;
     size_t per_nvme_file_size = 0;
-    geminifs_debug("GeminiFS::init: config_file_path=%s, num_files=%zu, file_size=%zu, reset=%s\n", 
+    geminifs_info("GeminiFS::init: config_file_path=%s, num_files=%zu, file_size=%zu, reset=%s\n", 
                    config_file_path.c_str(), num_files, file_size, reset ? "true" : "false");
     
     auto& registry = GPUControllerRegistry::getInstance();
@@ -678,17 +704,88 @@ __host__ void GeminiFS::init(const std::string& config_file_path, int GPU_file_n
     geminifs_debug("GeminiFS::init: Initializing GPUFileManager with log path: %s\n", 
                    gpu_file_manager_log_path.c_str());
     
-    gpu_file_manager_ = std::make_unique<GPUFileManager>(gpu_file_manager_log_path.string());
+    gpu_file_manager_ = std::make_unique<GPUFileManager>(gpu_file_manager_log_path.string(), gpu_controller);
     
     if (!gpu_file_manager_) {
         geminifs_error("GeminiFS::init: Failed to initialize GPUFileManager\n");
         return;
     }
 
-        // 如果需要reset，清空已存在的GPU controller下所有NVMe controller的文件
+    // 如果需要reset，清空已存在的GPU文件和对应的NVMe controller文件
     if (reset) {
         handle_gpu_file_reset(current_gpu_id);
     }
+
+
+    // 检查已有的GPU文件数量，决定是否需要创建新文件
+    auto existing_gpu_file_ids = gpu_file_manager_->getAllGPUFileIds();
+    size_t existing_file_count = existing_gpu_file_ids.size();
+    
+    geminifs_info("GeminiFS::init: Found %zu existing GPU files, need %zu total files\n", 
+                   existing_file_count, num_files);
+    
+    // 打印GPU file ID的范围信息
+    if (existing_file_count > 0) {
+        GPUFileId min_gpu_file_id = *std::min_element(existing_gpu_file_ids.begin(), existing_gpu_file_ids.end());
+        GPUFileId max_gpu_file_id = *std::max_element(existing_gpu_file_ids.begin(), existing_gpu_file_ids.end());
+        geminifs_info("GeminiFS::init: GPU file ID range: min=%u, max=%u\n", min_gpu_file_id, max_gpu_file_id);
+    } else {
+        geminifs_info("GeminiFS::init: No existing GPU files found\n");
+    }
+    
+    // 验证现有文件的配置是否匹配
+    bool config_mismatch = false;
+    if (existing_file_count > 0) {
+        // 检查第一个文件的配置作为样本
+        GPUFileDesc sample_desc;
+        if (gpu_file_manager_->getGPUFileById(existing_gpu_file_ids[0], sample_desc)) {
+            if (sample_desc.total_file_size != file_size ||
+                sample_desc.tensor_shape[0] != GPU_file_shape[0] ||
+                sample_desc.tensor_shape[1] != GPU_file_shape[1] ||
+                sample_desc.tensor_shape[2] != GPU_file_shape[2]) {
+                
+                geminifs_warn("GeminiFS::init: Existing GPU file configuration mismatch detected:\n");
+                geminifs_warn("  Existing: size=%zu, shape=[%u, %u, %u]\n", 
+                             sample_desc.total_file_size, 
+                             sample_desc.tensor_shape[0], sample_desc.tensor_shape[1], sample_desc.tensor_shape[2]);
+                geminifs_warn("  Requested: size=%zu, shape=[%zu, %zu, %zu]\n", 
+                             file_size, GPU_file_shape[0], GPU_file_shape[1], GPU_file_shape[2]);
+                geminifs_warn("  Consider using reset=true to clear existing files with different configuration\n");
+                config_mismatch = true;
+            }
+        }
+    }
+    
+    if (existing_file_count >= num_files && !config_mismatch) {
+        geminifs_info("GeminiFS::init: Sufficient GPU files already exist (%zu >= %zu) with matching configuration, skipping file creation\n", 
+                      existing_file_count, num_files);
+    } else {
+        if (config_mismatch) {
+            geminifs_warn("GeminiFS::init: Will create new files despite existing files due to configuration mismatch\n");
+        }
+        
+        size_t files_to_create = (existing_file_count < num_files) ? (num_files - existing_file_count) : num_files;
+        geminifs_info("GeminiFS::init: Creating %zu additional GPU files of size %zu bytes each\n", 
+                      files_to_create, file_size);
+        
+        for (size_t i = 0; i < files_to_create; ++i) {
+            GPUFileId gpu_file_id;
+            std::vector<size_t> tensor_shape = {GPU_file_shape[0], GPU_file_shape[1], GPU_file_shape[2]};
+            
+            if (!gpu_file_manager_->createGPUFile(file_size, tensor_shape, gpu_file_id)) {
+                geminifs_error("GeminiFS::init: Failed to create GPU file %zu of size %zu bytes\n", 
+                               existing_file_count + i, file_size);
+                return;
+            }
+            
+            geminifs_debug("GeminiFS::init: Successfully created GPU file %zu with ID %u\n", 
+                           existing_file_count + i, gpu_file_id);
+        }
+        
+        geminifs_info("GeminiFS::init: Successfully created %zu new GPU files, total files now: %zu\n", 
+                      files_to_create, existing_file_count + files_to_create);
+    }
+
 
 
 
