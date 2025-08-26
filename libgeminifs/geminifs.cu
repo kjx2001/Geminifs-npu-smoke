@@ -812,23 +812,6 @@ __host__ void GeminiFS::init(const std::string& config_file_path, int GPU_file_n
     //         geminifs_debug("geminifs_init: GPU file %zu already exists with ID %lu\n", i, gpu_file_id);
     //     }
 
-    //     // 为每个GPU file 创建对应的 NVMe link
-    //     std::vector<NVMe_Link> links;
-    //     for (size_t ctrl_idx = 0; ctrl_idx < nvme_params_.size(); ++ctrl_idx) {
-    //         NVMe_Link link;
-    //         link.controller_index = ctrl_idx;
-    //         link.name = std::to_string(i) + ".KV"; // 文件命名为 "0.KV", "1.KV", ...
-    //         link.file_size = per_nvme_file_size;
-    //         links.push_back(link);
-    //     }
-
-    //     if (!gpu_file_manager_.setLinksForFile(gpu_file_id, links)) {
-    //         geminifs_error("geminifs_init: Failed to set links for GPU file ID %lu\n", gpu_file_id);
-    //         return;
-    //     }
-    //     geminifs_debug("geminifs_init: Set %zu links for GPU file ID %lu\n", links.size(), gpu_file_id);
-
-
 
 
 
