@@ -83,9 +83,10 @@ set (CUDA_NVCC_FLAGS "${CUDA_NVCC_FLAGS} -lineinfo -D__CUDA__ -D__CUDACC__ -std=
 set (CUDA_NVCC_FLAGS_DEBUG "${CMAKE_NVCC_FLAGS_DEBUG} -DDEBUG" CACHE INTERNAL "" FORCE)
 set (CUDA_NVCC_FLAGS_RELEASE "${CMAKE_NVCC_FLAGS_RELEASE} -O2" CACHE INTERNAL "" FORCE)
 
-# set (CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xlinker -rpath=${CMAKE_BINARY_DIR}/lib --expt-relaxed-constexpr --expt-extended-lambda -lcudadevrt -lcudart ${GPU_ARCHS}")
-set (CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xlinker -rpath=${CMAKE_BINARY_DIR}/lib -rdc=true -O3 --expt-relaxed-constexpr --expt-extended-lambda -lcudadevrt -lcudart -lineinfo ${GPU_ARCHS}")
+# set (CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xlinker -rpath=${CMAKE_BINARY_DIR}/lib --expt-relaxed-constexpr --expt-extended-lambda  -lcudart ${GPU_ARCHS}")
+set (CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xlinker -rpath=${CMAKE_BINARY_DIR}/lib -rdc=true --expt-relaxed-constexpr --expt-extended-lambda -lineinfo ${GPU_ARCHS}")
 set (CMAKE_CUDA_FLAGS_DEBUG "${CMAKE_CUDA_FLAGS_DEBUG} -G -DDEBUG" CACHE INTERNAL "" FORCE)
+set (CMAKE_CUDA_FLAGS_RELEASE "${CMAKE_CUDA_FLAGS_RELEASE} -O2" CACHE INTERNAL "" FORCE)
 set (CMAKE_CUDA_GEMINIFS_LIBS "${CMAKE_CUDA_GEMINIFS_LIBS} -L${PROJECT_BINARY_DIR}/libgeminifs -L${PROJECT_SOURCE_DIR}/include/geminifs -L${CMAKE_BINARY_DIR}/lib -lgeminifs -lnvm")
 
 if (no_cc)
@@ -220,7 +221,7 @@ target_link_libraries(libgeminifs
     PRIVATE
     unwind
     unwind-x86_64
-    dl
+    ${CMAKE_DL_LIBS}
 )
 
 set_target_properties(libgeminifs PROPERTIES OUTPUT_NAME "geminifs")
@@ -261,8 +262,9 @@ macro (make_benchmark target binary_name files)
         target_sources (${target} PRIVATE ${files})
 
         add_dependencies (${target} libgeminifs)
-        target_link_libraries (${target} cudadevrt libnvm libgeminifs ${CUDA_LIBRARIES})
+        target_link_libraries (${target}  libnvm libgeminifs CUDA::cudart)
         set_target_properties (${target} PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+        set_target_properties (${target} PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)
         set_target_properties (${target} PROPERTIES OUTPUT_NAME "nvm-${binary_name}")
 
         list (APPEND benchmark_targets "${target}")
