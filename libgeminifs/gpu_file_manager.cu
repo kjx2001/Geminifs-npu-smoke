@@ -26,6 +26,7 @@
 #include <chrono>
 #include <iostream>
 #include <algorithm>
+#include <vector>
 
 // 构造函数
 GPUFileManager::GPUFileManager(const std::string& log_path, GPUControllerPtr gpu_controller, size_t persistence_threshold)
@@ -166,6 +167,82 @@ bool GPUFileManager::createGPUFile(size_t total_file_size, const std::vector<siz
     return true;
 }
 
+bool GPUFileManager::openGPUFile(GPUFileId file_id) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    
+    if (!gpu_controller_) {
+        geminifs_error("GPU controller is null\n");
+        return false;
+    }
+    
+    size_t nvme_count = gpu_controller_->getControllerCount();
+    if (nvme_count == 0) {
+        geminifs_error("No NVMe controllers available\n");
+        return false;
+    }
+
+    // 检查文件ID是否存在
+    auto it = file_id_to_desc_map_.find(file_id);
+    if (it == file_id_to_desc_map_.end()) {
+        geminifs_error("GPU file with ID %u does not exist\n", file_id);
+        return false;
+    }
+
+    // 获取文件描述符
+    const GPUFileDesc& desc = it->second;
+    const CompactNVMeMapping& nvme_mapping = desc.nvme_mapping;
+
+    if (!nvme_mapping.is_valid()) {
+        geminifs_debug("GPU file with ID %u is with invalid mapping\n", file_id);
+        return false;
+    }
+
+    for (size_t i = 0; i < nvme_count && i < 4; ++i) {
+        if (!nvme_mapping.has_nvme_controller(i)) {
+            continue;
+        }
+
+        auto nvme_file_id = nvme_mapping.nvme_file_ids[i];
+        if (nvme_file_id_to_dev_fd_map_.find(nvme_file_id) != nvme_file_id_to_dev_fd_map_.end()) {
+            continue;
+        }
+
+        auto nvme_controller = gpu_controller_->getNVMeController(i);
+        if (!nvme_controller) {
+            geminifs_error("Failed to get NVMe controller %zu\n", i);
+            return false;
+        }
+
+        dev_fd_t file = nvme_controller->device_file_open_managed(nvme_file_id);
+        if (file) {
+            geminifs_debug("Opened NVMe file ID %u on controller %zu\n", nvme_file_id, i);
+            nvme_file_id_to_dev_fd_map_[nvme_file_id] = file;
+        } else {
+            geminifs_error("Failed to open NVMe file ID %u on controller %zu\n", nvme_file_id, i);
+            return false;
+        }
+    }
+
+    // 所有资源初始化成功，将file_id添加到free_list以便后续使用
+    free_list_.push_back(file_id);
+
+    geminifs_debug("Opened GPU file with ID %u, total_size=%zu\n", file_id, desc.total_file_size);
+    return true;    
+}
+
+bool GPUFileManager::getGPUFile(GPUFileId& file_id) {
+    std::lock_guard<std::mutex> lock(mtx_);
+
+    if (free_list_.empty()) {
+        return false;
+    }
+
+    file_id = free_list_.back();
+    free_list_.pop_back();
+    
+    return true;
+}
+
 // 删除GPU文件
 bool GPUFileManager::deleteGPUFile(GPUFileId file_id) {
     std::lock_guard<std::mutex> lock(mtx_);
@@ -222,6 +299,48 @@ bool GPUFileManager::getGPUFileById(GPUFileId file_id, GPUFileDesc& out_desc) co
     }
     
     out_desc = it->second;
+    return true;
+}
+
+bool GPUFileManager::getDevFdById(GPUFileId file_id, std::vector<dev_fd_t>& dev_fds) const {
+    std::lock_guard<std::mutex> lock(mtx_);
+    
+    auto it = file_id_to_desc_map_.find(file_id);
+    if (it == file_id_to_desc_map_.end()) {
+        geminifs_debug("GPU file with ID %u not found\n", file_id);
+        return false;
+    }
+
+    const GPUFileDesc& desc = it->second;
+    const CompactNVMeMapping& nvme_mapping = desc.nvme_mapping;
+
+    if (!nvme_mapping.is_valid()) {
+        geminifs_debug("GPU file with ID %u is with invalid mapping\n", file_id);
+        return false;
+    }
+
+    size_t nvme_count = gpu_controller_->getControllerCount();
+    if (nvme_count == 0) {
+        geminifs_error("No NVMe controllers available\n");
+        return false;
+    }
+
+    for (size_t i = 0; i < nvme_count && i < 4; ++i) {
+        if (!nvme_mapping.has_nvme_controller(i)) {
+            continue;
+        }
+
+        auto nvme_file_id = nvme_mapping.nvme_file_ids[i];
+
+        auto it = nvme_file_id_to_dev_fd_map_.find(nvme_file_id);
+        if (it == nvme_file_id_to_dev_fd_map_.end()) {
+            geminifs_error("Failed to get opened device fd for file ID %u\n", nvme_file_id);
+            return false;
+        }
+
+        dev_fds.emplace_back(it->second);
+    }
+
     return true;
 }
 
@@ -428,15 +547,7 @@ bool GPUFileManager::createNVMeFilesForGPUFile(size_t file_size, std::vector<uin
         auto nvme_controller = gpu_controller_->getNVMeController(i);
         if (!nvme_controller) {
             geminifs_error("Failed to get NVMe controller %zu\n", i);
-            // 清理已创建的文件 - 使用控制器索引确保正确清理
-            for (size_t j = 0; j < nvme_file_ids.size(); ++j) {
-                auto cleanup_ctrl = gpu_controller_->getNVMeController(j);
-                if (cleanup_ctrl) {
-                    geminifs_debug("Cleaning up NVMe file ID %u from controller %zu\n", nvme_file_ids[j], j);
-                    cleanup_ctrl->host_file_delete_managed(nvme_file_ids[j]);
-                }
-            }
-            return false;
+            goto cleanup;
         }
         
         // 创建NVMe文件，让FileManager自动分配ID并生成对应的文件名
@@ -447,15 +558,7 @@ bool GPUFileManager::createNVMeFilesForGPUFile(size_t file_size, std::vector<uin
         
         if (nvme_file_id == UINT32_MAX) {
             geminifs_error("Failed to create NVMe file on controller %zu\n", i);
-            // 清理已创建的文件 - 使用控制器索引确保正确清理
-            for (size_t j = 0; j < nvme_file_ids.size(); ++j) {
-                auto cleanup_ctrl = gpu_controller_->getNVMeController(j);
-                if (cleanup_ctrl) {
-                    geminifs_debug("Cleaning up NVMe file ID %u from controller %zu\n", nvme_file_ids[j], j);
-                    cleanup_ctrl->host_file_delete_managed(nvme_file_ids[j]);
-                }
-            }
-            return false;
+            goto cleanup;
         }
         
         nvme_file_ids.push_back(nvme_file_id);
@@ -466,6 +569,17 @@ bool GPUFileManager::createNVMeFilesForGPUFile(size_t file_size, std::vector<uin
     geminifs_debug("Successfully created %zu NVMe files for GPU file, total_size=%zu\n", 
                    nvme_file_ids.size(), file_size);
     return true;
+
+cleanup:
+    // 清理已创建的文件 - 使用控制器索引确保正确清理
+    for (size_t j = 0; j < nvme_file_ids.size(); ++j) {
+        auto cleanup_ctrl = gpu_controller_->getNVMeController(j);
+        if (cleanup_ctrl) {
+            geminifs_debug("Cleaning up NVMe file ID %u from controller %zu\n", nvme_file_ids[j], j);
+            cleanup_ctrl->host_file_delete_managed(nvme_file_ids[j]);
+        }
+    }
+    return false;
 }
 
 // 删除GPU文件关联的NVMe文件

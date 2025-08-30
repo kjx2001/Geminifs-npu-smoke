@@ -18,6 +18,8 @@ constexpr size_t MAX_RECORDS = BITMAP_SIZE_BYTES * BITS_PER_BYTE; // 1,048,576 r
 // Forward declaration
 struct LogHeader;
 
+using NVMeFileId = uint32_t;
+
 
 
 /*host file*/
@@ -108,7 +110,7 @@ private:
     std::vector<bool> dirty_bitmap_;
     
     mutable std::mutex mtx_;
-    std::unordered_map<uint32_t, NVMeFileDesc> fileid_to_file_map_;  // ID to file mapping for efficiency
+    std::unordered_map<uint32_t, NVMeFileDesc> nvme_file_id_to_file_map_;  // ID to file mapping for efficiency
 
     // Host file descriptor tracking for automatic cleanup
     std::vector<OpenFileHandle> open_files_;

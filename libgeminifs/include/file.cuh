@@ -91,8 +91,6 @@ private:
         assert(file_offset % this->nvme_page_size == 0);
         nvme_ofst_t nvme_ofst = __get_nvmeofst(file_offset);
         uint64_t starting_lba = nvme_ofst >> hqps_block_size_log;
-        // printf("NVMe_File: nvme_ofst: %lx, starting_lba: %lx, nbytes: %zu\n", 
-        //        (unsigned long) nvme_ofst, (unsigned long) starting_lba, nbytes);
         int queue = queue_acquire_helper->acquire_queue();
         QueuePair* qp = &ctrl->d_qps[queue];
 

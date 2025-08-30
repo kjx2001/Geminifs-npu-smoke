@@ -11,6 +11,7 @@
 
 #include "file.cuh"
 #include "nvme_file.h"  // 引入NVMeFileDesc
+#include "geminifs.h"
 
 // 前向声明
 class GPUController;
@@ -94,8 +95,11 @@ public:
 
     // 核心文件操作接口 - 重新设计为直接管理NVMe文件
     bool createGPUFile(size_t total_file_size, const std::vector<size_t>& tensor_shape, GPUFileId& out_file_id);
+    bool openGPUFile(GPUFileId file_id);
+    bool getGPUFile(GPUFileId& file_id);
     bool deleteGPUFile(GPUFileId file_id);
     bool getGPUFileById(GPUFileId file_id, GPUFileDesc& out_desc) const;
+    bool getDevFdById(GPUFileId file_id, std::vector<dev_fd_t>& dev_fds) const;
     std::vector<GPUFileId> getAllGPUFileIds() const;
 
     // 持久化管理
@@ -119,7 +123,10 @@ private:
     std::vector<bool> dirty_bitmap_;
     
     mutable std::mutex mtx_;
+    // free_list_是**已打开的**GPUFile池
+    std::vector<GPUFileId> free_list_;
     std::unordered_map<GPUFileId, GPUFileDesc> file_id_to_desc_map_;
+    std::unordered_map<NVMeFileId, dev_fd_t> nvme_file_id_to_dev_fd_map_;
 
     size_t persistence_threshold_;
     size_t pending_writes_count_;

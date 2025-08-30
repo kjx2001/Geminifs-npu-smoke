@@ -324,17 +324,17 @@ void FileManager::loadFromFile() {
                  continue;
             }
 
-            fileid_to_file_map_[desc.slot_index] = desc;
+            nvme_file_id_to_file_map_[desc.slot_index] = desc;
         }
     }
 
-    if(fileid_to_file_map_.size() != header_.active_record_count) {
+    if(nvme_file_id_to_file_map_.size() != header_.active_record_count) {
         std::cerr << "Warning: Header count mismatch. Correcting..." << std::endl;
-        header_.active_record_count = fileid_to_file_map_.size();
+        header_.active_record_count = nvme_file_id_to_file_map_.size();
         pending_writes_count_++; // Mark for persistence
     }
 
-    std::cout << "Successfully loaded " << fileid_to_file_map_.size() << " active file records." << std::endl;
+    std::cout << "Successfully loaded " << nvme_file_id_to_file_map_.size() << " active file records." << std::endl;
 }
 
 void FileManager::forcePersist() {
@@ -357,7 +357,7 @@ void FileManager::persistBitmap() {
         }
     }
 
-    header_.active_record_count = fileid_to_file_map_.size();
+    header_.active_record_count = nvme_file_id_to_file_map_.size();
 
     fseek(log_file_handle_, 0, SEEK_SET);
     if (fwrite(&header_, sizeof(LogHeader), 1, log_file_handle_) != 1) {
@@ -376,7 +376,7 @@ void FileManager::persistBitmap() {
 }
 
 long FileManager::findNextFreeSlot() {
-    for (long i = 0; i < MAX_RECORDS; ++i) {
+    for (uint32_t i = 0; i < MAX_RECORDS; ++i) {
         if (!dirty_bitmap_[i]) {
             return i;
         }
@@ -417,7 +417,7 @@ bool FileManager::createFile(const std::string& filename, NVMeFileDesc& out_desc
     }
 
     // Check if the slot is already in use (this should not happen, but be safe)
-    if (fileid_to_file_map_.find(slot) != fileid_to_file_map_.end()) {
+    if (nvme_file_id_to_file_map_.find(slot) != nvme_file_id_to_file_map_.end()) {
         std::cerr << "Error: Slot " << slot << " is already occupied (this should not happen)." << std::endl;
         return false;
     }
@@ -437,7 +437,7 @@ bool FileManager::createFile(const std::string& filename, NVMeFileDesc& out_desc
     }
 
     dirty_bitmap_[slot] = true;
-    fileid_to_file_map_[slot] = new_desc;
+    nvme_file_id_to_file_map_[slot] = new_desc;
     out_desc = new_desc;
 
     pending_writes_count_++;
@@ -480,7 +480,7 @@ bool FileManager::createFile(NVMeFileDesc& out_desc, size_t file_size) {
     }
 
     dirty_bitmap_[slot] = true;
-    fileid_to_file_map_[slot] = new_desc;
+    nvme_file_id_to_file_map_[slot] = new_desc;
     out_desc = new_desc;
 
     pending_writes_count_++;
@@ -494,14 +494,14 @@ bool FileManager::createFile(NVMeFileDesc& out_desc, size_t file_size) {
 bool FileManager::deleteFile(uint32_t file_id) {
     std::lock_guard<std::mutex> lock(mtx_);
 
-    auto file_it = fileid_to_file_map_.find(file_id);
-    if (file_it == fileid_to_file_map_.end()) return false;
+    auto file_it = nvme_file_id_to_file_map_.find(file_id);
+    if (file_it == nvme_file_id_to_file_map_.end()) return false;
 
     const NVMeFileDesc& desc_to_delete = file_it->second;
     uint64_t slot = desc_to_delete.slot_index;
 
     dirty_bitmap_[slot] = false;
-    fileid_to_file_map_.erase(file_it);
+    nvme_file_id_to_file_map_.erase(file_it);
 
     pending_writes_count_++;
     if (persistence_threshold_ == 0 || (persistence_threshold_ > 0 && pending_writes_count_ >= persistence_threshold_)) {
@@ -521,8 +521,8 @@ uint64_t FileManager::getCurrentTimestamp() {
 
 bool FileManager::getFileById(uint32_t file_id, NVMeFileDesc& out_desc) const {
     std::lock_guard<std::mutex> lock(mtx_);
-    auto it = fileid_to_file_map_.find(file_id);
-    if (it != fileid_to_file_map_.end()) {
+    auto it = nvme_file_id_to_file_map_.find(file_id);
+    if (it != nvme_file_id_to_file_map_.end()) {
         out_desc = it->second;
         return true;
     }
@@ -537,14 +537,14 @@ uint32_t FileManager::getFileIdByFilename(const std::string& filename) const {
     if (file_id != UINT32_MAX) {
         // Verify the file actually exists in our map
         std::lock_guard<std::mutex> lock(mtx_);
-        if (fileid_to_file_map_.find(file_id) != fileid_to_file_map_.end()) {
+        if (nvme_file_id_to_file_map_.find(file_id) != nvme_file_id_to_file_map_.end()) {
             return file_id;
         }
     }
     
     // If parsing fails or file not found, fall back to scanning (for non-standard filenames)
     std::lock_guard<std::mutex> lock(mtx_);
-    for (const auto& pair : fileid_to_file_map_) {
+    for (const auto& pair : nvme_file_id_to_file_map_) {
         if (std::string(pair.second.filename) == filename) {
             return pair.first;
         }
@@ -556,8 +556,8 @@ uint32_t FileManager::getFileIdByFilename(const std::string& filename) const {
 std::vector<uint32_t> FileManager::getAllFileIds() const {
     std::lock_guard<std::mutex> lock(mtx_);
     std::vector<uint32_t> file_ids;
-    file_ids.reserve(fileid_to_file_map_.size());
-    for (const auto& pair : fileid_to_file_map_) {
+    file_ids.reserve(nvme_file_id_to_file_map_.size());
+    for (const auto& pair : nvme_file_id_to_file_map_) {
         file_ids.push_back(pair.first);
     }
     return file_ids;

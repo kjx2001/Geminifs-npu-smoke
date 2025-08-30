@@ -753,11 +753,11 @@ size_t GPUController::getControllerCount() const {
 
 // === File Operations ===
 
-void* GPUController::openFile(GPUFileId gpu_file_id, 
-                                size_t file_size, 
-                                uint32_t o_flag, // device or host
-                                const std::vector<nvme_ctrl_param>& nvme_params, 
-                                GPUFileManager& gpu_file_manager) {
+// void* GPUController::openFile(GPUFileId gpu_file_id, 
+//                                 size_t file_size, 
+//                                 uint32_t o_flag, // device or host
+//                                 const std::vector<nvme_ctrl_param>& nvme_params, 
+//                                 GPUFileManager& gpu_file_manager) {
     // if (!isInitialized()) {
     //     geminifs_error("GPU Controller: Device %d is not initialized\n", device_id_);
     //     return nullptr;
@@ -828,7 +828,7 @@ void* GPUController::openFile(GPUFileId gpu_file_id,
     // // This is a placeholder, as the exact return type would depend on how the user wants to identify/use the opened file.
     // // Returning the new_file_id cast to void* is one option.
     // return reinterpret_cast<void*>(new_gpu_file);
-}
+// }
 
 
 
@@ -934,7 +934,7 @@ bool GPUController::performDMASlicing(geminifs_dma* dma_ctx, size_t tensor_size,
                     sub_local_offset += sub_slice_size;
                     sub_remaining -= sub_slice_size;
                     sub_index++;
-        }
+                }
             }
             
             // 添加granularity组到列表
@@ -1119,8 +1119,8 @@ bool GPUController::initializePRPEntries(geminifs_dma* dma_ctx) {
             PRPMappingEntry entry(transfer_type, (uint32_t)slice_size, 0, 0, sub_slice.offset);
             group.prp_mappings.push_back(entry);
             
-            geminifs_debug("GPU Controller: Group[%zu] Sub-slice[%zu]: transfer_type=%u, size=%zu\n",
-                           group_idx, sub_idx, transfer_type, slice_size);
+            // geminifs_debug("GPU Controller: Group[%zu] Sub-slice[%zu]: transfer_type=%u, size=%zu\n",
+            //                group_idx, sub_idx, transfer_type, slice_size);
         }
         
         // geminifs_info("GPU Controller: Group[%zu] created %zu PRP mappings (%zu type2)\n", 
@@ -1219,8 +1219,8 @@ bool GPUController::initializePRPEntries(geminifs_dma* dma_ctx) {
                 
                 for (size_t j = 0; j < remaining_pages && j < 511; j++) {  // 最多511个entry
                     prp_list_host[j] = dma_ctx->dma_ptr->ioaddrs[current_ioaddr_index + 1 + j];
-                    geminifs_debug("GPU Controller: Group[%zu] Sub-slice[%zu] PRP List[%zu] = 0x%lx (ioaddr_index=%zu)\n",
-                                   group_idx, sub_idx, j, prp_list_host[j], current_ioaddr_index + 1 + j);
+                    // geminifs_debug("GPU Controller: Group[%zu] Sub-slice[%zu] PRP List[%zu] = 0x%lx (ioaddr_index=%zu)\n",
+                    //                group_idx, sub_idx, j, prp_list_host[j], current_ioaddr_index + 1 + j);
                 }
                 
                 // 将PRP List复制到GPU内存
@@ -1876,6 +1876,9 @@ __global__ void GPU_Write_kernel_multi(NVMe_File** d_fds,
                                        size_t len,
                                        GPUMemoryMapperDeviceView* device_view) {
     if (threadIdx.x == 0 && blockIdx.x == 0) {
+        printf("GPU_Write_kernel_multi: Launching with tensor_ptr=0x%lx, offset=%zu, len=%zu, num_fds=%u\n",
+               tensor_ptr, offset, len, num_fds);
+
         if (!device_view || num_fds == 0) {
             printf("GPU_Write_kernel_multi: invalid device_view or num_fds=0\n");
             return;
@@ -1890,13 +1893,21 @@ __global__ void GPU_Write_kernel_multi(NVMe_File** d_fds,
             mapping_entry_ptrs,
             1024,
             &tensor_size);
+        printf("GPU_Write_kernel_multi: found_count=%u, tensor_size=%lu\n", found_count, tensor_size);
+
         if (found_count == 0) {
             printf("GPU_Write_kernel_multi: no mappings for tensor 0x%lx\n", tensor_ptr);
             return;
         }
         const uint32_t THREADS_PER_BLOCK = 64;
         uint32_t blocks = (found_count + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+
+        printf("GPU_Write_kernel_multi: Launching nvme_batch_write_kernel_v3 with blocks=%u, threads_per_block=%u\n",
+               blocks, THREADS_PER_BLOCK);
+
         nvme_batch_write_kernel_v3<<<blocks, THREADS_PER_BLOCK>>>(d_fds, num_fds, tensor_ptr, found_count, offset, mapping_entry_ptrs, device_view);
+
+        printf("GPU_Write_kernel_multi: nvme_batch_write_kernel_v3 launched\n");
     }
 }
 
@@ -1917,6 +1928,10 @@ __global__ void nvme_batch_read_kernel_v3(NVMe_File** d_fds,
 
     // 选择 fd：tid % num_fds
     NVMe_File* d_fd = d_fds[tid % num_fds];
+
+    printf("nvme_batch_read_kernel_v3: tid=%u, fd_idx=%u, prp1=0x%lx, prp2=0x%lx, file_offset=%zu, len=%u\n",
+           tid, tid % num_fds, entry->prp1, entry->prp2, base_file_offset, entry->data_length);
+
     nvme_controller_g_read(d_fd, entry->prp1, entry->prp2, base_file_offset, entry->data_length);
 }
 
@@ -1935,5 +1950,9 @@ __global__ void nvme_batch_write_kernel_v3(NVMe_File** d_fds,
     if (!entry) return;
 
     NVMe_File* d_fd = d_fds[tid % num_fds];
+
+    printf("nvme_batch_write_kernel_v3: tid=%u, fd_idx=%u, prp1=0x%lx, prp2=0x%lx, file_offset=%zu, len=%u\n",
+           tid, tid % num_fds, entry->prp1, entry->prp2, base_file_offset, entry->data_length);
+
     nvme_controller_g_write(d_fd, entry->prp1, entry->prp2, base_file_offset, entry->data_length);
 }

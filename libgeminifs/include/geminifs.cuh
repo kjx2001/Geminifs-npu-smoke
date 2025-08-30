@@ -131,7 +131,7 @@ class GeminiFS {
         /**
          * Open file using GPU controller
          */
-        __host__ void* geminifs_gpu_open_file(int device_id, GPUFileId gpu_file_id, size_t file_size, uint32_t o_flag);
+        __host__ bool geminifs_gpu_open_file(int device_id, GPUFileId& gpu_file_id);
 
         /**
          * Cleanup all GPU controllers

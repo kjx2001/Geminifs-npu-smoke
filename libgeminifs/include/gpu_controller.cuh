@@ -415,7 +415,7 @@ public:
      * @param gpu_file_manager GPU file manager
      * @return File descriptor or nullptr if failed
      */
-    void* openFile(GPUFileId gpu_file_id, size_t file_size, uint32_t o_flag, const std::vector<nvme_ctrl_param>& nvme_params, GPUFileManager& gpu_file_manager);
+    // void* openFile(GPUFileId gpu_file_id, uint32_t o_flag, const std::vector<nvme_ctrl_param>& nvme_params, GPUFileManager& gpu_file_manager);
     
     // === GPU Management Methods ===
     

@@ -33,7 +33,6 @@ __global__ void init_nvme_file_kernel(NVMe_File* d_nvme_file,
                                        Controller* d_ctrl_ptr,
                                        struct geminiFS_hdr* device_fd,
                                        QueueAcquireHelper* d_queue_acquire_helper,
-                                       size_t file_size,
                                        uint32_t nvme_page_size,
                                        uint32_t block_size,
                                        uint32_t hqps_block_size_log) {
@@ -188,7 +187,7 @@ void * NVMeController::g_open(std::string filename, size_t file_size, uint32_t o
                     return nullptr;
                 }
             } else if (o_flag & O_DEVICE) {
-                result_fd = device_file_open_managed(filename, file_size);
+                result_fd = device_file_open_managed(filename);
                 if (result_fd == nullptr) {
                     geminifs_error("g_open: Failed to open existing device file '%s'\n", filename.c_str());
                     return nullptr;
@@ -509,6 +508,18 @@ host_fd_t NVMeController::host_file_open_managed(const std::string& filepath, ui
 }
 
 /**
+ * NVMeController member function to open a file with automatic FileManager integration
+ */
+host_fd_t NVMeController::host_file_open_managed(uint32_t id, uint32_t o_flag) {
+    NVMeFileDesc file_desc;
+    file_manager->getFileById(id, file_desc);
+
+    std::string filepath = get_file_path(file_desc);
+    
+    return host_file_open_managed(filepath, o_flag);
+}
+
+/**
  * NVMeController member function to close a file with automatic FileManager cleanup
  */    
 void NVMeController::host_file_close_managed(host_fd_t fd) {
@@ -636,7 +647,6 @@ dev_fd_t NVMeController::device_file_create_managed(int block_size, size_t file_
                                      (Controller*)controller->d_ctrl_ptr,
                                      (struct geminiFS_hdr*)device_fd,
                                      d_queue_acquire_helper,
-                                     file_size,
                                      controller->page_size,
                                      block_size,
                                      controller->h_qps[0]->block_size_log);
@@ -675,7 +685,7 @@ dev_fd_t NVMeController::device_file_create_managed(int block_size, size_t file_
 /**
  * NVMeController private function to open an existing file as a device file
  */
-dev_fd_t NVMeController::device_file_open_managed(const std::string& filename, size_t file_size) {
+dev_fd_t NVMeController::device_file_open_managed(const std::string& filename) {
     // Check if controller is properly initialized
     if (!is_initialized()) {
         geminifs_error("device file open managed: NVMeController is not properly initialized\n");
@@ -701,12 +711,12 @@ dev_fd_t NVMeController::device_file_open_managed(const std::string& filename, s
     }
     
     // Validate file size
-    if (host_fd->virtual_space_size != file_size) {
-        geminifs_error("device file open managed: File size mismatch. Expected %zu, got %zu\n", 
-                       file_size, host_fd->virtual_space_size);
-        host_file_close_managed(host_fd);
-        return nullptr;
-    }
+    // if (host_fd->virtual_space_size != file_size) {
+    //     geminifs_error("device file open managed: File size mismatch. Expected %zu, got %zu\n", 
+    //                    file_size, host_fd->virtual_space_size);
+    //     host_file_close_managed(host_fd);
+    //     return nullptr;
+    // }
     
     // Calculate header size
     size_t hdr_size = host_fd->first_block_base;
@@ -734,7 +744,6 @@ dev_fd_t NVMeController::device_file_open_managed(const std::string& filename, s
                                      (Controller*)controller->d_ctrl_ptr,
                                      (struct geminiFS_hdr*)device_fd,
                                      d_queue_acquire_helper,
-                                     file_size,
                                      controller->page_size,
                                      controller->blk_size,
                                      controller->blk_size_log);
@@ -768,6 +777,15 @@ dev_fd_t NVMeController::device_file_open_managed(const std::string& filename, s
                    filename.c_str(), device_fd);
     
     return d_nvme_file;
+}
+
+dev_fd_t NVMeController::device_file_open_managed(uint32_t id) {
+    NVMeFileDesc file_desc;
+    file_manager->getFileById(id, file_desc);
+
+    std::string filepath = get_file_path(file_desc);
+    
+    return device_file_open_managed(filepath);
 }
 
 /**
@@ -874,6 +892,11 @@ void NVMeController::cleanup_device_files() {
     }
     
     device_files_.clear();
+}
+
+string NVMeController::get_file_path(const NVMeFileDesc& file_desc) {
+    std::filesystem::path file_path = std::filesystem::path(controller->dev_mount_path) / file_desc.filename;
+    return file_path.string();
 }
 
 ControllerPtr NVMeController::open_single_controller(const std::string& pci_addr, const nvme_ctrl_param& params) {
@@ -1013,8 +1036,8 @@ bool NVMeController::device_file_delete_all_files_managed() {
     
     // Report results
     geminifs_debug("device_file_delete_all_files_managed: Cleanup complete. "
-                   "Successfully deleted: %zu, Failed: %zu, Total: %zu\n", 
-                   files_deleted, files_failed, all_filenames.size());
+                   "Successfully deleted: %zu, Failed: %zun", 
+                   files_deleted, files_failed);
     
     if (files_failed > 0) {
         geminifs_error("device_file_delete_all_files_managed: %zu files could not be completely cleaned up\n", 
@@ -1256,8 +1279,8 @@ size_t NVMeController::device_file_validate_sizes(size_t expected_size) const {
         }
     }
     
-    geminifs_debug("device_file_validate_sizes: Validation complete. Valid files with expected size: %zu out of %zu total files\n", 
-                   valid_files, all_filenames.size());
+    geminifs_debug("device_file_validate_sizes: Validation complete. Valid files with expected size: %zu\n", 
+                   valid_files);
     
     return valid_files;
 }

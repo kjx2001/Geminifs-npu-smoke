@@ -55,11 +55,13 @@ public:
     uint32_t host_file_create_managed(int block_size, size_t file_size);  // Auto-generate filename based on file ID
     bool host_file_create_only_managed(int block_size, size_t file_size, const std::string& filename);
     host_fd_t host_file_open_managed(const std::string& filepath, uint32_t o_flag);
+    host_fd_t host_file_open_managed(uint32_t nvme_file_id, uint32_t o_flag);
     void host_file_close_managed(host_fd_t fd);
 
     // Device file operations - manage host to device fd mapping
     dev_fd_t device_file_create_managed(int block_size, size_t file_size, const std::string& filename);
-    dev_fd_t device_file_open_managed(const std::string& filename, size_t file_size);
+    dev_fd_t device_file_open_managed(const std::string& filename);
+    dev_fd_t device_file_open_managed(uint32_t nvme_file_id);
     void device_file_close_managed(dev_fd_t device_fd);
     
     // delete up all files managed by this controller
@@ -95,6 +97,7 @@ private:
     // Device file management helper methods
     dev_fd_t copy_host_fd_to_device(host_fd_t host_fd, size_t hdr_size);
     void cleanup_device_files();
+    string get_file_path(const NVMeFileDesc& file_desc);
     
     // Initialization state
     bool is_initialized_;
