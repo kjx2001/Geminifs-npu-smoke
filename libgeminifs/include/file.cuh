@@ -66,20 +66,49 @@ private:
 
     __forceinline__ __device__ nvme_ofst_t __get_nvmeofst(vaddr_t va) const {
         assert(hdr);
-        uint64_t blk_id = va >> hdr->block_bit;
+        uint64_t blk_id = ((uint64_t)va) >> hdr->block_bit;
         uint64_t start_blk_id = 0;
         uint64_t end_blk_id = 0;
 
+        geminifs_debug("__get_nvmeofst: va=0x%llx, blk_id=%llu, block_bit=%u, extent_count=%llu\n",
+            (unsigned long long)va,
+            (unsigned long long)blk_id,
+            (unsigned)hdr->block_bit,
+            (unsigned long long)hdr->extent_count);
+
         for (size_t i = 0; i < hdr->extent_count; ++i) {
-            end_blk_id += hdr->extents[i].fe_length >> hdr->block_bit;
-            assert(blk_id < end_blk_id);
-            if (blk_id >= start_blk_id) {
-                return hdr->extents[i].fe_physical + ((blk_id - start_blk_id) << hdr->block_bit);
+            uint64_t add = ((uint64_t)hdr->extents[i].fe_length) >> hdr->block_bit;
+            end_blk_id += add;
+
+            geminifs_debug("va=0x%llx, extent[%llu], fe_length=%llu, fe_physical=0x%llx, start_blk_id=%llu, end_blk_id=%llu\n",
+                (unsigned long long)va,
+                (unsigned long long)i,
+                (unsigned long long)hdr->extents[i].fe_length,
+                (unsigned long long)hdr->extents[i].fe_physical,
+                (unsigned long long)start_blk_id,
+                (unsigned long long)end_blk_id);
+
+            /* 检查是否在这个 extent 范围内： [start_blk_id, end_blk_id) */
+            if (blk_id >= start_blk_id && blk_id < end_blk_id) {
+                uint64_t offset_blk = (uint64_t)(blk_id - start_blk_id);
+                uint64_t byte_offset = offset_blk << hdr->block_bit; /* 保证 64-bit */
+                nvme_ofst_t result = (nvme_ofst_t)( (uint64_t)hdr->extents[i].fe_physical + byte_offset );
+
+                geminifs_debug("Match: va=0x%llx, i=%llu, fe_physical=0x%llx, offset_blk=%llu, byte_offset=%llu, result=0x%llx\n",
+                    (unsigned long long)va,
+                    (unsigned long long)i,
+                    (unsigned long long)hdr->extents[i].fe_physical,
+                    (unsigned long long)offset_blk,
+                    (unsigned long long)byte_offset,
+                    (unsigned long long)result);
+
+                return result;
             }
             start_blk_id = end_blk_id;
         }
 
-        assert(false && "Invalid virtual address for NVMe offset calculation");
+        geminifs_error("Invalid virtual address for NVMe offset calculation: va=0x%llx\n", (unsigned long long)va);
+        assert(false);
         return 0;
     }
 
@@ -90,7 +119,10 @@ private:
         assert(nbytes % this->nvme_page_size == 0);
         assert(file_offset % this->nvme_page_size == 0);
         nvme_ofst_t nvme_ofst = __get_nvmeofst(file_offset);
+        uint32_t tid = threadIdx.x + blockIdx.x * blockDim.x;
         uint64_t starting_lba = nvme_ofst >> hqps_block_size_log;
+        printf("NVMe_File: tid:%d, offset: %lx, nvme_ofst: %lx, starting_lba: %lx, nbytes: %lu\n", 
+               tid, file_offset, (unsigned long) nvme_ofst, (unsigned long) starting_lba, (unsigned long) nbytes);
         int queue = queue_acquire_helper->acquire_queue();
         QueuePair* qp = &ctrl->d_qps[queue];
 
@@ -131,10 +163,10 @@ public:
     }
     
     __forceinline__ __device__ void read_in(uint64_t prp1, uint64_t prp2 ,size_t file_offset, size_t nbytes) {
-        nvme_xfer(file_offset, nbytes, prp1, prp2 ,FILE_XFER_READ);
+        nvme_xfer(file_offset, nbytes, prp1, prp2, FILE_XFER_READ);
     }
     __forceinline__ __device__ void write_out(uint64_t prp1, uint64_t prp2 , size_t file_offset, size_t nbytes) {
-        nvme_xfer(file_offset, nbytes, prp1, prp2 , FILE_XFER_WRITE);
+        nvme_xfer(file_offset, nbytes, prp1, prp2, FILE_XFER_WRITE);
     }
 };
 struct NVMe_Link {

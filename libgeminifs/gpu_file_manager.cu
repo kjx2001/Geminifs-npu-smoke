@@ -167,7 +167,7 @@ bool GPUFileManager::createGPUFile(size_t total_file_size, const std::vector<siz
     return true;
 }
 
-bool GPUFileManager::openGPUFile(GPUFileId file_id) {
+bool GPUFileManager::initGPUFile(GPUFileId file_id) {
     std::lock_guard<std::mutex> lock(mtx_);
     
     if (!gpu_controller_) {
@@ -230,7 +230,7 @@ bool GPUFileManager::openGPUFile(GPUFileId file_id) {
     return true;    
 }
 
-bool GPUFileManager::getGPUFile(GPUFileId& file_id) {
+bool GPUFileManager::openGPUFile(GPUFileId& file_id) {
     std::lock_guard<std::mutex> lock(mtx_);
 
     if (free_list_.empty()) {
@@ -239,9 +239,68 @@ bool GPUFileManager::getGPUFile(GPUFileId& file_id) {
 
     file_id = free_list_.back();
     free_list_.pop_back();
-    
+
+    std::vector<dev_fd_t> dev_fds;
+    if (!getDevFdById(file_id, dev_fds)) {
+        assert(false);
+    }
+    size_t num_fds = dev_fds.size();
+
+
+    GPUIoContext* io_context;
+    cudaError_t err = cudaMalloc(&io_context, sizeof(GPUIoContext));
+    if (err != cudaSuccess) {
+        geminifs_error("openGPUFile: cudaMalloc GPUIoContext failed: %s\n", cudaGetErrorString(err));
+        goto fail_after_pop_back;
+    }
+
+    cudaMemcpy(&io_context->num_files, &num_fds, sizeof(io_context->num_files), cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        geminifs_error("openGPUFile: cudaMemcpy num_files failed: %s\n", cudaGetErrorString(err));
+        goto fail_after_cuda_malloc;
+    }
+
+    err = cudaMemcpy(&io_context->nvme_files, dev_fds.data(), num_fds * sizeof(NVMe_File*), cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        geminifs_error("openGPUFile: cudaMemcpy nvme_files failed: %s\n", cudaGetErrorString(err));
+        goto fail_after_cuda_malloc;
+    }
+
+    file_id_to_ctx_map_[file_id] = io_context;
+    return true;
+
+fail_after_cuda_malloc:
+    cudaFree(io_context);
+fail_after_pop_back:
+    free_list_.push_back(file_id);
+    return false;
+}
+
+
+bool GPUFileManager::closeGPUFile(GPUFileId file_id) {
+    std::lock_guard<std::mutex> lock(mtx_);
+
+    auto it = file_id_to_ctx_map_.find(file_id);
+    if (it == file_id_to_ctx_map_.end()) {
+        geminifs_debug("GPU file with ID %u is not open\n", file_id);
+        return false;
+    }
+
+    GPUIoContext* io_context = it->second;
+    cudaFree(io_context);
+    file_id_to_ctx_map_.erase(it);
+
+    auto free_it = std::lower_bound(free_list_.begin(), free_list_.end(), file_id);
+    if (free_it != free_list_.end() && *free_it == file_id) {
+        geminifs_warn("Double close detected!");
+    } else {
+        free_list_.insert(free_it, file_id);
+    }
+
+    geminifs_debug("Closed GPU file with ID: %u\n", file_id);
     return true;
 }
+
 
 // 删除GPU文件
 bool GPUFileManager::deleteGPUFile(GPUFileId file_id) {
@@ -303,8 +362,6 @@ bool GPUFileManager::getGPUFileById(GPUFileId file_id, GPUFileDesc& out_desc) co
 }
 
 bool GPUFileManager::getDevFdById(GPUFileId file_id, std::vector<dev_fd_t>& dev_fds) const {
-    std::lock_guard<std::mutex> lock(mtx_);
-    
     auto it = file_id_to_desc_map_.find(file_id);
     if (it == file_id_to_desc_map_.end()) {
         geminifs_debug("GPU file with ID %u not found\n", file_id);
@@ -341,6 +398,19 @@ bool GPUFileManager::getDevFdById(GPUFileId file_id, std::vector<dev_fd_t>& dev_
         dev_fds.emplace_back(it->second);
     }
 
+    return true;
+}
+
+bool GPUFileManager::getIoContextById(GPUFileId file_id, GPUIoContext** io_ctx) const {
+    std::lock_guard<std::mutex> lock(mtx_);
+    
+    auto it = file_id_to_ctx_map_.find(file_id);
+    if (it == file_id_to_ctx_map_.end()) {
+        geminifs_debug("GPU file with ID %u has no IO context\n", file_id);
+        return false;
+    }
+    
+    *io_ctx = it->second;
     return true;
 }
 

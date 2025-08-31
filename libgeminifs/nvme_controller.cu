@@ -99,7 +99,7 @@ NVMeController::NVMeController(const nvme_ctrl_param& params) : is_initialized_(
             throw std::runtime_error("Failed to initialize QueueAcquireHelper on GPU");
         }
         
-        geminifs_debug("Successfully allocated and initialized QueueAcquireHelper on GPU at %p for %d queues\n", 
+        geminifs_debug("Successfully allocated and initialized QueueAcquireHelper on GPU at %p for %lu queues\n", 
                        d_queue_acquire_helper, params.numQueues);
     }
     
@@ -310,7 +310,7 @@ uint32_t NVMeController::host_file_create_managed(int block_size, size_t file_si
     hdr->magic_num = the_geminiFS_magic.magic_num;
     hdr->first_block_base = hdr_size;
     hdr->virtual_space_size = file_size;
-    hdr->block_bit = __builtin_clzll(block_size); // Block size in bits
+    hdr->block_bit = __builtin_ctzll(block_size); // Block size in bits
 
     // Open file
     int fd = open(file_path_str.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0666);
@@ -332,15 +332,15 @@ uint32_t NVMeController::host_file_create_managed(int block_size, size_t file_si
     
     // Refine NVMe offsets
     host_refine_nvmeofst(hdr);
-    
-    // Write header to file
-    if (write(fd, hdr, hdr_size) != (ssize_t)hdr_size) {
-        geminifs_error("host_file_create_managed: Failed to write header to file '%s': %s\n", 
-                      file_path_str.c_str(), strerror(errno));
-        close(fd);
-        free(hdr);
-        return UINT32_MAX;
-    }
+   
+    // // Write header to file
+    // if (write(fd, hdr, hdr_size) != (ssize_t)hdr_size) {
+    //     geminifs_error("host_file_create_managed: Failed to write header to file '%s': %s\n", 
+    //                   file_path_str.c_str(), strerror(errno));
+    //     close(fd);
+    //     free(hdr);
+    //     return UINT32_MAX;
+    // }
     
     // Close file immediately - we only create it, don't keep it open
     close(fd);
@@ -415,7 +415,7 @@ uint32_t NVMeController::host_file_create_managed(int block_size, size_t file_si
     hdr->magic_num = the_geminiFS_magic.magic_num;
     hdr->first_block_base = hdr_size;
     hdr->virtual_space_size = file_size;
-    hdr->block_bit = __builtin_clzll(block_size); // Block size in bits
+    hdr->block_bit = __builtin_ctzll(block_size); // Block size in bits
 
     // Create and write file, then immediately close
     int fd = open(file_path_str.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0666);
@@ -445,17 +445,17 @@ uint32_t NVMeController::host_file_create_managed(int block_size, size_t file_si
     // Refine NVMe offsets
     host_refine_nvmeofst(hdr);
 
-    // Write header to file
-    if (write(fd, hdr, hdr_size) != (ssize_t)hdr_size) {
-        geminifs_error("host_file_create_managed: Failed to write header to file '%s': %s\n", 
-                       file_path_str.c_str(), strerror(errno));
-        close(fd);
-        unlink(file_path_str.c_str()); // Delete the incomplete file
-        free(hdr);
-        // Clean up the FileManager entry
-        file_manager->deleteFile(file_desc.slot_index);
-        return UINT32_MAX;
-    }
+    // // Write header to file
+    // if (write(fd, hdr, hdr_size) != (ssize_t)hdr_size) {
+    //     geminifs_error("host_file_create_managed: Failed to write header to file '%s': %s\n", 
+    //                    file_path_str.c_str(), strerror(errno));
+    //     close(fd);
+    //     unlink(file_path_str.c_str()); // Delete the incomplete file
+    //     free(hdr);
+    //     // Clean up the FileManager entry
+    //     file_manager->deleteFile(file_desc.slot_index);
+    //     return UINT32_MAX;
+    // }
 
     // Close file immediately - we only created it, don't need to keep it open
     close(fd);
@@ -564,7 +564,7 @@ host_fd_t NVMeController::create_host_fd_internal(int block_size, size_t file_si
     hdr->magic_num = the_geminiFS_magic.magic_num;
     hdr->first_block_base = hdr_size;
     hdr->virtual_space_size = file_size;
-    hdr->block_bit = __builtin_clzll(block_size);
+    hdr->block_bit = __builtin_ctzll(block_size);
 
     // Open file
     int fd = open(file_path_str.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0666);
@@ -958,7 +958,7 @@ bool NVMeController::device_file_delete_all_files_managed() {
     }
     
     geminifs_debug("device_file_delete_all_files_managed: Starting cleanup for mount path '%s'\n", 
-                   controller->dev_mount_path);
+                   controller->dev_mount_path.c_str());
     
     // Get all file IDs from the FileManager log
     std::vector<uint32_t> all_file_ids = file_manager->getAllFileIds();
@@ -1067,7 +1067,7 @@ bool NVMeController::device_file_delete_single_managed(const std::string& filena
     }
     
     geminifs_debug("device_file_delete_single_managed: Deleting file '%s' from mount path '%s'\n", 
-                   filename.c_str(), controller->dev_mount_path);
+                   filename.c_str(), controller->dev_mount_path.c_str());
     
     // Parse file ID directly from filename (since filename = nvme_id.toString())
     uint32_t file_id = FileManager::parseFileIdFromFilename(filename);
@@ -1336,7 +1336,7 @@ bool NVMeController::host_file_create_only_managed(int block_size, size_t file_s
     auto nvpage_size = controller->page_size;
     assert(block_size % nvpage_size == 0);
 
-    auto hdr_size = GEMINI_HDR_MAX_SIZE;
+    size_t hdr_size = GEMINI_HDR_MAX_SIZE;
 
     // Allocate host memory for the header
     struct geminiFS_hdr *hdr = (struct geminiFS_hdr *)malloc(hdr_size);
@@ -1359,7 +1359,7 @@ bool NVMeController::host_file_create_only_managed(int block_size, size_t file_s
     hdr->magic_num = the_geminiFS_magic.magic_num;
     hdr->first_block_base = hdr_size;
     hdr->virtual_space_size = file_size;
-    hdr->block_bit = __builtin_clzll(block_size); // Block size in bits
+    hdr->block_bit = __builtin_ctzll(block_size); // Block size in bits
 
     // Create and write file, then immediately close
     int fd = open(file_path.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0666);

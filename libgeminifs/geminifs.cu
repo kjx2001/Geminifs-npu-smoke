@@ -288,7 +288,25 @@ __host__ bool GeminiFS::geminifs_gpu_open_file(int device_id, GPUFileId& id) {
         return false;
     }
 
-    return gpu_file_manager_->getGPUFile(id);
+    return gpu_file_manager_->openGPUFile(id);
+}
+
+
+
+
+__host__ bool GeminiFS::geminifs_gpu_close_file(int device_id, GPUFileId id) {
+    auto gpu_controller = geminifs_get_gpu_controller(device_id);
+    if (!gpu_controller) {
+        geminifs_error("geminifs_gpu_close_file: No GPU controller found for device %d\n", device_id);
+        return false;
+    }
+    
+    if (!gpu_file_manager_) {
+        geminifs_error("geminifs_gpu_close_file: GPUFileManager not initialized\n");
+        return false;
+    }
+
+    return gpu_file_manager_->closeGPUFile(id);
 }
 
 
@@ -310,9 +328,9 @@ __host__ bool GeminiFS::geminifs_GPU_read_kernel(torch::Tensor& tensor, GPUFileI
         return false;
     }
 
-    std::vector<dev_fd_t> dev_fds;
-    if (!gpu_file_manager_->getDevFdById(gpu_file_id, dev_fds)) {
-        geminifs_error("GPU_write_kernel: GPUFileId %u not found\n", gpu_file_id);
+    GPUIoContext* io_ctx;
+    if (!gpu_file_manager_->getIoContextById(gpu_file_id, &io_ctx)) {
+        geminifs_error("GPU_read_kernel: GPU File %u not opened\n", gpu_file_id);
         return false;
     }
 
@@ -329,29 +347,13 @@ __host__ bool GeminiFS::geminifs_GPU_read_kernel(torch::Tensor& tensor, GPUFileI
         return false;
     }
 
-    // 拷贝 NVMe_File** 到设备
-    NVMe_File** d_fds = nullptr;
-    size_t num_fds = dev_fds.size();
-    cudaError_t err = cudaMalloc(&d_fds, num_fds * sizeof(NVMe_File*));
-    if (err != cudaSuccess) {
-        geminifs_error("GPU_read_kernel: cudaMalloc d_fds failed: %s\n", cudaGetErrorString(err));
-        return false;
-    }
-    err = cudaMemcpy(d_fds, dev_fds.data(), num_fds * sizeof(NVMe_File*), cudaMemcpyHostToDevice);
-    if (err != cudaSuccess) {
-        cudaFree(d_fds);
-        geminifs_error("GPU_read_kernel: cudaMemcpy d_fds failed: %s\n", cudaGetErrorString(err));
-        return false;
-    }
-
     // 启动多FD内核（内核内部根据 tid%num_fds 分发并触发 v3 批量）
     uint64_t tensor_ptr = reinterpret_cast<uint64_t>(tensor.data_ptr());
     size_t offset = 0;
     size_t len = static_cast<size_t>(tensor.numel()) * static_cast<size_t>(tensor.element_size());
-    GPU_Read_kernel_multi<<<1,1>>>(d_fds, static_cast<uint32_t>(num_fds), tensor_ptr, offset, len, device_view);
-    err = cudaDeviceSynchronize();
+    GPU_Read_kernel_multi<<<1,1>>>(io_ctx, tensor_ptr, offset, len, device_view);
+    cudaError_t err = cudaDeviceSynchronize();
 
-    cudaFree(d_fds);
     if (err != cudaSuccess) {
         geminifs_error("GPU_read_kernel: GPU_Read_kernel_multi failed: %s\n", cudaGetErrorString(err));
         return false;
@@ -373,10 +375,10 @@ __host__ bool GeminiFS::geminifs_GPU_write_kernel(const torch::Tensor& tensor, G
         geminifs_error("GPU_write_kernel: GPUFileManager not initialized\n");
         return false;
     }
-    
-    std::vector<dev_fd_t> dev_fds;
-    if (!gpu_file_manager_->getDevFdById(gpu_file_id, dev_fds)) {
-        geminifs_error("GPU_write_kernel: GPUFileId %u not found\n", gpu_file_id);
+
+    GPUIoContext* io_ctx;
+    if (!gpu_file_manager_->getIoContextById(gpu_file_id, &io_ctx)) {
+        geminifs_error("GPU_write_kernel: GPU File %u not opened\n", gpu_file_id);
         return false;
     }
 
@@ -393,31 +395,13 @@ __host__ bool GeminiFS::geminifs_GPU_write_kernel(const torch::Tensor& tensor, G
         return false;
     }
 
-
-    // // 拷贝 NVMe_File** 到设备
-    NVMe_File** d_fds = nullptr;
-    size_t num_fds = dev_fds.size();
-    cudaError_t err = cudaMalloc(&d_fds, num_fds * sizeof(NVMe_File*));
-    if (err != cudaSuccess) {
-        geminifs_error("GPU_write_kernel: cudaMalloc d_fds failed: %s\n", cudaGetErrorString(err));
-        return false;
-    }
-    // dev_fd_t is an alias of NVMe_File*  
-    err = cudaMemcpy(d_fds, dev_fds.data(), num_fds * sizeof(NVMe_File*), cudaMemcpyHostToDevice);
-    if (err != cudaSuccess) {
-        cudaFree(d_fds);
-        geminifs_error("GPU_write_kernel: cudaMemcpy d_fds failed: %s\n", cudaGetErrorString(err));
-        return false;
-    }
-
     // 启动多FD内核
     uint64_t tensor_ptr = reinterpret_cast<uint64_t>(tensor.data_ptr());
     size_t offset = 0;
     size_t len = static_cast<size_t>(tensor.numel()) * static_cast<size_t>(tensor.element_size());
-    GPU_Write_kernel_multi<<<1,1>>>(d_fds, static_cast<uint32_t>(num_fds), tensor_ptr, offset, len, device_view);
-    err = cudaDeviceSynchronize();
+    GPU_Write_kernel_multi<<<1,1>>>(io_ctx, tensor_ptr, offset, len, device_view);
+    cudaError_t err = cudaDeviceSynchronize();
 
-    cudaFree(d_fds);
     if (err != cudaSuccess) {
         geminifs_error("GPU_write_kernel: GPU_Write_kernel_multi failed: %s\n", cudaGetErrorString(err));
         return false;
@@ -736,12 +720,12 @@ __host__ void GeminiFS::init(const std::string& config_file_path, int GPU_file_n
     }
 
     for (uint32_t i = 0; i < num_files; ++i) {
-        if (!gpu_file_manager_->openGPUFile(i)) {
-            geminifs_error("GeminiFS::init: Failed to open GPU file %u\n", i);
+        if (!gpu_file_manager_->initGPUFile(i)) {
+            geminifs_error("GeminiFS::init: Failed to init GPU file %u\n", i);
             return;
         }
-        
-        geminifs_debug("GeminiFS::init: Successfully opened GPU file %u\n", i);
+
+        geminifs_debug("GeminiFS::init: Successfully initialized GPU file %u\n", i);
     }
 
 

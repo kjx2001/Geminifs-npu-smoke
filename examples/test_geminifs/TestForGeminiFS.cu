@@ -18,7 +18,7 @@ int main(int argc, char** argv) {
     }
     vector<size_t> GPU_file_shape = {2, 32, 524288}; // 32MB
 
-    GeminiFS geminifs("/home/qs/CompanionFS/Geminifs/sys_config.ini", GPU_file_nums, GPU_file_shape, 0);
+    GeminiFS geminifs("/home/qs/CompanionFS/Geminifs/sys_config.ini", GPU_file_nums, GPU_file_shape, 1);
     GPUFileId file_id;
     bool success = geminifs.geminifs_gpu_open_file(device_id, file_id);
     assert(success);

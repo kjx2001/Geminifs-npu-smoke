@@ -241,8 +241,7 @@ __global__ void GPU_Read_kernel(NVMe_File* d_fd,
 /**
  * Multi-FD variant: distribute mappings by tid % num_fds
  */
-__global__ void GPU_Read_kernel_multi(NVMe_File** d_fds,
-                                      uint32_t num_fds,
+__global__ void GPU_Read_kernel_multi(GPUIoContext* io_ctx,
                                       uint64_t tensor_ptr,
                                       size_t offset,
                                       size_t len,
@@ -265,8 +264,7 @@ __global__ void GPU_Write_kernel(NVMe_File* d_fd,
 /**
  * Multi-FD variant: distribute mappings by tid % num_fds
  */
-__global__ void GPU_Write_kernel_multi(NVMe_File** d_fds,
-                                       uint32_t num_fds,
+__global__ void GPU_Write_kernel_multi(GPUIoContext* io_ctx,
                                        uint64_t tensor_ptr,
                                        size_t offset,
                                        size_t len,
@@ -288,21 +286,15 @@ __global__ void nvme_write_slices_by_range_kernel(NVMe_File** d_fds,
                                                   GPUMemoryMapperDeviceView* device_view);
 
 // Batch v3: distribute by tid % num_fds
-__global__ void nvme_batch_read_kernel_v3(NVMe_File** d_fds,
-                                          uint32_t num_fds,
+__global__ void nvme_batch_read_kernel_v3(GPUIoContext* io_ctx,
                                           uint64_t tensor_ptr,
                                           uint32_t total_count,
-                                          size_t base_file_offset,
-                                          PRPMappingEntry** mapping_entries,
-                                          GPUMemoryMapperDeviceView* device_view);
+                                          size_t base_file_offset);
 
-__global__ void nvme_batch_write_kernel_v3(NVMe_File** d_fds,
-                                           uint32_t num_fds,
+__global__ void nvme_batch_write_kernel_v3(GPUIoContext* io_ctx,
                                            uint64_t tensor_ptr,
                                            uint32_t total_count,
-                                           size_t base_file_offset,
-                                           PRPMappingEntry** mapping_entries,
-                                           GPUMemoryMapperDeviceView* device_view);
+                                           size_t base_file_offset);
 
 /**
  * Host端函数用于调用GPU kernel查询和打印PRP映射

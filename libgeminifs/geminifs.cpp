@@ -132,7 +132,14 @@ host_fd_t host_open_geminifs_file(const char *filename) {
 
 	// Read the complete header including l1 array
 	my_assert((off_t)(-1) != lseek(fd, 0, SEEK_SET));
-	my_assert(temp_hdr.first_block_base == read(fd, hdr, temp_hdr.first_block_base));
+	my_assert((ssize_t)temp_hdr.first_block_base == read(fd, hdr, temp_hdr.first_block_base));
+
+	my_assert(hdr->magic_num == the_geminiFS_magic.magic_num);
+	geminifs_debug("File %s's extents count: %d, first blk base: %lu\n", filename, hdr->extent_count, hdr->first_block_base);
+	for (uint32_t i = 0; i < hdr->extent_count; ++i) {
+		geminifs_debug("File %s's extents: fe_physical %llx fe_len %llx\n", filename,
+		 (unsigned long long)hdr->extents[i].fe_physical, (unsigned long long)hdr->extents[i].fe_length);
+	}
 
 	hdr->fd = fd;
 

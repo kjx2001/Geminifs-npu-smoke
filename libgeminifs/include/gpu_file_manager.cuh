@@ -12,6 +12,7 @@
 #include "file.cuh"
 #include "nvme_file.h"  // 引入NVMeFileDesc
 #include "geminifs.h"
+#include "prp_mapping_entry.h"
 
 // 前向声明
 class GPUController;
@@ -80,6 +81,11 @@ struct GPUFileDesc {
 };
 
 
+struct GPUIoContext {
+    uint8_t num_files;
+    NVMe_File* nvme_files[4]; // 最多4个NVMe文件指针 (32 bytes)
+    PRPMappingEntry* mapping_entries[1024]; // 对应的PRP映射条目指针 (32 bytes)
+};
 
 
 class GPUFileManager {
@@ -95,11 +101,13 @@ public:
 
     // 核心文件操作接口 - 重新设计为直接管理NVMe文件
     bool createGPUFile(size_t total_file_size, const std::vector<size_t>& tensor_shape, GPUFileId& out_file_id);
-    bool openGPUFile(GPUFileId file_id);
-    bool getGPUFile(GPUFileId& file_id);
     bool deleteGPUFile(GPUFileId file_id);
+    bool initGPUFile(GPUFileId file_id);
+    bool openGPUFile(GPUFileId& file_id);
+    bool closeGPUFile(GPUFileId file_id);
     bool getGPUFileById(GPUFileId file_id, GPUFileDesc& out_desc) const;
     bool getDevFdById(GPUFileId file_id, std::vector<dev_fd_t>& dev_fds) const;
+    bool getIoContextById(GPUFileId file_id, GPUIoContext** io_ctx) const;
     std::vector<GPUFileId> getAllGPUFileIds() const;
 
     // 持久化管理
@@ -125,6 +133,7 @@ private:
     mutable std::mutex mtx_;
     // free_list_是**已打开的**GPUFile池
     std::vector<GPUFileId> free_list_;
+    std::unordered_map<GPUFileId, GPUIoContext*> file_id_to_ctx_map_;
     std::unordered_map<GPUFileId, GPUFileDesc> file_id_to_desc_map_;
     std::unordered_map<NVMeFileId, dev_fd_t> nvme_file_id_to_dev_fd_map_;
 
