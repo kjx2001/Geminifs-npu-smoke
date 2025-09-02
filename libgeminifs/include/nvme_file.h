@@ -19,6 +19,7 @@ constexpr size_t MAX_RECORDS = BITMAP_SIZE_BYTES * BITS_PER_BYTE; // 1,048,576 r
 struct LogHeader;
 
 using NVMeFileId = uint32_t;
+using NVMeCtrlId = uint32_t;
 
 
 

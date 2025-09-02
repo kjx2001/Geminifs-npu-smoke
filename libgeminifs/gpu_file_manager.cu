@@ -203,7 +203,7 @@ bool GPUFileManager::initGPUFile(GPUFileId file_id) {
         }
 
         auto nvme_file_id = nvme_mapping.nvme_file_ids[i];
-        if (nvme_file_id_to_dev_fd_map_.find(nvme_file_id) != nvme_file_id_to_dev_fd_map_.end()) {
+        if (nvme_file_id_to_dev_fd_map_.find({i, nvme_file_id}) != nvme_file_id_to_dev_fd_map_.end()) {
             continue;
         }
 
@@ -216,7 +216,7 @@ bool GPUFileManager::initGPUFile(GPUFileId file_id) {
         dev_fd_t file = nvme_controller->device_file_open_managed(nvme_file_id);
         if (file) {
             geminifs_debug("Opened NVMe file ID %u on controller %zu\n", nvme_file_id, i);
-            nvme_file_id_to_dev_fd_map_[nvme_file_id] = file;
+            nvme_file_id_to_dev_fd_map_[{i, nvme_file_id}] = file;
         } else {
             geminifs_error("Failed to open NVMe file ID %u on controller %zu\n", nvme_file_id, i);
             return false;
@@ -389,9 +389,9 @@ bool GPUFileManager::getDevFdById(GPUFileId file_id, std::vector<dev_fd_t>& dev_
 
         auto nvme_file_id = nvme_mapping.nvme_file_ids[i];
 
-        auto it = nvme_file_id_to_dev_fd_map_.find(nvme_file_id);
+        auto it = nvme_file_id_to_dev_fd_map_.find({i, nvme_file_id});
         if (it == nvme_file_id_to_dev_fd_map_.end()) {
-            geminifs_error("Failed to get opened device fd for file ID %u\n", nvme_file_id);
+            geminifs_error("Failed to get opened device fd for file ID %u on controller %zu\n", nvme_file_id, i);
             return false;
         }
 

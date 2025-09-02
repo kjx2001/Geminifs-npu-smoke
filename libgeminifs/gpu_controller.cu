@@ -2048,8 +2048,8 @@ __global__ void GPU_Read_kernel_multi(GPUIoContext *io_ctx,
 {
     if (threadIdx.x == 0 && blockIdx.x == 0)
     {
-        printf("GPU_Read_kernel_multi: Launching with tensor_ptr=0x%lx, offset=%zu, len=%zu\n",
-               tensor_ptr, offset, len);
+        printf("GPU_Read_kernel_multi: Launching with tensor_ptr=0x%lx, offset=%lu, len=%lu\n",
+               tensor_ptr, (uint64_t)offset, (uint64_t)len);
 
         if (!device_view)
         {
@@ -2160,9 +2160,9 @@ __global__ void nvme_batch_read_kernel_v3(GPUIoContext *io_ctx,
     NVMe_File *d_fd = io_ctx->nvme_files[tid % io_ctx->num_files];
 
     printf("nvme_batch_read_kernel_v3: tid=%u, fd_idx=%u, prp1=0x%lx, prp2=0x%lx, file_offset=%zu, len=%u\n",
-           tid, tid % io_ctx->num_files, entry->prp1, entry->prp2, base_file_offset + tid * entry->data_length, entry->data_length);
+           tid, tid % io_ctx->num_files, entry->prp1, entry->prp2, base_file_offset + (tid / io_ctx->num_files) * entry->data_length, entry->data_length);
 
-    nvme_controller_g_read(d_fd, entry->prp1, entry->prp2, base_file_offset + tid * entry->data_length, entry->data_length);
+    nvme_controller_g_read(d_fd, entry->prp1, entry->prp2, base_file_offset + (tid / io_ctx->num_files) * entry->data_length, entry->data_length);
 }
 
 __global__ void nvme_batch_write_kernel_v3(GPUIoContext *io_ctx,
@@ -2193,7 +2193,7 @@ __global__ void nvme_batch_write_kernel_v3(GPUIoContext *io_ctx,
     NVMe_File *d_fd = io_ctx->nvme_files[tid % io_ctx->num_files];
 
     printf("nvme_batch_write_kernel_v3: tid=%u, fd_idx=%u, prp1=0x%lx, prp2=0x%lx, file_offset=%zu, len=%u\n",
-           tid, tid % io_ctx->num_files, entry->prp1, entry->prp2, base_file_offset + tid * entry->data_length, entry->data_length);
+           tid, tid % io_ctx->num_files, entry->prp1, entry->prp2, base_file_offset + (tid / io_ctx->num_files) * entry->data_length, entry->data_length);
 
-    nvme_controller_g_write(d_fd, entry->prp1, entry->prp2, base_file_offset + tid * entry->data_length, entry->data_length);
+    nvme_controller_g_write(d_fd, entry->prp1, entry->prp2, base_file_offset + (tid / io_ctx->num_files) * entry->data_length, entry->data_length);
 }

@@ -309,10 +309,71 @@ __host__ bool GeminiFS::geminifs_gpu_close_file(int device_id, GPUFileId id) {
     return gpu_file_manager_->closeGPUFile(id);
 }
 
+__host__ bool GeminiFS::geminifs_batched_read(std::vector<torch::Tensor>& k_caches, std::vector<torch::Tensor>& v_caches, std::vector<GPUFileId>& gpu_file_ids, std::vector<int>& layer_ids, GPUControllerPtr gpu_controller) {
+    assert(k_caches.size() == v_caches.size() && k_caches.size() == gpu_file_ids.size() && k_caches.size() == layer_ids.size());
+
+    for (size_t i = 0; i < k_caches.size(); ++i) {
+        if (!geminifs_GPU_read_kernel(k_caches[i], v_caches[i], gpu_file_ids[i], gpu_controller)) {
+            geminifs_error("geminifs_batched_read: Failed to read from GPU file %u\n", gpu_file_ids[i]);
+            return false;
+        }
+    }
+    return true;
+}
+
+__host__ bool GeminiFS::geminifs_batched_write(std::vector<torch::Tensor>& k_caches, std::vector<torch::Tensor>& v_caches, std::vector<GPUFileId>& gpu_file_ids, std::vector<int>& layer_ids, GPUControllerPtr gpu_controller) {
+    assert(k_caches.size() == v_caches.size() && k_caches.size() == gpu_file_ids.size() && k_caches.size() == layer_ids.size());
+
+    for (size_t i = 0; i < k_caches.size(); ++i) {
+        if (!geminifs_GPU_write_kernel(k_caches[i], v_caches[i], gpu_file_ids[i], gpu_controller)) {
+            geminifs_error("geminifs_batched_write: Failed to write to GPU file %u\n", gpu_file_ids[i]);
+            return false;
+        }
+    }
+    return true;
+}
+
+__host__ bool GeminiFS::geminifs_batched_read(std::vector<torch::Tensor>& k_caches, std::vector<int>& k_layer_ids, std::vector<torch::Tensor>& v_caches, std::vector<int>& v_layer_ids, std::vector<GPUFileId>& gpu_file_ids, GPUControllerPtr gpu_controller) {
+    assert(k_caches.size() == v_caches.size() && k_caches.size() == gpu_file_ids.size() && k_caches.size() == k_layer_ids.size() && k_caches.size() == v_layer_ids.size());
+
+    for (size_t i = 0; i < k_caches.size(); ++i) {
+        if (!geminifs_GPU_read_kernel(k_caches[i], v_caches[i], gpu_file_ids[i], gpu_controller)) {
+            geminifs_error("geminifs_batched_read: Failed to read from GPU file %u\n", gpu_file_ids[i]);
+            return false;
+        }
+    }
+    return true;
+}
+
+__host__ bool GeminiFS::geminifs_batched_write(std::vector<torch::Tensor>& k_caches, std::vector<int>& k_layer_ids, std::vector<torch::Tensor>& v_caches, std::vector<int>& v_layer_ids, std::vector<GPUFileId>& gpu_file_ids, GPUControllerPtr gpu_controller) {
+    assert(k_caches.size() == v_caches.size() && k_caches.size() == gpu_file_ids.size() && k_caches.size() == k_layer_ids.size() && k_caches.size() == v_layer_ids.size());
+
+    for (size_t i = 0; i < k_caches.size(); ++i) {
+        if (!geminifs_GPU_write_kernel(k_caches[i], v_caches[i], gpu_file_ids[i], gpu_controller)) {
+            geminifs_error("geminifs_batched_write: Failed to write to GPU file %u\n", gpu_file_ids[i]);
+            return false;
+        }
+    }
+    return true;
+}
+
+__host__ bool GeminiFS::geminifs_GPU_read_kernel(torch::Tensor& k, torch::Tensor& v, GPUFileId gpu_file_id, GPUControllerPtr gpu_controller) {
+    geminifs_GPU_read_kernel(k, gpu_file_id, 0, gpu_controller);
+    size_t len = static_cast<size_t>(k.numel()) * static_cast<size_t>(k.element_size());
+    geminifs_GPU_read_kernel(v, gpu_file_id, len / 2, gpu_controller);
+    return true;
+}
+
+__host__ bool GeminiFS::geminifs_GPU_write_kernel(torch::Tensor& k, torch::Tensor& v, GPUFileId gpu_file_id, GPUControllerPtr gpu_controller) {
+    geminifs_GPU_write_kernel(k, gpu_file_id, 0, gpu_controller);
+    size_t len = static_cast<size_t>(k.numel()) * static_cast<size_t>(k.element_size());
+    geminifs_GPU_write_kernel(v, gpu_file_id, len / 2, gpu_controller);
+    return true;
+}
 
 
 
-__host__ bool GeminiFS::geminifs_GPU_read_kernel(torch::Tensor& tensor, GPUFileId gpu_file_id, GPUControllerPtr gpu_controller) {
+__host__ bool GeminiFS::geminifs_GPU_read_kernel(torch::Tensor& tensor, GPUFileId gpu_file_id, loff_t offset, GPUControllerPtr gpu_controller) {
     if (!gpu_controller || !gpu_controller->isInitialized()) {
          geminifs_error("GPU_read_kernel: GPU controller is not initialized\n");
           return false;
@@ -349,7 +410,6 @@ __host__ bool GeminiFS::geminifs_GPU_read_kernel(torch::Tensor& tensor, GPUFileI
 
     // 启动多FD内核（内核内部根据 tid%num_fds 分发并触发 v3 批量）
     uint64_t tensor_ptr = reinterpret_cast<uint64_t>(tensor.data_ptr());
-    size_t offset = 0;
     size_t len = static_cast<size_t>(tensor.numel()) * static_cast<size_t>(tensor.element_size());
     GPU_Read_kernel_multi<<<1,1>>>(io_ctx, tensor_ptr, offset, len, device_view);
     cudaError_t err = cudaDeviceSynchronize();
@@ -361,7 +421,7 @@ __host__ bool GeminiFS::geminifs_GPU_read_kernel(torch::Tensor& tensor, GPUFileI
     return true;
 }
 
-__host__ bool GeminiFS::geminifs_GPU_write_kernel(const torch::Tensor& tensor, GPUFileId gpu_file_id, GPUControllerPtr gpu_controller) {
+__host__ bool GeminiFS::geminifs_GPU_write_kernel(const torch::Tensor& tensor, GPUFileId gpu_file_id, loff_t offset, GPUControllerPtr gpu_controller) {
     if (!gpu_controller || !gpu_controller->isInitialized()) {
         geminifs_error("GPU_write_kernel: GPU controller is not initialized\n");
         return false;
@@ -397,7 +457,6 @@ __host__ bool GeminiFS::geminifs_GPU_write_kernel(const torch::Tensor& tensor, G
 
     // 启动多FD内核
     uint64_t tensor_ptr = reinterpret_cast<uint64_t>(tensor.data_ptr());
-    size_t offset = 0;
     size_t len = static_cast<size_t>(tensor.numel()) * static_cast<size_t>(tensor.element_size());
     GPU_Write_kernel_multi<<<1,1>>>(io_ctx, tensor_ptr, offset, len, device_view);
     cudaError_t err = cudaDeviceSynchronize();
@@ -597,8 +656,8 @@ __host__ void GeminiFS::init(const std::string& config_file_path, int GPU_file_n
     // 记录初始化GPU file 参数
     init_GPU_num_files_ = num_files;
     init_GPU_file_size_ = file_size;
-    size_t per_nvme_controller_files = 0;
-    size_t per_nvme_file_size = 0;
+    // size_t per_nvme_controller_files = 0;
+    // size_t per_nvme_file_size = 0;
     geminifs_info("GeminiFS::init: config_file_path=%s, num_files=%zu, file_size=%zu, reset=%s\n", 
                    config_file_path.c_str(), num_files, file_size, reset ? "true" : "false");
     

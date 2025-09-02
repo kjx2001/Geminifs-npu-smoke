@@ -93,16 +93,21 @@ class GeminiFS {
             cleanup();
         }
 
+        __host__ bool geminifs_batched_read(std::vector<torch::Tensor>& k_caches, std::vector<torch::Tensor>& v_caches, std::vector<GPUFileId>& gpu_file_ids, std::vector<int>& layer_ids, GPUControllerPtr gpu_controller);
+        __host__ bool geminifs_batched_write(std::vector<torch::Tensor>& k_caches, std::vector<torch::Tensor>& v_caches, std::vector<GPUFileId>& gpu_file_ids, std::vector<int>& layer_ids, GPUControllerPtr gpu_controller);
+
+        __host__ bool geminifs_batched_read(std::vector<torch::Tensor>& k_caches, std::vector<int>& k_layer_ids, std::vector<torch::Tensor>& v_caches, std::vector<int>& v_layer_ids, std::vector<GPUFileId>& gpu_file_ids, GPUControllerPtr gpu_controller);
+        __host__ bool geminifs_batched_write(std::vector<torch::Tensor>& k_caches, std::vector<int>& k_layer_ids, std::vector<torch::Tensor>& v_caches, std::vector<int>& v_layer_ids, std::vector<GPUFileId>& gpu_file_ids, GPUControllerPtr gpu_controller);
         /**
         * GPU read kernel
         */
-        __host__ bool geminifs_GPU_read_kernel(torch::Tensor& tensor, GPUFileId gpu_file_id, GPUControllerPtr gpu_controller);
-
+        __host__ bool geminifs_GPU_read_kernel(torch::Tensor& tensor, GPUFileId gpu_file_id, loff_t off, GPUControllerPtr gpu_controller);
+        __host__ bool geminifs_GPU_read_kernel(torch::Tensor& k, torch::Tensor& v, GPUFileId gpu_file_id, GPUControllerPtr gpu_controller);
         /**
         * GPU write kernel
         */
-        __host__ bool geminifs_GPU_write_kernel(const torch::Tensor& tensor, GPUFileId gpu_file_id, GPUControllerPtr gpu_controller);
-
+        __host__ bool geminifs_GPU_write_kernel(const torch::Tensor& tensor, GPUFileId gpu_file_id, loff_t off, GPUControllerPtr gpu_controller);
+        __host__ bool geminifs_GPU_write_kernel(torch::Tensor& k, torch::Tensor& v, GPUFileId gpu_file_id, GPUControllerPtr gpu_controller);
         /**
          * Create and register a GPU controller for a specific device
          */

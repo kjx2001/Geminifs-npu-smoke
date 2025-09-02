@@ -3,6 +3,7 @@
 
 #include <string>
 #include <vector>
+#include <map>
 #include <unordered_map>
 #include <memory>
 #include <mutex>
@@ -76,7 +77,7 @@ struct GPUFileDesc {
     GPUFileId file_id;             // GPUFile的全局唯一ID，同时也是slot_index (4 bytes)
     size_t total_file_size;        // GPUFile的总大小 (8 bytes)
     size_t block_size;             // 块大小，即第三个维度tensor内存对象的大小 (8 bytes)
-    uint32_t tensor_shape[3];      // tensor的三维形状: [dim1_count, dim2_count, tensor_object_size] (12 bytes)
+    uint32_t tensor_shape[3];      // tensor的三维形状: [K/V, Layer, tensor_object_size] (12 bytes)
     CompactNVMeMapping nvme_mapping; // 紧凑的NVMe文件映射 (17 bytes)
 };
 
@@ -135,7 +136,7 @@ private:
     std::vector<GPUFileId> free_list_;
     std::unordered_map<GPUFileId, GPUIoContext*> file_id_to_ctx_map_;
     std::unordered_map<GPUFileId, GPUFileDesc> file_id_to_desc_map_;
-    std::unordered_map<NVMeFileId, dev_fd_t> nvme_file_id_to_dev_fd_map_;
+    std::map<std::pair<NVMeCtrlId, NVMeFileId>, dev_fd_t> nvme_file_id_to_dev_fd_map_;
 
     size_t persistence_threshold_;
     size_t pending_writes_count_;
