@@ -4,28 +4,38 @@
 #include <iostream>
 #include <vector>
 #include <cassert>
+
 using namespace std;
 
-//constexpr size_t GPU_file_size = 32ull * 1024 * 1024; // 32MB
 constexpr int GPU_file_nums = 100;
 constexpr int device_id = 1;
 
-torch::Tensor create_tensor() {
-    return torch::rand({4, 1024, 1024, 2},
+constexpr int num_layers = 32;
+// KV cache per layer shape: [block_size, num_kv_head, head_dim]
+constexpr int block_size   = 256;
+constexpr int num_kv_head  = 8;
+constexpr int head_dim     = 128;
+
+torch::Tensor create_kv_layer() {
+    return torch::rand(
+        {block_size, num_kv_head, head_dim},
         torch::TensorOptions()
             .dtype(torch::kFloat16)
             .device(torch::kCUDA, device_id)
             .pinned_memory(false));
 }
 
-void check_tensor_equal(const torch::Tensor& t1, const torch::Tensor& t2, const std::string& name) {
+void check_kv_equal(const torch::Tensor& t1,
+                    const torch::Tensor& t2,
+                    const std::string& tag) {
+    TORCH_CHECK(t1.sizes() == t2.sizes(), "Shape mismatch in ", tag);
     if (!torch::all(t1 == t2).item<bool>()) {
-        std::cout << "Tensors " << name << " are not equal!" << std::endl;
         auto t1_flat = t1.flatten().slice(0, 0, 20).cpu();
         auto t2_flat = t2.flatten().slice(0, 0, 20).cpu();
-        std::cout << "First 20 elements of " << name << "1: " << t1_flat << std::endl;
-        std::cout << "First 20 elements of " << name << "2: " << t2_flat << std::endl;
-        TORCH_CHECK(false, "Tensors " + name + " are not equal!");
+        std::cout << "[Mismatch] " << tag << "\n"
+                  << "First 20 A: " << t1_flat << "\n"
+                  << "First 20 B: " << t2_flat << std::endl;
+        TORCH_CHECK(false, "KV layer not equal: ", tag);
     }
 }
 
@@ -33,58 +43,93 @@ int main(int argc, char **argv)
 {
     cudaError_t err = cudaSetDevice(device_id);
     if (err != cudaSuccess) {
-        std::cerr << "Failed to set CUDA device " << device_id << ": " << cudaGetErrorString(err) << std::endl;
+        std::cerr << "Failed to set CUDA device " << device_id
+                  << ": " << cudaGetErrorString(err) << std::endl;
         return 1;
     }
 
-    vector<size_t> GPU_file_shape = {2, 32, 524288}; // 32MB
-    GeminiFS geminifs("/home/qs/CompanionFS/Geminifs/sys_config.ini", GPU_file_nums, GPU_file_shape, 1);
+    // Adjust GPU file shape to hold one layer KV (you may tune)
+    // Here: bytes = block_size * num_kv_head * head_dim * sizeof(fp16) * 2 (K+V)
+    // We just keep original shape placeholder (modify according to real layout inside GeminiFS)
+    vector<size_t> GPU_file_shape = {2, num_layers, block_size * num_kv_head * head_dim}; 
+    GeminiFS geminifs("/home/qs/CompanionFS/Geminifs/sys_config.ini",
+                      GPU_file_nums, GPU_file_shape, 1);
 
     GPUFileId file_id, file_id2;
     assert(geminifs.geminifs_gpu_open_file(device_id, file_id));
     assert(geminifs.geminifs_gpu_open_file(device_id, file_id2));
-    printf("finish open file, file id %u, file id2 %u\n", file_id, file_id2);
+    printf("Opened files: %u %u\n", file_id, file_id2);
 
-    auto key = create_tensor(), value = create_tensor();
-    auto key2 = create_tensor(), value2 = create_tensor();
-    auto key3 = create_tensor(), value3 = create_tensor();
-    auto key4 = create_tensor(), value4 = create_tensor();
+    // One layer per tensor (key/value separate)
+    auto k0 = create_kv_layer();
+    auto v0 = create_kv_layer();
+    auto k0_r = create_kv_layer(); // read-back buffers
+    auto v0_r = create_kv_layer();
 
-    for (auto& t : {&key, &key2, &key3, &key4}) geminifs.geminifs_register_tensor_with_gpu(*t);
-    printf("finish register tensor key\n");
-    for (auto& t : {&value, &value2, &value3, &value4}) geminifs.geminifs_register_tensor_with_gpu(*t);
-    printf("finish register tensor value\n");
+    auto k1 = create_kv_layer();
+    auto v1 = create_kv_layer();
+    auto k1_r = create_kv_layer();
+    auto v1_r = create_kv_layer();
 
-    geminifs.geminifs_GPU_write_kernel(key, value, file_id, geminifs.geminifs_get_gpu_controller(device_id));
-    printf("finish write kernel\n");
-    geminifs.geminifs_GPU_read_kernel(key2, value2, file_id, geminifs.geminifs_get_gpu_controller(device_id));
-    printf("finish read kernel\n");
+    // Register all tensors
+    for (auto* t : {&k0, &v0, &k0_r, &v0_r, &k1, &v1, &k1_r, &v1_r})
+        geminifs.geminifs_register_tensor_with_gpu(*t);
 
-    check_tensor_equal(key, key2, "key");
-    check_tensor_equal(value, value2, "value");
+    // Single layer write/read (per layer interface)
+    geminifs.geminifs_GPU_write_kernel(k0, v0, file_id,
+        geminifs.geminifs_get_gpu_controller(device_id));
+    geminifs.geminifs_GPU_read_kernel(k0_r, v0_r, file_id,
+        geminifs.geminifs_get_gpu_controller(device_id));
 
-    vector<torch::Tensor> key_list = {key, key2};
-    vector<torch::Tensor> value_list = {value, value2};
-    vector<GPUFileId> file_id_list = {file_id, file_id2};
-    vector<torch::Tensor> key_list2 = {key3, key4};
-    vector<torch::Tensor> value_list2 = {value3, value4};
-    vector<int> layer_id_list = {0, 1};
+    check_kv_equal(k0, k0_r, "layer0.key");
+    check_kv_equal(v0, v0_r, "layer0.value");
 
-    geminifs.geminifs_batched_write(key_list, value_list, file_id_list, layer_id_list, geminifs.geminifs_get_gpu_controller(device_id));
-    geminifs.geminifs_batched_read(key_list2, value_list2, file_id_list, layer_id_list, geminifs.geminifs_get_gpu_controller(device_id));
+    // Batched (each element already one layer)
+    vector<torch::Tensor> key_layers_write  = {k0, k1};
+    vector<torch::Tensor> value_layers_write= {v0, v1};
+    vector<GPUFileId>     file_ids          = {file_id, file_id2};
+    vector<int>           layer_ids         = {0, 1};
 
-    check_tensor_equal(key, key3, "key_batch");
-    check_tensor_equal(key2, key4, "key_batch");
-    check_tensor_equal(value, value3, "value_batch");
-    check_tensor_equal(value2, value4, "value_batch");
+    vector<torch::Tensor> key_layers_read  = {k0_r, k1_r};
+    vector<torch::Tensor> value_layers_read= {v0_r, v1_r};
 
-    geminifs.geminifs_batched_write(key_list, layer_id_list, value_list, layer_id_list, file_id_list, geminifs.geminifs_get_gpu_controller(device_id));
-    geminifs.geminifs_batched_read(key_list2, layer_id_list, value_list2, layer_id_list, file_id_list, geminifs.geminifs_get_gpu_controller(device_id));
+    geminifs.geminifs_batched_write(
+        key_layers_write, value_layers_write,
+        file_ids, layer_ids,
+        geminifs.geminifs_get_gpu_controller(device_id));
 
-    check_tensor_equal(key, key3, "key_batch");
-    check_tensor_equal(key2, key4, "key_batch");
-    check_tensor_equal(value, value3, "value_batch");
-    check_tensor_equal(value2, value4, "value_batch");
+    geminifs.geminifs_batched_read(
+        key_layers_read, value_layers_read,
+        file_ids, layer_ids,
+        geminifs.geminifs_get_gpu_controller(device_id));
+
+    // Per layer equal check
+    for (size_t i = 0; i < key_layers_write.size(); ++i) {
+        check_kv_equal(key_layers_write[i], key_layers_read[i],
+                       "batched.layer" + std::to_string(i) + ".key");
+        check_kv_equal(value_layers_write[i], value_layers_read[i],
+                       "batched.layer" + std::to_string(i) + ".value");
+    }
+
+    // Alternate interface variant (if required by API)
+    geminifs.geminifs_batched_write(
+        key_layers_write, layer_ids,
+        value_layers_write, layer_ids,
+        file_ids,
+        geminifs.geminifs_get_gpu_controller(device_id));
+
+    geminifs.geminifs_batched_read(
+        key_layers_read, layer_ids,
+        value_layers_read, layer_ids,
+        file_ids,
+        geminifs.geminifs_get_gpu_controller(device_id));
+
+    for (size_t i = 0; i < key_layers_write.size(); ++i) {
+        check_kv_equal(key_layers_write[i], key_layers_read[i],
+                       "batched2.layer" + std::to_string(i) + ".key");
+        check_kv_equal(value_layers_write[i], value_layers_read[i],
+                       "batched2.layer" + std::to_string(i) + ".value");
+    }
 
     return 0;
 }

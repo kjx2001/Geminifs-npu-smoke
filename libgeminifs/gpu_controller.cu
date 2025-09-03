@@ -2072,7 +2072,7 @@ __global__ void GPU_Read_kernel_multi(GPUIoContext *io_ctx,
         }
 
         // 启动 v3 批量 kernel，让每个线程处理一个映射条目，并按 tid%num_fds 选择 fd
-        const uint32_t THREADS_PER_BLOCK = 64;
+        const uint32_t THREADS_PER_BLOCK = 32;
         uint32_t blocks = (found_count + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
 
         printf("GPU_Read_kernel_multi: Launching nvme_batch_read_kernel_v3 with blocks=%u, threads_per_block=%u\n",
@@ -2117,7 +2117,7 @@ __global__ void GPU_Write_kernel_multi(GPUIoContext *io_ctx,
             printf("GPU_Write_kernel_multi: no mappings for tensor 0x%lx\n", tensor_ptr);
             return;
         }
-        const uint32_t THREADS_PER_BLOCK = 64;
+        const uint32_t THREADS_PER_BLOCK = 32;
         uint32_t blocks = (found_count + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
 
         printf("GPU_Write_kernel_multi: Launching nvme_batch_write_kernel_v3 with blocks=%u, threads_per_block=%u\n",
@@ -2156,13 +2156,15 @@ __global__ void nvme_batch_read_kernel_v3(GPUIoContext *io_ctx,
         return;
     }
 
-    // 选择 fd：tid % num_fds
-    NVMe_File *d_fd = io_ctx->nvme_files[tid % io_ctx->num_files];
+    uint64_t thread_logical_offset = base_file_offset + tid * entry->data_length;
+    uint64_t fd_idx = (thread_logical_offset % (io_ctx->num_files * entry->data_length)) / entry->data_length;
+    uint64_t thread_physical_offset = (thread_logical_offset / (io_ctx->num_files * entry->data_length)) * entry->data_length + fd_idx * entry->data_length;
+    NVMe_File *file = io_ctx->nvme_files[fd_idx];
 
-    printf("nvme_batch_read_kernel_v3: tid=%u, fd_idx=%u, prp1=0x%lx, prp2=0x%lx, file_offset=%zu, len=%u\n",
-           tid, tid % io_ctx->num_files, entry->prp1, entry->prp2, base_file_offset + (tid / io_ctx->num_files) * entry->data_length, entry->data_length);
+    printf("nvme_batch_read_kernel_v3: tid=%u, fd_idx=%u, prp1=0x%lx, prp2=0x%lx, file_offset=%lu, len=%u\n",
+           tid, fd_idx, entry->prp1, entry->prp2, thread_physical_offset, entry->data_length);
 
-    nvme_controller_g_read(d_fd, entry->prp1, entry->prp2, base_file_offset + (tid / io_ctx->num_files) * entry->data_length, entry->data_length);
+    nvme_controller_g_read(file, entry->prp1, entry->prp2, thread_physical_offset, entry->data_length);
 }
 
 __global__ void nvme_batch_write_kernel_v3(GPUIoContext *io_ctx,
@@ -2190,10 +2192,13 @@ __global__ void nvme_batch_write_kernel_v3(GPUIoContext *io_ctx,
         return;
     }
 
-    NVMe_File *d_fd = io_ctx->nvme_files[tid % io_ctx->num_files];
+    uint64_t thread_logical_offset = base_file_offset + tid * entry->data_length;
+    uint64_t fd_idx = (thread_logical_offset % (io_ctx->num_files * entry->data_length)) / entry->data_length;
+    uint64_t thread_physical_offset = (thread_logical_offset / (io_ctx->num_files * entry->data_length)) * entry->data_length + fd_idx * entry->data_length;
+    NVMe_File *file = io_ctx->nvme_files[fd_idx];
 
-    printf("nvme_batch_write_kernel_v3: tid=%u, fd_idx=%u, prp1=0x%lx, prp2=0x%lx, file_offset=%zu, len=%u\n",
-           tid, tid % io_ctx->num_files, entry->prp1, entry->prp2, base_file_offset + (tid / io_ctx->num_files) * entry->data_length, entry->data_length);
+    printf("nvme_batch_write_kernel_v3: tid=%u, fd_idx=%u, prp1=0x%lx, prp2=0x%lx, file_offset=%lu, len=%u\n",
+           tid, fd_idx, entry->prp1, entry->prp2, thread_physical_offset, entry->data_length);
 
-    nvme_controller_g_write(d_fd, entry->prp1, entry->prp2, base_file_offset + (tid / io_ctx->num_files) * entry->data_length, entry->data_length);
+    nvme_controller_g_write(file, entry->prp1, entry->prp2, thread_physical_offset, entry->data_length);
 }
