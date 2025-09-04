@@ -703,7 +703,23 @@ bool GPUController::registerTensorMemory(const torch::Tensor &tensor, uint64_t g
             return false;
         }
 
-        dma_contexts_[tensor_ptr] = dma_ctx;
+        // Add DMA context mapping based on granularity
+        if (granularity > 0)
+        {
+            // Add multiple pointers according to granularity, all pointing to the same dma_ctx
+            size_t num_granules = (tensor_size + granularity - 1) / granularity; // Round up
+            
+            for (size_t i = 0; i < num_granules; ++i)
+            {
+                uint64_t granule_ptr = tensor_ptr + (i * granularity);
+                dma_contexts_[granule_ptr] = dma_ctx;
+            }
+        }
+        else
+        {
+            // Traditional single mapping for the entire tensor
+            dma_contexts_[tensor_ptr] = dma_ctx;
+        }
     }
 
     geminifs_debug("GPU Controller: Successfully registered tensor at %p for device %d\n",
