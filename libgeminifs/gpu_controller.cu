@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <cstring>
 #include <algorithm>
+#include <unordered_set>
 #include "gpu_controller.cuh"
 
 __device__ uint32_t gpu_lookup_all_prp_mappings(uint64_t tensor_ptr,
@@ -747,12 +748,26 @@ bool GPUController::unregisterTensorMemory(void *tensor_ptr)
             return false;
         }
 
-        // Clean up DMA context (但不释放 CUDA 内存)
+        // Get DMA context and remove ALL entries that point to the same dma_ctx
         geminifs_dma *dma_ctx = it->second;
+        
+        // Remove all granule mappings for this DMA context
+        auto map_it = dma_contexts_.begin();
+        while (map_it != dma_contexts_.end())
+        {
+            if (map_it->second == dma_ctx)
+            {
+                map_it = dma_contexts_.erase(map_it);
+            }
+            else
+            {
+                ++map_it;
+            }
+        }
+
+        // Clean up DMA context (但不释放 CUDA 内存)
         // 注意: 不调用 cudaFree(dma_ctx->ioaddrs)，因为 CUDA 内存由应用进程管理
         delete dma_ctx;
-
-        dma_contexts_.erase(it);
     }
 
     geminifs_debug("GPU Controller: Successfully unregistered tensor at %p for device %d\n",
@@ -778,9 +793,19 @@ void GPUController::clearAllDMAContexts()
 {
     std::lock_guard<std::mutex> lock(memory_mutex_);
 
-    for (auto &pair : dma_contexts_)
+    // Collect unique DMA contexts to avoid double deletion
+    std::unordered_set<geminifs_dma *> unique_contexts;
+    for (const auto &pair : dma_contexts_)
     {
-        geminifs_dma *dma_ctx = pair.second;
+        if (pair.second != nullptr)
+        {
+            unique_contexts.insert(pair.second);
+        }
+    }
+
+    // Delete each unique DMA context only once
+    for (geminifs_dma *dma_ctx : unique_contexts)
+    {
         // 注意: 不调用 cudaFree，因为 CUDA 内存由应用进程管理
         // PRP 上下文会在 geminifs_dma 的析构函数中自动清理
         delete dma_ctx;
