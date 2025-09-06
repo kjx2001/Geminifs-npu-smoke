@@ -307,8 +307,8 @@ __host__ bool GeminiFS::geminifs_gpu_close_file(int device_id, GPUFileId id) {
     }
 
     return gpu_file_manager_->closeGPUFile(id);
-}
-
+}   
+// TODO (YJQ): optimize the GPU_read_kernel
 __host__ bool GeminiFS::geminifs_batched_read(std::vector<torch::Tensor>& k_caches, const std::vector<int>& k_layer_ids, std::vector<torch::Tensor>& v_caches, const std::vector<int>& v_layer_ids, const std::vector<GPUFileId>& gpu_file_ids, GPUControllerPtr gpu_controller) {
     assert(k_caches.size() == v_caches.size() && k_caches.size() == gpu_file_ids.size() && k_caches.size() == k_layer_ids.size() && k_caches.size() == v_layer_ids.size());
     assert(k_caches[0].sizes() == v_caches[0].sizes());
@@ -435,7 +435,7 @@ __host__ bool GeminiFS::geminifs_GPU_write_kernel(const torch::Tensor& tensor, G
         geminifs_error("GPU_write_kernel: GPUFileManager not initialized\n");
         return false;
     }
-
+    // TODO (YJQ): optimize the io quest struct
     GPUIoContext* io_ctx;
     if (!gpu_file_manager_->getIoContextById(gpu_file_id, &io_ctx)) {
         geminifs_error("GPU_write_kernel: GPU File %u not opened\n", gpu_file_id);

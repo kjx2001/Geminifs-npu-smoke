@@ -1216,7 +1216,7 @@ geminifs_dma *GPUController::createDMAContext(const torch::Tensor &tensor, uint6
         delete dma_ctx;
         return nullptr;
     }
-
+    // TODO (YJQ): move thie mapping to CPU
     if (!addPRPMappingsToGPU(dma_ctx))
     {
         delete dma_ctx;
