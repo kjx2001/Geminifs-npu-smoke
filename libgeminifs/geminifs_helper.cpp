@@ -59,7 +59,7 @@ static inline int ioctl_get_pci_distance(const char *snvme_control_path, struct 
 }
 
 static std::string pci_bdf_to_string(const PCI_BDF& bdf) {
-    char buffer[13];
+    char buffer[14];
     snprintf(buffer, sizeof(buffer), "%04x:%02x:%02x.%x", 
              bdf.domain, bdf.bus, bdf.device, bdf.function);
     return std::string(buffer, sizeof(buffer));
