@@ -48,7 +48,6 @@
 #include "utils.cuh"
 #include "geminifs.cuh"
 #include "nvme_controller.cuh"
-#include "geminifs_helper.h"
 #include "gpu_controller.cuh"
 
 
@@ -398,18 +397,31 @@ __host__ bool GeminiFS::geminifs_GPU_read_kernel(torch::Tensor& tensor, GPUFileI
         return false;
     }
 
-    auto* device_view = gpu_controller->getMemoryMapper()->getDeviceViewPtr();
-    if (!device_view) {
-        geminifs_error("GPU_read_kernel: device view is null\n");
+    uint64_t tensor_ptr = reinterpret_cast<uint64_t>(tensor.data_ptr());
+    size_t len = static_cast<size_t>(tensor.numel()) * static_cast<size_t>(tensor.element_size());
+
+    // MAX COUNT ?
+    auto mapping_info = gpu_controller->getMemoryMapper()->lookupMappings(tensor_ptr);
+    if (!mapping_info) {
+        geminifs_error("GPU_write_kernel: No valid PRP mapping found for tensor pointer %p\n", tensor.data_ptr());
         return false;
     }
 
-    // 启动多FD内核（内核内部根据 tid%num_fds 分发并触发 v3 批量）
-    uint64_t tensor_ptr = reinterpret_cast<uint64_t>(tensor.data_ptr());
-    size_t len = static_cast<size_t>(tensor.numel()) * static_cast<size_t>(tensor.element_size());
-    GPU_Read_kernel_multi<<<1,1>>>(io_ctx, tensor_ptr, offset, len, device_view);
-    cudaError_t err = cudaDeviceSynchronize();
+    int mapping_count = mapping_info->mappings.size();
+    auto mapping_start = (uint64_t)mapping_info->mappings.data();
+    geminifs_info("mapping_start: %lx, mapping_count: %d\n", mapping_start, mapping_count);
+    auto err = cudaMemcpy(&io_ctx->mapping_entries, &mapping_start, sizeof(uint64_t), cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        geminifs_error("GPU_write_kernel: cudaMemcpy to io_ctx->mapping_entries failed");
+        return false;
+    }
 
+    const uint32_t THREADS_PER_BLOCK = 32;
+    uint32_t blocks = (mapping_count + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+
+    nvme_batch_read_kernel<<<blocks, THREADS_PER_BLOCK>>>(io_ctx, tensor_ptr, mapping_count, offset);
+    
+    err = cudaDeviceSynchronize();
     if (err != cudaSuccess) {
         geminifs_error("GPU_read_kernel: GPU_Read_kernel_multi failed: %s\n", cudaGetErrorString(err));
         return false;
@@ -449,18 +461,29 @@ __host__ bool GeminiFS::geminifs_GPU_write_kernel(const torch::Tensor& tensor, G
         return false;
     }
 
-    auto* device_view = gpu_controller->getMemoryMapper()->getDeviceViewPtr();
-    if (!device_view) {
-        geminifs_error("GPU_write_kernel: device view is null\n");
+    uint64_t tensor_ptr = reinterpret_cast<uint64_t>(tensor.data_ptr());
+    size_t len = static_cast<size_t>(tensor.numel()) * static_cast<size_t>(tensor.element_size());
+
+    auto mapping_info = gpu_controller->getMemoryMapper()->lookupMappings(tensor_ptr);
+    if (!mapping_info) {
+        geminifs_error("GPU_write_kernel: No valid PRP mapping found for tensor pointer %p\n", tensor.data_ptr());
         return false;
     }
 
-    // 启动多FD内核
-    uint64_t tensor_ptr = reinterpret_cast<uint64_t>(tensor.data_ptr());
-    size_t len = static_cast<size_t>(tensor.numel()) * static_cast<size_t>(tensor.element_size());
-    GPU_Write_kernel_multi<<<1,1>>>(io_ctx, tensor_ptr, offset, len, device_view);
-    cudaError_t err = cudaDeviceSynchronize();
+    int mapping_count = mapping_info->mappings.size();
+    auto mapping_start = (uint64_t)mapping_info->mappings.data();
+    auto err = cudaMemcpy(&io_ctx->mapping_entries, &mapping_start, sizeof(uint64_t), cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        geminifs_error("GPU_write_kernel: cudaMemcpy to io_ctx->mapping_entries failed");
+        return false;
+    }
 
+    const uint32_t THREADS_PER_BLOCK = 32;
+    uint32_t blocks = (mapping_count + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+
+    nvme_batch_write_kernel<<<blocks, THREADS_PER_BLOCK>>>(io_ctx, tensor_ptr, mapping_count, offset);
+    
+    err = cudaDeviceSynchronize();
     if (err != cudaSuccess) {
         geminifs_error("GPU_write_kernel: GPU_Write_kernel_multi failed: %s\n", cudaGetErrorString(err));
         return false;

@@ -13,56 +13,26 @@
 #include "geminifs_mem.h"
 #include "gpu_file_manager.cuh"
 #include "prp_mapping_entry.h"
+#include <cuda/std/span>
 
 
-/**
- * GPU端映射链表节点 (16字节)
- */
-struct GPUMappingNode {
-    uint32_t entry_index;     // 4字节 - 在映射条目数组中的索引
-    uint32_t next_node;       // 4字节 - 下一个节点的索引 (链表)
-    uint64_t reserved;        // 8字节 - 保留字段，用于对齐
-    
-    __device__ __host__ GPUMappingNode() : entry_index(0xFFFFFFFF), next_node(0xFFFFFFFF), reserved(0) {}
-    __device__ __host__ GPUMappingNode(uint32_t entry_idx) : entry_index(entry_idx), next_node(0xFFFFFFFF), reserved(0) {}
-};
 
-
-/**
- * GPU端哈希表条目 (16字节) - 支持链表
- */
-struct GPUHashEntry {
-    uint64_t GPU_virtual_ptr;    // 8字节 - tensor指针 (作为key)
-    uint32_t first_node;         // 4字节 - 第一个映射节点的索引
-    uint32_t mapping_count;      // 4字节 - 该tensor的映射数量
-    uint64_t tensor_size;        // 8字节 - 注册的GPU虚拟内存总长度
-    
-    __device__ __host__ GPUHashEntry() : GPU_virtual_ptr(0), first_node(0xFFFFFFFF), mapping_count(0), tensor_size(0) {}
-};
-
-/**
- * GPU内存映射管理器的Device侧视图结构体
- * 用于在GPU kernel中访问映射数据结构
- */
-struct GPUMemoryMapperDeviceView {
-    PRPMappingEntry* d_mapping_entries;     // PRP映射条目数组
-    GPUMappingNode* d_mapping_nodes;        // 映射节点数组
-    GPUHashEntry* d_hash_table;             // 哈希表
-    uint32_t* d_free_entry_list;            // 空闲映射条目列表
-    uint32_t* d_free_node_list;             // 空闲映射节点列表
-    uint32_t* d_free_entry_count;           // 空闲映射条目计数器
-    uint32_t* d_free_node_count;            // 空闲映射节点计数器
-    
-    __device__ __host__ GPUMemoryMapperDeviceView() 
-        : d_mapping_entries(nullptr), d_mapping_nodes(nullptr), d_hash_table(nullptr),
-          d_free_entry_list(nullptr), d_free_node_list(nullptr), 
-          d_free_entry_count(nullptr), d_free_node_count(nullptr) {}
-};
-
-/**
- * GPU内存映射管理器
- */
 class GPUMemoryMapper {
+public:
+    struct GPUMappingNode {
+        uint32_t entry_index;     // 4字节 - 在映射条目数组中的索引
+        uint32_t next_node;       // 4字节 - 下一个节点的索引 (链表)
+        uint64_t reserved;        // 8字节 - 保留字段，用于对齐
+        __device__ __host__ GPUMappingNode(uint32_t entry_idx = 0) : entry_index(entry_idx), next_node(0xFFFFFFFF), reserved(0) {}
+    };
+
+    struct GPUHashEntry {
+        uint64_t dev_ptr;
+        uint64_t tensor_size;
+        cuda::std::span<PRPMappingEntry> mappings;
+        GPUHashEntry* next; 
+    };
+
 public:
     static constexpr size_t MAX_MAPPINGS = 1024 * 1024;          // 1M个PRP映射条目
     static constexpr size_t MAX_MAPPING_NODES = 4 * 1024 * 1024; // 2M个映射节点 (支持平均每个tensor 4个映射)
@@ -70,25 +40,13 @@ public:
     static constexpr uint32_t INVALID_INDEX = 0xFFFFFFFF;
     
 private:
-    // GPU内存指针
-    PRPMappingEntry* d_mapping_entries_;     // PRP映射条目数组
-    GPUMappingNode* d_mapping_nodes_;        // 映射节点数组 (用于链表)
-    GPUHashEntry* d_hash_table_;             // 哈希表
-    uint32_t* d_free_entry_list_;            // 空闲映射条目列表
-    uint32_t* d_free_node_list_;             // 空闲映射节点列表
-    uint32_t* d_free_entry_count_;           // 空闲映射条目计数器
-    uint32_t* d_free_node_count_;            // 空闲映射节点计数器
-    
-    // Device侧视图结构体指针 - 在GPU内存中
-    GPUMemoryMapperDeviceView* d_device_view_;
-    
     // 主机端管理
     mutable std::mutex mapper_mutex_;
-    bool is_initialized_;
+    std::atomic<bool> initialized_;
+    std::unordered_map<uint64_t, GPUHashEntry*> host_mappings_; // 主机端的映射存储
     int device_id_;
-    
 public:
-    GPUMemoryMapper(int device_id);
+    GPUMemoryMapper(int device_id) : initialized_(false), device_id_(device_id) {}
     ~GPUMemoryMapper();
     
     /**
@@ -108,7 +66,9 @@ public:
      * @return 成功返回true
      */
     bool addBatchMappings(uint64_t tensor_ptr, uint64_t tensor_size, const std::vector<PRPMappingEntry>& mappings);
- 
+    
+
+    GPUHashEntry* lookupMappings(uint64_t tensor_ptr) const;
     
     /**
      * 移除tensor的所有映射
@@ -116,197 +76,22 @@ public:
      * @return 成功返回true
      */
     bool removeAllMappings(uint64_t tensor_ptr);
-    
-   /**
-     * 获取映射条目数组指针 (用于GPU kernel)
-     */
-    PRPMappingEntry* getMappingEntriesPtr() const { return d_mapping_entries_; }
-    
-    /**
-     * 获取映射节点数组指针 (用于GPU kernel)
-     */
-    GPUMappingNode* getMappingNodesPtr() const { return d_mapping_nodes_; }
-    
-    /**
-     * 获取哈希表指针 (用于GPU kernel)
-     */
-    GPUHashEntry* getHashTablePtr() const { return d_hash_table_; }
-    
-    /**
-     * 获取Device侧视图结构体指针 (用于GPU kernel)
-     */
-    GPUMemoryMapperDeviceView* getDeviceViewPtr() const { return d_device_view_; }
 
-    /**
-     * 获取统计信息
-     */
-    std::tuple<uint32_t, uint32_t, uint32_t, uint32_t> getStats() const; // (used_entries, total_entries, used_nodes, total_nodes)
+    void debugPrintMappings(const GPUHashEntry * entry, bool inDevice) const;
 };
 
 
-// === GPU mem to dma maping Implementation ===
-
-
-/**
- * GPU端哈希函数
- */
-__device__ __forceinline__ uint32_t gpu_hash(uint64_t key) {
-    // 改进的哈希函数，解决指针哈希冲突问题
-    // 灵感来源于MurmurHash和xorshift
-    key = (key >> 12); // 指针通常是4K对齐的，右移12位可以消除低位的0，增加有效信息
-    key ^= (key >> 33);
-    key *= 0xff51afd7ed558ccdULL;
-    key ^= (key >> 33);
-    key *= 0xc4ceb9fe1a85ec53ULL;
-    key ^= (key >> 33);
-    return static_cast<uint32_t>(key % GPUMemoryMapper::HASH_TABLE_SIZE);
-}
-
-// === GPU设备端查找函数 ===
-
-/**
- * GPU端查找tensor的所有PRP映射
- * @param tensor_ptr Tensor的GPU虚拟内存指针
- * @param hash_table 哈希表指针
- * @param mapping_nodes 映射节点数组指针
- * @param mapping_entries 映射条目数组指针
- * @param result_ptrs 输出的PRP映射条目指针数组 (调用者分配)
- * @param max_results 最大结果数量
- * @return 实际找到的映射数量
- */
-__device__ uint32_t gpu_lookup_all_prp_mappings(uint64_t tensor_ptr,
-                                                GPUHashEntry* hash_table,
-                                                GPUMappingNode* mapping_nodes,
-                                                PRPMappingEntry* mapping_entries,
-                                                PRPMappingEntry** result_ptrs,
-                                                uint32_t max_results,
-                                                uint64_t* tensor_size);
-
-/**
- * GPU kernel用于查询和打印tensor的PRP映射信息
- * @param device_view Device侧视图结构体指针
- * @param tensor_ptr Tensor指针
- * @param tensor_size Tensor大小
- * @param granularity 粒度大小
- */
-__global__ void gpu_debug_prp_mappings_kernel(GPUMemoryMapperDeviceView* device_view,
-                                              uint64_t tensor_ptr, 
-                                              size_t tensor_size,
-                                              uint64_t granularity);
-
-
-                                       /**
- * 批量NVMe读取kernel V2：每个线程直接查询自己的PRP映射条目
- * 解决动态并行内存访问问题，避免传递指针数组
- * @param d_fd NVMe文件描述符
- * @param tensor_ptr GPU tensor指针
- * @param total_count 总的映射条目数量
- * @param base_file_offset 文件基础偏移量
- * @param device_view GPU内存映射器的设备视图
- */
-__global__ void nvme_batch_read_kernel_v2(NVMe_File* d_fd,
-                                          uint64_t tensor_ptr,
-                                          uint32_t total_count,
-                                          size_t base_file_offset,
-                                          GPUMemoryMapperDeviceView* device_view);
-
-/**
- * 批量NVMe写入kernel V2：每个线程直接查询自己的PRP映射条目
- * 解决动态并行内存访问问题，避免传递指针数组
- * @param d_fd NVMe文件描述符
- * @param tensor_ptr GPU tensor指针
- * @param total_count 总的映射条目数量
- * @param base_file_offset 文件基础偏移量
- * @param device_view GPU内存映射器的设备视图
- */
-__global__ void nvme_batch_write_kernel_v2(NVMe_File* d_fd,
-                                           uint64_t tensor_ptr,
-                                           uint32_t total_count,
-                                           size_t base_file_offset,
-                                           GPUMemoryMapperDeviceView* device_view);
-/**
- * GPU读取kernel：查询PRP映射并动态并行发起NVMe IO
- * @param d_fd NVMe文件描述符
- * @param tensor_ptr GPU tensor指针
- * @param offset 文件偏移量
- * @param len 读取长度
- * @param device_view GPU内存映射器的设备视图
- */
-__global__ void GPU_Read_kernel(NVMe_File* d_fd,
-                               uint64_t tensor_ptr,
-                               size_t offset,
-                               size_t len, 
-                               GPUMemoryMapperDeviceView* device_view);
-
-/**
- * Multi-FD variant: distribute mappings by tid % num_fds
- */
-__global__ void GPU_Read_kernel_multi(GPUIoContext* io_ctx,
-                                      uint64_t tensor_ptr,
-                                      size_t offset,
-                                      size_t len,
-                                      GPUMemoryMapperDeviceView* device_view);
-
-/**
- * GPU写入kernel：查询PRP映射并动态并行发起NVMe IO
- * @param d_fd NVMe文件描述符
- * @param tensor_ptr GPU tensor指针
- * @param offset 文件偏移量
- * @param len 写入长度
- * @param device_view GPU内存映射器的设备视图
- */
-__global__ void GPU_Write_kernel(NVMe_File* d_fd,
-                                uint64_t tensor_ptr,
-                                size_t offset,
-                                size_t len, 
-                                GPUMemoryMapperDeviceView* device_view);
-
-/**
- * Multi-FD variant: distribute mappings by tid % num_fds
- */
-__global__ void GPU_Write_kernel_multi(GPUIoContext* io_ctx,
-                                       uint64_t tensor_ptr,
-                                       size_t offset,
-                                       size_t len,
-                                       GPUMemoryMapperDeviceView* device_view);
-
-// New: per-slice by (offset,len), resolve PRP inside kernel at execution time
-__global__ void nvme_read_slices_by_range_kernel(NVMe_File** d_fds,
-                                                 uint64_t* tensor_ptrs,
-                                                 uint64_t* offsets,
-                                                 uint32_t* lengths,
-                                                 uint32_t total_count,
-                                                 GPUMemoryMapperDeviceView* device_view);
-
-__global__ void nvme_write_slices_by_range_kernel(NVMe_File** d_fds,
-                                                  uint64_t* tensor_ptrs,
-                                                  uint64_t* offsets,
-                                                  uint32_t* lengths,
-                                                  uint32_t total_count,
-                                                  GPUMemoryMapperDeviceView* device_view);
-
 // Batch v3: distribute by tid % num_fds
-__global__ void nvme_batch_read_kernel_v3(GPUIoContext* io_ctx,
+__global__ void nvme_batch_read_kernel(GPUIoContext* io_ctx,
                                           uint64_t tensor_ptr,
                                           uint32_t total_count,
                                           size_t base_file_offset);
 
-__global__ void nvme_batch_write_kernel_v3(GPUIoContext* io_ctx,
+__global__ void nvme_batch_write_kernel(GPUIoContext* io_ctx,
                                            uint64_t tensor_ptr,
                                            uint32_t total_count,
                                            size_t base_file_offset);
 
-/**
- * Host端函数用于调用GPU kernel查询和打印PRP映射
- * @param mapper GPUMemoryMapper指针
- * @param tensor_ptr Tensor指针
- * @param tensor_size Tensor大小
- * @param granularity 粒度大小
- */
-void debug_prp_mappings_from_gpu(GPUMemoryMapper* mapper, 
-                                 uint64_t tensor_ptr, 
-                                 size_t tensor_size, 
-                                 uint64_t granularity);
 
 /**
  * GPU Controller class for managing a single GPU device's memory and storage
@@ -449,7 +234,7 @@ private:
     mutable std::mutex storage_mutex_;                                      // Mutex for storage operations
     
     std::unique_ptr<GPUMemoryMapper> memory_mapper_;
-    
+
     /**
      * Initialize the GPU controller
      * @return true if successful, false otherwise

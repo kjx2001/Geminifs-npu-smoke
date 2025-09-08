@@ -15,4 +15,5 @@ third_pkgs/*
 *.swp
 *~
 .clangd
+.cache
 db/

@@ -9,6 +9,7 @@
 #include <mutex>
 #include <cstdint>
 #include <cstdio>
+#include <atomic>
 
 #include "file.cuh"
 #include "nvme_file.h"  // 引入NVMeFileDesc
@@ -84,8 +85,8 @@ struct GPUFileDesc {
 
 struct GPUIoContext {
     uint8_t num_files;
-    NVMe_File* nvme_files[4]; // 最多4个NVMe文件指针 (32 bytes)
-    PRPMappingEntry* mapping_entries[1024]; // 对应的PRP映射条目指针 (32 bytes)
+    NVMe_File* nvme_files[4];
+    PRPMappingEntry *mapping_entries;
 };
 
 
