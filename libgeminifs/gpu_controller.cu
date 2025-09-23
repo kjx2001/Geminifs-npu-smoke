@@ -1,14 +1,16 @@
 #include "geminifs_helper.h"
 #include "geminifs_mem.h"
 #include "buffer.h"
+#include <cstdint>
 #include <cuda_runtime.h>
 #include <cassert>
 #include <filesystem>
 #include <cstring>
 #include <algorithm>
+#include <sys/types.h>
 #include <unordered_set>
 #include "gpu_controller.cuh"
-
+#include "nvme_controller.cuh"
 
 
 
@@ -76,7 +78,7 @@ bool GPUMemoryMapper::addBatchMappings(uint64_t tensor_ptr, uint64_t tensor_size
         return false;
     }
 
-    debugPrintMappings(new_entry, true);
+    // debugPrintMappings(new_entry, true);
 
     auto iter = host_mappings_.find(tensor_ptr);
     if (iter != host_mappings_.end()) { // 正常情况不会存在重复mapping
@@ -130,13 +132,14 @@ GPUMemoryMapper::lookupMappings(uint64_t tensor_ptr) const {
         geminifs_debug("GPU Memory Mapper: No mappings found for tensor 0x%lx on device %d\n", tensor_ptr, device_id_);
         return nullptr;
     }
-    debugPrintMappings(iter->second, true);
+    // debugPrintMappings(iter->second, true);
 
     // 直接返回链表头指针，调用者负责遍历
     return iter->second;
 }
 
 void GPUMemoryMapper::debugPrintMappings(const GPUHashEntry * entry, bool inDevice) const {
+#ifdef DEBUG
     if (entry == nullptr) {
         geminifs_info("GPU Memory Mapper: No mappings to print on device %d\n", device_id_);
         return;
@@ -160,6 +163,7 @@ void GPUMemoryMapper::debugPrintMappings(const GPUHashEntry * entry, bool inDevi
                     i, mapping.prp1, mapping.prp2, mapping.data_length);
     }
     std::free(host_mappings);
+#endif
 }
 
 
@@ -379,7 +383,7 @@ bool GPUController::unregisterTensorMemory(void *tensor_ptr)
 
         // Clean up DMA context (但不释放 CUDA 内存)
         // 注意: 不调用 cudaFree(dma_ctx->ioaddrs)，因为 CUDA 内存由应用进程管理
-        delete dma_ctx;
+        std::free(dma_ctx);
     }
 
     geminifs_debug("GPU Controller: Successfully unregistered tensor at %p for device %d\n",
@@ -420,7 +424,8 @@ void GPUController::clearAllDMAContexts()
     {
         // 注意: 不调用 cudaFree，因为 CUDA 内存由应用进程管理
         // PRP 上下文会在 geminifs_dma 的析构函数中自动清理
-        delete dma_ctx;
+        // delete dma_ctx;
+        std::free(dma_ctx);
     }
 
     dma_contexts_.clear();
@@ -733,26 +738,31 @@ geminifs_dma *GPUController::createDMAContext(const torch::Tensor &tensor, uint6
         return nullptr;
     }
 
-    // 创建 geminifs_dma 结构
-    geminifs_dma *dma_ctx = new geminifs_dma();
+    // clangd在new和delete关键词会报错，这里该用malloc/free
+    geminifs_dma *dma_ctx = (geminifs_dma *)std::malloc(sizeof(geminifs_dma));
+    if (!dma_ctx) {
+        geminifs_error("GPU Controller: Failed to allocate memory for DMA context\n");
+        return nullptr;
+    }
+    *dma_ctx = geminifs_dma();
     dma_ctx->dma_ptr = dma_ptr;
 
     // 执行 DMA 切片
     if (!performDMASlicing(dma_ctx, tensor_size, granularity))
     {
-        delete dma_ctx;
+        std::free(dma_ctx);
         return nullptr;
     }
 
     if (!initializePRPEntries(dma_ctx))
     {
-        delete dma_ctx;
+        std::free(dma_ctx);
         return nullptr;
     }
-    // TODO (YJQ): move thie mapping to CPU
+
     if (!addPRPMappingsToGPU(dma_ctx))
     {
-        delete dma_ctx;
+        std::free(dma_ctx);
         return nullptr;
     }
 
@@ -1123,7 +1133,7 @@ __device__ bool check_file_access_safety(NVMe_File *d_fd,
 {
     if (!d_fd)
     {
-        printf("Safety Check Error: NVMe_File pointer is null\n");
+        geminifs_error("Safety Check Error: NVMe_File pointer is null\n");
         return false;
     }
 
@@ -1131,14 +1141,14 @@ __device__ bool check_file_access_safety(NVMe_File *d_fd,
     uint64_t file_max_size = d_fd->get_file_size();
     if (file_max_size == 0)
     {
-        printf("Safety Check Error: Could not get file size (hdr might be null)\n");
+        geminifs_error("Safety Check Error: Could not get file size (hdr might be null)\n");
         return false;
     }
 
     // 检查tensor_size是否足够容纳要读取的数据
     if (tensor_size < len)
     {
-        printf("Safety Check Error: tensor_size (%lu) < read length (%zu)\n",
+        geminifs_error("Safety Check Error: tensor_size (%lu) < read length (%zu)\n",
                tensor_size, len);
         return false;
     }
@@ -1146,7 +1156,7 @@ __device__ bool check_file_access_safety(NVMe_File *d_fd,
     // 检查文件访问边界
     if (offset + len > file_max_size)
     {
-        printf("Safety Check Error: access beyond file boundary - "
+        geminifs_error("Safety Check Error: access beyond file boundary - "
                "offset (%zu) + len (%zu) = %zu > file_max_size (%lu)\n",
                offset, len, offset + len, file_max_size);
         return false;
@@ -1155,7 +1165,7 @@ __device__ bool check_file_access_safety(NVMe_File *d_fd,
     // 检查offset是否有效
     if (offset >= file_max_size)
     {
-        printf("Safety Check Error: offset (%zu) >= file_max_size (%lu)\n",
+        geminifs_error("Safety Check Error: offset (%zu) >= file_max_size (%lu)\n",
                offset, file_max_size);
         return false;
     }
@@ -1163,7 +1173,7 @@ __device__ bool check_file_access_safety(NVMe_File *d_fd,
     // 检查len是否为0
     if (len == 0)
     {
-        printf("Safety Check Warning: read length is 0\n");
+        geminifs_error("Safety Check Warning: read length is 0\n");
         return false;
     }
 
@@ -1177,7 +1187,7 @@ __device__ bool check_file_access_safety(NVMe_File *d_fd,
 
     if (len % 4096 != 0)
     {
-        printf("Safety Check Error: length (%zu) is not 4K aligned (remainder: %zu)\n",
+        geminifs_error("Safety Check Error: length (%zu) is not 4K aligned (remainder: %zu)\n",
                len, len % 4096);
         return false;
     }
@@ -1189,76 +1199,114 @@ __device__ bool check_file_access_safety(NVMe_File *d_fd,
     return true;
 }
 
-__global__ void nvme_batch_read_kernel(GPUIoContext *io_ctx,
-                                          uint64_t tensor_ptr,
-                                          uint32_t total_count,
-                                          size_t base_file_offset)
-{
-    uint32_t tid = threadIdx.x + blockIdx.x * blockDim.x;
-    if (tid >= total_count)
-    {
-        printf("WARNING, read kernel tid %d >= total count %d! prp base %p\n", tid, total_count, io_ctx->mapping_entries);
+
+// 所有的检查都在host端进行
+__global__ void nvme_xfer_kernel(NVMeFilesSpan nvme_file,
+                                 PRPMappingEntrySpan prp_entries,
+                                 uint64_t tensor_size,
+                                 size_t base_file_offset,
+                                 bool is_read) {
+
+    const uint32_t tid   = threadIdx.x + blockIdx.x * blockDim.x;
+    const uint32_t total = prp_entries.size();
+    if (tid >= total) return;
+
+    auto entry = &prp_entries[tid];
+    const uint64_t blk_size = entry->data_length;
+    const uint64_t gpu_blk  = (base_file_offset / blk_size) + tid;
+    const uint64_t fd_idx   = gpu_blk % nvme_file.size();
+    const uint64_t file_off = (gpu_blk / nvme_file.size()) * blk_size;
+
+    geminifs_info("tid=%u fd_idx=%lu prp1=0x%lx prp2=0x%lx file_off=%lu len=%lu\n",
+                  tid, fd_idx, entry->prp1, entry->prp2, file_off, blk_size);
+    
+
+    auto file = nvme_file[fd_idx];
+    if (!check_file_access_safety(file, tensor_size, file_off, blk_size)) {
+        geminifs_error("nvme_xfer_kernel: Safety check failed for tid=%u\n", tid);
         return;
     }
 
-    if (io_ctx->num_files == 0)
-    {
-        printf("WARNING, read kernel num_files=0\n");
-        return;
+    if (is_read) {
+        nvme_controller_g_read(file, entry->prp1, entry->prp2, file_off, blk_size);
+    } else {
+        nvme_controller_g_write(file, entry->prp1, entry->prp2, file_off, blk_size);
     }
-
-    // 获取本线程的映射条目
-    PRPMappingEntry *entry = io_ctx->mapping_entries + tid;
-    if (!entry)
-    {
-        printf("WARNING, read kernel tid %d no prp entry! base entry %p\n", tid, io_ctx->mapping_entries);
-
-        return;
-    }
-
-    uint64_t thread_logical_offset = base_file_offset + tid * entry->data_length;
-    uint64_t fd_idx = (thread_logical_offset % (io_ctx->num_files * entry->data_length)) / entry->data_length;
-    uint64_t thread_physical_offset = (thread_logical_offset / (io_ctx->num_files * entry->data_length)) * entry->data_length + fd_idx * entry->data_length;
-    NVMe_File *file = io_ctx->nvme_files[fd_idx];
-
-    printf("nvme_batch_read_kernel_v3: tid=%u, fd_idx=%lu, prp1=0x%lx, prp2=0x%lx, file_offset=%lu, len=%u\n",
-           tid, fd_idx, entry->prp1, entry->prp2, thread_physical_offset, entry->data_length);
-
-    nvme_controller_g_read(file, entry->prp1, entry->prp2, thread_physical_offset, entry->data_length);
 }
 
-__global__ void nvme_batch_write_kernel(GPUIoContext *io_ctx,
-                                           uint64_t tensor_ptr,
-                                           uint32_t total_count,
-                                           size_t base_file_offset)
-{
-    uint32_t tid = threadIdx.x + blockIdx.x * blockDim.x;
-    if (tid >= total_count)
-    {
-        printf("WARNING, write kernel tid %d >= total count %d !\n", tid, total_count);
+// 这里为了避免拷贝直接用了两个span，可以直接调用长度为1的batch发起。
+__global__ void nvme_kv_xfer_kernel(NVMeFilesSpan nvme_file,
+                                    PRPMappingEntrySpan k_mappings,
+                                    PRPMappingEntrySpan v_mappings,
+                                    uint64_t tensor_size,
+                                    size_t base_file_offset,
+                                    bool is_read) {
+
+    const uint32_t tid = threadIdx.x + blockIdx.x * blockDim.x;
+    const auto k_size = k_mappings.size();
+    const auto v_size = v_mappings.size();
+    const auto total  = k_size + v_size;
+
+    if (tid >= total || nvme_file.empty()) return;
+
+    auto entry = tid < k_size ? &k_mappings[tid] : &v_mappings[tid - k_size];
+    const uint64_t blk_size = entry->data_length;
+    const uint64_t gpu_blk  = (base_file_offset / blk_size) + tid;
+    const uint64_t fd_idx   = gpu_blk % nvme_file.size();
+    const uint64_t file_off = (gpu_blk / nvme_file.size()) * blk_size;
+
+    geminifs_info("tid=%u fd_idx=%lu prp1=0x%lx prp2=0x%lx file_off=%lu len=%lu\n",
+                  tid, fd_idx, entry->prp1, entry->prp2, file_off, blk_size);
+
+    auto file = nvme_file[fd_idx];
+    if (!check_file_access_safety(file, tensor_size, file_off, blk_size)) {
+        geminifs_error("nvme_kv_xfer_kernel: Safety check failed for tid=%u\n", tid);
         return;
     }
 
-    if (io_ctx->num_files == 0)
-    {
-        printf("WARNING, write kernel invalid device_view or num_files=0\n");
+    if (is_read) {
+        nvme_controller_g_read(file, entry->prp1, entry->prp2, file_off, blk_size);
+    } else {
+        nvme_controller_g_write(file, entry->prp1, entry->prp2, file_off, blk_size);
+    }
+}
+
+
+__global__ void nvme_batch_xfer_kernel(BatchIoEntry* io_ctx,
+                                       uint64_t tensor_size,
+                                       uint32_t total_count,
+                                       bool is_read) {
+    
+    const uint32_t tid = threadIdx.x + blockIdx.x * blockDim.x;
+    if (tid >= total_count || !io_ctx) return;
+
+    // const auto local_tid = 
+
+    auto ctx = io_ctx->d_ioctxs[tid];
+    auto entry = ctx.prp_entry;
+    if (!entry) return;
+
+    auto nvme_file = ctx.nvme_files;
+    if (nvme_file.size() == 0) return;
+
+    const uint64_t blk_size = entry->data_length;
+    const uint64_t gpu_blk  = (ctx.file_offset / blk_size) + ctx.prp_idx;
+    const uint64_t fd_idx   = gpu_blk % nvme_file.size();
+    const uint64_t file_off = (gpu_blk / nvme_file.size()) * blk_size;      
+    
+    geminifs_info("tid=%u fd_idx=%lu prp1=0x%lx prp2=0x%lx file_off=%lu len=%lu\n",
+                  tid, fd_idx, entry->prp1, entry->prp2, file_off, blk_size);
+    
+    auto file = nvme_file[fd_idx];
+    if (!check_file_access_safety(file, tensor_size, file_off, blk_size)) {
+        geminifs_error("nvme_batch_xfer_kernel: Safety check failed for tid=%u\n", tid);
         return;
     }
 
-    PRPMappingEntry *entry = io_ctx->mapping_entries + tid;
-    if (!entry)
-    {
-        printf("WARNING, write kernel tid %d no prp entry!\n", tid);
-        return;
+    if (is_read) {
+        nvme_controller_g_read(file, entry->prp1, entry->prp2, file_off, blk_size);
+    } else {
+        nvme_controller_g_write(file, entry->prp1, entry->prp2, file_off, blk_size);
     }
 
-    uint64_t thread_logical_offset = base_file_offset + tid * entry->data_length;
-    uint64_t fd_idx = (thread_logical_offset % (io_ctx->num_files * entry->data_length)) / entry->data_length;
-    uint64_t thread_physical_offset = (thread_logical_offset / (io_ctx->num_files * entry->data_length)) * entry->data_length + fd_idx * entry->data_length;
-    NVMe_File *file = io_ctx->nvme_files[fd_idx];
-
-    printf("nvme_batch_write_kernel: tid=%u, fd_idx=%lu, prp1=0x%lx, prp2=0x%lx, file_offset=%lu, len=%u\n",
-           tid, fd_idx, entry->prp1, entry->prp2, thread_physical_offset, entry->data_length);
-
-    nvme_controller_g_write(file, entry->prp1, entry->prp2, thread_physical_offset, entry->data_length);
 }

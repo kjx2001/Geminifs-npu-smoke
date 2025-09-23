@@ -2,6 +2,7 @@
 #define GPU_FILE_MANAGER_H
 
 #include <string>
+#include <sys/types.h>
 #include <vector>
 #include <map>
 #include <unordered_map>
@@ -10,6 +11,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <atomic>
+#include <utility>
 
 #include "file.cuh"
 #include "nvme_file.h"  // 引入NVMeFileDesc
@@ -82,12 +84,82 @@ struct GPUFileDesc {
     CompactNVMeMapping nvme_mapping; // 紧凑的NVMe文件映射 (17 bytes)
 };
 
+template<typename T>
+using cudaSpan = cuda::std::span<T>;
+using NVMeFilesSpan = cudaSpan<NVMe_File*>;
+using PRPMappingEntrySpan = cudaSpan<PRPMappingEntry>;
 
 struct GPUIoContext {
-    uint8_t num_files;
-    NVMe_File* nvme_files[4];
-    PRPMappingEntry *mapping_entries;
+    NVMeFilesSpan nvme_files;
+    PRPMappingEntry *prp_entry;
+    off_t prp_idx;
+    off_t file_offset;
 };
+
+#define MAX_IOCTX_PER_BATCH 64u
+#define MAX_LAYER_PER_BATCH MAX_IOCTX_PER_BATCH
+
+struct BatchIoEntry {
+    GPUIoContext d_ioctxs[MAX_IOCTX_PER_BATCH];
+};
+
+class BatchIoPool {
+public:
+    struct BatchIoNode {
+        BatchIoEntry *entry;
+        BatchIoNode* next;
+        BatchIoNode(BatchIoEntry* e) : entry(e), next(nullptr) {}
+        BatchIoNode() : entry(nullptr), next(nullptr) {}
+    };
+public:
+    explicit __host__ BatchIoPool(size_t capacity) {
+        auto cudaErr = cudaMalloc(&entries_, capacity * sizeof(BatchIoEntry));
+        if (cudaErr != cudaSuccess) {
+            throw std::runtime_error("Failed to allocate device memory for BatchIoPool");
+        }
+        nodes_.resize(capacity);
+        for (size_t i = 0; i < capacity; ++i) {
+            nodes_[i].entry = entries_ + i;
+            release(entries_ + i);
+        }
+    }
+
+    ~BatchIoPool() {
+        cudaFree(entries_);
+        nodes_.clear();
+    }
+
+    // 分配资源
+    BatchIoEntry* acquire() {
+        BatchIoNode* node;
+        do {
+            node = head_.load(std::memory_order_acquire);
+            if (!node) return nullptr;
+        } while (!head_.compare_exchange_weak(node, node->next,
+                                             std::memory_order_acquire,
+                                             std::memory_order_relaxed));
+        return node->entry;
+    }
+
+    // 回收资源
+    void release(BatchIoEntry* obj) {
+        size_t idx = obj - entries_;   // entries_ 是数组首指针
+        BatchIoNode* node = &nodes_[idx];
+        BatchIoNode* oldHead;
+        do {
+            oldHead = head_.load(std::memory_order_relaxed);
+            node->next = oldHead;
+        } while (!head_.compare_exchange_weak(oldHead, node,
+                                             std::memory_order_release,
+                                             std::memory_order_relaxed));
+    }
+
+private:
+    BatchIoEntry* entries_; // device point
+    std::atomic<BatchIoNode*> head_ {nullptr};
+    std::vector<BatchIoNode> nodes_;
+};
+
 
 
 class GPUFileManager {
@@ -109,8 +181,12 @@ public:
     bool closeGPUFile(GPUFileId file_id);
     bool getGPUFileById(GPUFileId file_id, GPUFileDesc& out_desc) const;
     bool getDevFdById(GPUFileId file_id, std::vector<dev_fd_t>& dev_fds) const;
-    bool getIoContextById(GPUFileId file_id, GPUIoContext** io_ctx) const;
+    bool getNVMeFilesSpanById(GPUFileId file_id, NVMeFilesSpan& nvme_files) const;
+
     std::vector<GPUFileId> getAllGPUFileIds() const;
+
+    BatchIoEntry* allocateIoContexts();
+    void releaseIoContexts(BatchIoEntry* entry);
 
     // 持久化管理
     void forcePersist();
@@ -135,9 +211,10 @@ private:
     mutable std::mutex mtx_;
     // free_list_是**已打开的**GPUFile池
     std::vector<GPUFileId> free_list_;
-    std::unordered_map<GPUFileId, GPUIoContext*> file_id_to_ctx_map_;
+    std::unordered_map<GPUFileId, NVMeFilesSpan> file_id_to_ctx_map_;
     std::unordered_map<GPUFileId, GPUFileDesc> file_id_to_desc_map_;
     std::map<std::pair<NVMeCtrlId, NVMeFileId>, dev_fd_t> nvme_file_id_to_dev_fd_map_;
+    std::unique_ptr<BatchIoPool> io_ctx_pool_; // IO上下文池
 
     size_t persistence_threshold_;
     size_t pending_writes_count_;

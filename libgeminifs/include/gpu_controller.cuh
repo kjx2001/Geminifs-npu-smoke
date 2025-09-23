@@ -29,7 +29,7 @@ public:
     struct GPUHashEntry {
         uint64_t dev_ptr;
         uint64_t tensor_size;
-        cuda::std::span<PRPMappingEntry> mappings;
+        PRPMappingEntrySpan mappings;
         GPUHashEntry* next; 
     };
 
@@ -81,11 +81,32 @@ public:
 };
 
 
-// Batch v3: distribute by tid % num_fds
-__global__ void nvme_batch_read_kernel(GPUIoContext* io_ctx,
-                                          uint64_t tensor_ptr,
-                                          uint32_t total_count,
-                                          size_t base_file_offset);
+__global__ void nvme_xfer_kernel(NVMeFilesSpan nvme_file,
+                                 PRPMappingEntrySpan prp_entries,
+                                 uint64_t tensor_size,
+                                 size_t base_file_offset,
+                                 bool is_read);
+
+                    
+__global__ void nvme_kv_xfer_kernel(NVMeFilesSpan nvme_file,
+                                    PRPMappingEntrySpan k_mappings,
+                                    PRPMappingEntrySpan v_mappings,
+                                    uint64_t tensor_size,
+                                    size_t base_file_offset,
+                                    bool is_read);
+
+__global__ void nvme_batch_xfer_kernel(BatchIoEntry* io_ctx,
+                                       uint64_t tensor_size,
+                                       uint32_t total_count,
+                                       bool is_read);
+
+__global__ void nvme_batch_loop_xfer_kernel(BatchIoEntry* io_ctx,
+                                            uint32_t total_count,
+                                            bool is_read);
+
+__global__ void nvme_batch_read_kernel(cuda::std::span<GPUIoContext> io_ctx,
+                                       uint32_t total_count,
+                                       size_t base_file_offset);
 
 __global__ void nvme_batch_write_kernel(GPUIoContext* io_ctx,
                                            uint64_t tensor_ptr,

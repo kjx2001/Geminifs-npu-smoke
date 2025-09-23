@@ -8,7 +8,7 @@
 using namespace std;
 
 constexpr int GPU_file_nums = 100;
-constexpr int device_id = 1;
+constexpr int device_id = 0;
 
 constexpr int num_layers = 32;
 // KV cache per layer shape: [block_size, num_kv_head, head_dim]
@@ -52,7 +52,7 @@ int main(int argc, char **argv)
     // Here: bytes = block_size * num_kv_head * head_dim * sizeof(fp16) * 2 (K+V)
     // We just keep original shape placeholder (modify according to real layout inside GeminiFS)
     vector<size_t> GPU_file_shape = {2, num_layers, block_size * num_kv_head * head_dim}; 
-    GeminiFS geminifs("/home/qs/CompanionFS/Geminifs/sys_config.ini",
+    GeminiFS geminifs("/home/yjq/Geminifs/sys_config.ini",
                       GPU_file_nums, GPU_file_shape, 1);
 
     GPUFileId file_id, file_id2;
@@ -81,6 +81,7 @@ int main(int argc, char **argv)
     geminifs.geminifs_GPU_read_kernel(k0_r, v0_r, file_id,
         geminifs.geminifs_get_gpu_controller(device_id));
 
+    std::cout << "Single layer read/write done." << std::endl;
     check_kv_equal(k0, k0_r, "layer0.key");
     check_kv_equal(v0, v0_r, "layer0.value");
 
@@ -88,7 +89,7 @@ int main(int argc, char **argv)
     vector<torch::Tensor> key_layers_write  = {k0, k1};
     vector<torch::Tensor> value_layers_write= {v0, v1};
     vector<GPUFileId>     file_ids          = {file_id, file_id2};
-    vector<int>           layer_ids         = {0, 1};
+    int           layer_ids         = 1;
 
     vector<torch::Tensor> key_layers_read  = {k0_r, k1_r};
     vector<torch::Tensor> value_layers_read= {v0_r, v1_r};
@@ -113,15 +114,11 @@ int main(int argc, char **argv)
 
     // Alternate interface variant (if required by API)
     geminifs.geminifs_batched_write(
-        key_layers_write, layer_ids,
-        value_layers_write, layer_ids,
-        file_ids,
+        key_layers_write, value_layers_write, file_ids, layer_ids,
         geminifs.geminifs_get_gpu_controller(device_id));
 
     geminifs.geminifs_batched_read(
-        key_layers_read, layer_ids,
-        value_layers_read, layer_ids,
-        file_ids,
+        key_layers_write, value_layers_write, file_ids, layer_ids,
         geminifs.geminifs_get_gpu_controller(device_id));
 
     for (size_t i = 0; i < key_layers_write.size(); ++i) {

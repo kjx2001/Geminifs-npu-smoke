@@ -26,6 +26,7 @@
 #include <chrono>
 #include <iostream>
 #include <algorithm>
+#include <memory>
 #include <vector>
 
 // 构造函数
@@ -34,7 +35,8 @@ GPUFileManager::GPUFileManager(const std::string& log_path, GPUControllerPtr gpu
     , log_file_handle_(nullptr)
     , persistence_threshold_(persistence_threshold)
     , pending_writes_count_(0)
-    , gpu_controller_(gpu_controller) {
+    , gpu_controller_(gpu_controller)
+    , io_ctx_pool_(nullptr){
     
     geminifs_debug("Initializing GPUFileManager with log path: %s\n", log_path.c_str());
     
@@ -51,6 +53,9 @@ GPUFileManager::GPUFileManager(const std::string& log_path, GPUControllerPtr gpu
     
     // 从文件加载现有数据
     loadFromFile();
+
+    // 初始化IO上下文池
+    io_ctx_pool_.reset(new BatchIoPool(64 * 1024)); // 64K个IO上下文
     
     geminifs_info("GPUFileManager initialized with %zu active files and %zu NVMe controllers\n", 
                    file_id_to_desc_map_.size(), gpu_controller_->getControllerCount());
@@ -246,31 +251,25 @@ bool GPUFileManager::openGPUFile(GPUFileId& file_id) {
     }
     size_t num_fds = dev_fds.size();
 
-
-    GPUIoContext* io_context;
-    cudaError_t err = cudaMalloc(&io_context, sizeof(GPUIoContext));
+    NVMe_File **nvme_files;
+    cudaError_t err = cudaMalloc(&nvme_files, num_fds * sizeof(NVMe_File*));
     if (err != cudaSuccess) {
-        geminifs_error("openGPUFile: cudaMalloc GPUIoContext failed: %s\n", cudaGetErrorString(err));
+        geminifs_error("openGPUFile: cudaMalloc nvme_files failed: %s\n", cudaGetErrorString(err));
         goto fail_after_pop_back;
     }
 
-    cudaMemcpy(&io_context->num_files, &num_fds, sizeof(io_context->num_files), cudaMemcpyHostToDevice);
-    if (err != cudaSuccess) {
-        geminifs_error("openGPUFile: cudaMemcpy num_files failed: %s\n", cudaGetErrorString(err));
-        goto fail_after_cuda_malloc;
-    }
-
-    err = cudaMemcpy(&io_context->nvme_files, dev_fds.data(), num_fds * sizeof(NVMe_File*), cudaMemcpyHostToDevice);
+    err = cudaMemcpy(nvme_files, dev_fds.data(), num_fds * sizeof(NVMe_File*), cudaMemcpyHostToDevice);
     if (err != cudaSuccess) {
         geminifs_error("openGPUFile: cudaMemcpy nvme_files failed: %s\n", cudaGetErrorString(err));
         goto fail_after_cuda_malloc;
     }
-
-    file_id_to_ctx_map_[file_id] = io_context;
+    geminifs_debug("Opened GPU file with ID: %u, num_fds=%zu\n", file_id, num_fds);
+    
+    file_id_to_ctx_map_[file_id] = NVMeFilesSpan(nvme_files, num_fds);
     return true;
 
 fail_after_cuda_malloc:
-    cudaFree(io_context);
+    cudaFree(nvme_files);
 fail_after_pop_back:
     free_list_.push_back(file_id);
     return false;
@@ -286,8 +285,8 @@ bool GPUFileManager::closeGPUFile(GPUFileId file_id) {
         return false;
     }
 
-    GPUIoContext* io_context = it->second;
-    cudaFree(io_context);
+    auto& io_context = it->second;
+    cudaFree(io_context.data());
     file_id_to_ctx_map_.erase(it);
 
     auto free_it = std::lower_bound(free_list_.begin(), free_list_.end(), file_id);
@@ -401,7 +400,7 @@ bool GPUFileManager::getDevFdById(GPUFileId file_id, std::vector<dev_fd_t>& dev_
     return true;
 }
 
-bool GPUFileManager::getIoContextById(GPUFileId file_id, GPUIoContext** io_ctx) const {
+bool GPUFileManager::getNVMeFilesSpanById(GPUFileId file_id, NVMeFilesSpan& nvme_files) const {
     std::lock_guard<std::mutex> lock(mtx_);
     
     auto it = file_id_to_ctx_map_.find(file_id);
@@ -410,7 +409,7 @@ bool GPUFileManager::getIoContextById(GPUFileId file_id, GPUIoContext** io_ctx) 
         return false;
     }
     
-    *io_ctx = it->second;
+    nvme_files = it->second;
     return true;
 }
 
@@ -693,5 +692,13 @@ bool GPUFileManager::deleteNVMeFilesForGPUFile(const CompactNVMeMapping& nvme_ma
     }
     
     return all_success;
+}
+
+BatchIoEntry* GPUFileManager::allocateIoContexts() {
+    return io_ctx_pool_->acquire();
+}
+
+void GPUFileManager::releaseIoContexts(BatchIoEntry* entry) {
+    return io_ctx_pool_->release(entry);
 }
 
