@@ -313,7 +313,7 @@ __host__ bool GeminiFS::geminifs_batched_read(const std::vector<torch::Tensor>& 
                                                const std::vector<torch::Tensor>& v_caches, 
                                                const std::vector<GPUFileId>& gpu_file_ids, 
                                                int layer_idx, GPUControllerPtr gpu_controller,
-                                               cudaStream_t& stream) {
+                                               cudaStream_t stream) {
     return geminifs_batched_xfer(k_caches, v_caches, gpu_file_ids, layer_idx, gpu_controller, true, stream);
 }
 
@@ -321,7 +321,7 @@ __host__ bool GeminiFS::geminifs_batched_write(const std::vector<torch::Tensor>&
                                                const std::vector<torch::Tensor>& v_caches, 
                                                const std::vector<GPUFileId>& gpu_file_ids, 
                                                int layer_idx, GPUControllerPtr gpu_controller,
-                                               cudaStream_t& stream) {
+                                               cudaStream_t stream) {
     return geminifs_batched_xfer(k_caches, v_caches, gpu_file_ids, layer_idx, gpu_controller, false, stream);
 }
 
@@ -330,7 +330,7 @@ GeminiFS::geminifs_batched_xfer(const std::vector<torch::Tensor>& k_caches,
                                 const std::vector<torch::Tensor>& v_caches, 
                                 const std::vector<GPUFileId>& gpu_file_ids, 
                                 int layer_idx, GPUControllerPtr gpu_controller,
-                                bool is_read, cudaStream_t& stream) {
+                                bool is_read, cudaStream_t stream) {
     if (k_caches.empty() || k_caches.size() != v_caches.size() || k_caches.size() != gpu_file_ids.size()) {
         geminifs_error("Invalid params: k=%zu v=%zu layers=%d files=%zu",
                        k_caches.size(), v_caches.size(),
@@ -404,8 +404,8 @@ GeminiFS::geminifs_batched_xfer(const std::vector<torch::Tensor>& k_caches,
     
     auto ioctxs_per_batch = std::min(1lu * MAX_IOCTX_PER_BATCH, ioctxs.size());
 
-    geminifs_info("geminifs_batched_xfer: total ioctxs %zu, batch_loop_size %zu, ioctxs_per_batch %zu\n",
-                  ioctxs.size(), batch_loop_size, ioctxs_per_batch);
+    // geminifs_info("geminifs_batched_xfer: total ioctxs %zu, batch_loop_size %zu, ioctxs_per_batch %zu\n",
+    //               ioctxs.size(), batch_loop_size, ioctxs_per_batch);
 
     for (int i = 0; i < batch_loop_size; i++) {
         auto entry = batch_entries[i];
@@ -430,7 +430,7 @@ GeminiFS::geminifs_batched_xfer(const std::vector<torch::Tensor>& k_caches,
             return false;
         }
     }
-    auto err = cudaDeviceSynchronize();
+    auto err = cudaStreamSynchronize(stream);
     if (err != cudaSuccess) {
         geminifs_error("geminifs_batched_xfer: nvme_batch_xfer_kernel failed: %s\n", cudaGetErrorString(err));
         release();
@@ -493,7 +493,7 @@ __host__ bool GeminiFS::get_prp_mappings(const torch::Tensor& tensor, GPUControl
 
 // one tensor xfer
 __forceinline__ __host__ bool 
-GeminiFS::geminifs_xfer_kernel(const torch::Tensor& tensor, GPUFileId gpu_file_id, loff_t off, GPUControllerPtr gpu_controller, bool is_read) {
+GeminiFS::geminifs_xfer_kernel(const torch::Tensor& tensor, GPUFileId gpu_file_id, loff_t off, GPUControllerPtr gpu_controller, bool is_read, cudaStream_t stream) {
     NVMeFilesSpan nvme_files;
     PRPMappingEntrySpan prp_mappings;
     if (!get_nvme_files(gpu_file_id, nvme_files)) {
@@ -512,8 +512,8 @@ GeminiFS::geminifs_xfer_kernel(const torch::Tensor& tensor, GPUFileId gpu_file_i
     auto len = tensor.numel() * tensor.element_size();
     const uint32_t THREADS_PER_BLOCK = 32;
     uint32_t blocks = (prp_mappings.size() + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
-    nvme_xfer_kernel<<<blocks, THREADS_PER_BLOCK>>>(nvme_files, prp_mappings, len, off, is_read);
-    auto err = cudaDeviceSynchronize();
+    nvme_xfer_kernel<<<blocks, THREADS_PER_BLOCK, 0, stream>>>(nvme_files, prp_mappings, len, off, is_read);
+    auto err = cudaStreamSynchronize(stream);
     if (err != cudaSuccess) {
         geminifs_error("GPU_read_kernel: GPU_Read_kernel_multi failed: %s\n", cudaGetErrorString(err));
         return false;
@@ -527,7 +527,7 @@ GeminiFS::geminifs_kv_xfer_kernel(const torch::Tensor& k_cache,
                                   const torch::Tensor& v_cache, 
                                   GPUFileId gpu_file_id, loff_t off, 
                                   GPUControllerPtr gpu_controller, 
-                                  bool is_read) {
+                                  bool is_read, cudaStream_t stream) {
     NVMeFilesSpan nvme_files;
     PRPMappingEntrySpan k_prp_mappings, v_prp_mappings; // for kv
        
@@ -552,8 +552,8 @@ GeminiFS::geminifs_kv_xfer_kernel(const torch::Tensor& k_cache,
 
     const uint32_t THREADS_PER_BLOCK = 32;
     uint32_t blocks = (k_prp_mappings.size() + v_prp_mappings.size() + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
-    nvme_kv_xfer_kernel<<<blocks, THREADS_PER_BLOCK>>>(nvme_files, k_prp_mappings, v_prp_mappings, len, off, is_read);
-    auto err = cudaDeviceSynchronize();
+    nvme_kv_xfer_kernel<<<blocks, THREADS_PER_BLOCK, 0, stream>>>(nvme_files, k_prp_mappings, v_prp_mappings, len, off, is_read);
+    auto err = cudaStreamSynchronize(stream);
     if (err != cudaSuccess) {
         geminifs_error("GPU_read_kernel: GPU_Read_kernel_multi failed: %s\n", cudaGetErrorString(err));
         return false;
@@ -562,36 +562,36 @@ GeminiFS::geminifs_kv_xfer_kernel(const torch::Tensor& k_cache,
 }
 
 
-__host__ bool GeminiFS::geminifs_GPU_read_kernel(torch::Tensor& k, torch::Tensor& v, GPUFileId gpu_file_id, loff_t off, GPUControllerPtr gpu_controller) {
-    return geminifs_kv_xfer_kernel(k, v, gpu_file_id, off, gpu_controller, true);
+__host__ bool GeminiFS::geminifs_GPU_read_kernel(torch::Tensor& k, torch::Tensor& v, GPUFileId gpu_file_id, loff_t off, GPUControllerPtr gpu_controller, cudaStream_t stream) {
+    return geminifs_kv_xfer_kernel(k, v, gpu_file_id, off, gpu_controller, true, stream);
 }
 
-__host__ bool GeminiFS::geminifs_GPU_read_kernel(torch::Tensor& k, torch::Tensor& v, GPUFileId gpu_file_id, GPUControllerPtr gpu_controller) {
-    return geminifs_kv_xfer_kernel(k, v, gpu_file_id, 0, gpu_controller, true);
+__host__ bool GeminiFS::geminifs_GPU_read_kernel(torch::Tensor& k, torch::Tensor& v, GPUFileId gpu_file_id, GPUControllerPtr gpu_controller, cudaStream_t stream) {
+    return geminifs_kv_xfer_kernel(k, v, gpu_file_id, 0, gpu_controller, true, stream);
 }
 
-__host__ bool GeminiFS::geminifs_GPU_write_kernel(const torch::Tensor& k, const torch::Tensor& v, GPUFileId gpu_file_id, loff_t off, GPUControllerPtr gpu_controller) {
-    return geminifs_kv_xfer_kernel(k, v, gpu_file_id, off, gpu_controller, false);
+__host__ bool GeminiFS::geminifs_GPU_write_kernel(const torch::Tensor& k, const torch::Tensor& v, GPUFileId gpu_file_id, loff_t off, GPUControllerPtr gpu_controller, cudaStream_t stream) {
+    return geminifs_kv_xfer_kernel(k, v, gpu_file_id, off, gpu_controller, false, stream);
 }
 
-__host__ bool GeminiFS::geminifs_GPU_write_kernel(const torch::Tensor& k, const torch::Tensor& v, GPUFileId gpu_file_id, GPUControllerPtr gpu_controller) {
-    return geminifs_kv_xfer_kernel(k, v, gpu_file_id, 0, gpu_controller, false);
+__host__ bool GeminiFS::geminifs_GPU_write_kernel(const torch::Tensor& k, const torch::Tensor& v, GPUFileId gpu_file_id, GPUControllerPtr gpu_controller, cudaStream_t stream) {
+    return geminifs_kv_xfer_kernel(k, v, gpu_file_id, 0, gpu_controller, false, stream);
 }
 
-__host__ bool GeminiFS::geminifs_GPU_read_kernel(torch::Tensor& tensor, GPUFileId gpu_file_id, GPUControllerPtr gpu_controller) {
-    return geminifs_xfer_kernel(tensor, gpu_file_id, 0, gpu_controller, true);
+__host__ bool GeminiFS::geminifs_GPU_read_kernel(torch::Tensor& tensor, GPUFileId gpu_file_id, GPUControllerPtr gpu_controller, cudaStream_t stream) {
+    return geminifs_xfer_kernel(tensor, gpu_file_id, 0, gpu_controller, true, stream);
 }
 
-__host__ bool GeminiFS::geminifs_GPU_read_kernel(torch::Tensor& tensor, GPUFileId gpu_file_id, loff_t off, GPUControllerPtr gpu_controller) {
-    return geminifs_xfer_kernel(tensor, gpu_file_id, off, gpu_controller, true);
+__host__ bool GeminiFS::geminifs_GPU_read_kernel(torch::Tensor& tensor, GPUFileId gpu_file_id, loff_t off, GPUControllerPtr gpu_controller, cudaStream_t stream) {
+    return geminifs_xfer_kernel(tensor, gpu_file_id, off, gpu_controller, true, stream);
 }
 
-__host__ bool GeminiFS::geminifs_GPU_write_kernel(const torch::Tensor& tensor, GPUFileId gpu_file_id, GPUControllerPtr gpu_controller) {
-    return geminifs_xfer_kernel(tensor, gpu_file_id, 0, gpu_controller, false);
+__host__ bool GeminiFS::geminifs_GPU_write_kernel(const torch::Tensor& tensor, GPUFileId gpu_file_id, GPUControllerPtr gpu_controller, cudaStream_t stream) {
+    return geminifs_xfer_kernel(tensor, gpu_file_id, 0, gpu_controller, false, stream);
 }
 
-__host__ bool GeminiFS::geminifs_GPU_write_kernel(const torch::Tensor& tensor, GPUFileId gpu_file_id, loff_t offset, GPUControllerPtr gpu_controller) {
-    return geminifs_xfer_kernel(tensor, gpu_file_id, offset, gpu_controller, false);
+__host__ bool GeminiFS::geminifs_GPU_write_kernel(const torch::Tensor& tensor, GPUFileId gpu_file_id, loff_t offset, GPUControllerPtr gpu_controller, cudaStream_t stream) {
+    return geminifs_xfer_kernel(tensor, gpu_file_id, offset, gpu_controller, false, stream);
 }
 
 __host__ void geminifs_cleanup_all_gpu_controllers() {
