@@ -93,8 +93,8 @@ class GeminiFS {
             cleanup();
         }
 
-        __host__ bool geminifs_batched_read(const std::vector<torch::Tensor>& k_caches, const std::vector<torch::Tensor>& v_caches, const std::vector<GPUFileId>& gpu_file_ids, int layer_idx, GPUControllerPtr gpu_controller);
-        __host__ bool geminifs_batched_write(const std::vector<torch::Tensor>& k_caches, const std::vector<torch::Tensor>& v_caches, const std::vector<GPUFileId>& gpu_file_ids, int layer_idx, GPUControllerPtr gpu_controller);
+        __host__ bool geminifs_batched_read(const std::vector<torch::Tensor>& k_caches, const std::vector<torch::Tensor>& v_caches, const std::vector<GPUFileId>& gpu_file_ids, int layer_idx, GPUControllerPtr gpu_controller, cudaStream_t& stream);
+        __host__ bool geminifs_batched_write(const std::vector<torch::Tensor>& k_caches, const std::vector<torch::Tensor>& v_caches, const std::vector<GPUFileId>& gpu_file_ids, int layer_idx, GPUControllerPtr gpu_controller, cudaStream_t& stream);
         /**
         * GPU read kernel
         */
@@ -174,7 +174,7 @@ class GeminiFS {
                                                             const std::vector<torch::Tensor>& v_caches, 
                                                             const std::vector<GPUFileId>& gpu_file_ids, 
                                                             int layer_idx, GPUControllerPtr gpu_controller,
-                                                            bool is_read);
+                                                            bool is_read, cudaStream_t& stream);
 
         __forceinline__ __host__ bool get_nvme_files(GPUFileId gpu_file_id, 
                                                      NVMeFilesSpan &out_nvme_files);

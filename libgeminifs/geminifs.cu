@@ -312,15 +312,17 @@ __host__ bool GeminiFS::geminifs_gpu_close_file(int device_id, GPUFileId id) {
 __host__ bool GeminiFS::geminifs_batched_read(const std::vector<torch::Tensor>& k_caches, 
                                                const std::vector<torch::Tensor>& v_caches, 
                                                const std::vector<GPUFileId>& gpu_file_ids, 
-                                               int layer_idx, GPUControllerPtr gpu_controller) {
-    return geminifs_batched_xfer(k_caches, v_caches, gpu_file_ids, layer_idx, gpu_controller, true);
+                                               int layer_idx, GPUControllerPtr gpu_controller,
+                                               cudaStream_t& stream) {
+    return geminifs_batched_xfer(k_caches, v_caches, gpu_file_ids, layer_idx, gpu_controller, true, stream);
 }
 
 __host__ bool GeminiFS::geminifs_batched_write(const std::vector<torch::Tensor>& k_caches, 
                                                const std::vector<torch::Tensor>& v_caches, 
                                                const std::vector<GPUFileId>& gpu_file_ids, 
-                                               int layer_idx, GPUControllerPtr gpu_controller) {
-    return geminifs_batched_xfer(k_caches, v_caches, gpu_file_ids, layer_idx, gpu_controller, false);
+                                               int layer_idx, GPUControllerPtr gpu_controller,
+                                               cudaStream_t& stream) {
+    return geminifs_batched_xfer(k_caches, v_caches, gpu_file_ids, layer_idx, gpu_controller, false, stream);
 }
 
 __forceinline__ __host__ bool 
@@ -328,7 +330,7 @@ GeminiFS::geminifs_batched_xfer(const std::vector<torch::Tensor>& k_caches,
                                 const std::vector<torch::Tensor>& v_caches, 
                                 const std::vector<GPUFileId>& gpu_file_ids, 
                                 int layer_idx, GPUControllerPtr gpu_controller,
-                                bool is_read) {
+                                bool is_read, cudaStream_t& stream) {
     if (k_caches.empty() || k_caches.size() != v_caches.size() || k_caches.size() != gpu_file_ids.size()) {
         geminifs_error("Invalid params: k=%zu v=%zu layers=%d files=%zu",
                        k_caches.size(), v_caches.size(),
@@ -420,7 +422,7 @@ GeminiFS::geminifs_batched_xfer(const std::vector<torch::Tensor>& k_caches,
         constexpr static int THREADS_PER_BLOCK = 32;
         int blocks = (this_batch_size + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
 
-        nvme_batch_xfer_kernel<<<blocks, THREADS_PER_BLOCK>>>(entry, len, this_batch_size, is_read);
+        nvme_batch_xfer_kernel<<<blocks, THREADS_PER_BLOCK, 0, stream>>>(entry, len, this_batch_size, is_read);
         cudaError = cudaGetLastError();
         if (cudaError != cudaSuccess) {
             geminifs_error("kernel launch failed: %s", cudaGetErrorString(cudaError));
