@@ -25,64 +25,7 @@
 
 using ControllerPtr = std::shared_ptr<Controller>;
 
-__host__ struct geminifs_metadata* geminifs_get_metadata(int device_id);
-__host__ struct geminifs_dma* geminifs_get_dma(const torch::Tensor &tensor);
-__host__ bool geminifs_create_dma(const torch::Tensor& tensor);
-
-
-// geminifs_batch_create(int nr_device, int nr_files, size_t block_size, size_t file_size, int  cudaDevice);
-
-
-__host__ DmaPtr createDmaTest(int idx, size_t block_size, int device);
-
-__host__
-DmaPtr getdeviceDmaTest(int idx, void* buffer, size_t size, int cudaDevice);
-
-// /**
-//  * Create and register a GPU controller for a specific device
-//  */
-// __host__ GPUControllerPtr geminifs_create_gpu_controller(int device_id, const std::string& mount_base_path);
-
-/**
- * Get GPU controller for a specific device
- */
-__host__ GPUControllerPtr geminifs_get_gpu_controller(int device_id);
-
-/**
- * Add an NVMe controller to a GPU controller
- */
-__host__ bool geminifs_add_nvme_to_gpu(int device_id, const nvme_ctrl_param& params);
-
-/**
- * Register tensor memory with GPU controller
- */
-__host__ bool geminifs_register_tensor_with_gpu(const torch::Tensor& tensor, uint64_t granularity = 0);
-
-/**
- * Unregister tensor memory from GPU controller
- */
-__host__ bool geminifs_unregister_tensor_from_gpu(const torch::Tensor& tensor);
-
-/**
- * Get DMA context from GPU controller
- */
-__host__ struct geminifs_dma* geminifs_get_tensor_dma_from_gpu(const torch::Tensor& tensor);
-
-/**
- * Open file using GPU controller
- */
-__host__ void* geminifs_gpu_open_file(int device_id, const std::string& filename, size_t file_size, uint32_t o_flag, size_t controller_index = 0);
-
-/**
- * Cleanup all GPU controllers
- */
-__host__ void geminifs_cleanup_all_gpu_controllers();
-
-/**
- * Delete all files managed by a specific NVMe controller
- */
-__host__ bool geminifs_nvme_delete_all_files(int device_id, size_t controller_index = 0);
-
+  
 class GeminiFS {
     public:
         GeminiFS(const std::string& config_file_path, int GPU_file_nums, const std::vector<size_t>& GPU_file_shape, bool reset = false) {
@@ -108,17 +51,12 @@ class GeminiFS {
                                                               bool is_read, cudaStream_t stream);
 
 
-        __host__ bool geminifs_GPU_read_kernel(torch::Tensor& tensor, GPUFileId gpu_file_id, GPUControllerPtr gpu_controller, cudaStream_t stream);
+
         __host__ bool geminifs_GPU_read_kernel(torch::Tensor& tensor, GPUFileId gpu_file_id, loff_t off, GPUControllerPtr gpu_controller, cudaStream_t stream);
-        __host__ bool geminifs_GPU_read_kernel(torch::Tensor& k, torch::Tensor& v, GPUFileId gpu_file_id, GPUControllerPtr gpu_controller, cudaStream_t stream);
-        __host__ bool geminifs_GPU_read_kernel(torch::Tensor& k, torch::Tensor& v, GPUFileId gpu_file_id, loff_t off, GPUControllerPtr gpu_controller, cudaStream_t stream);
         /**
         * GPU write kernel
         */
-        __host__ bool geminifs_GPU_write_kernel(const torch::Tensor& tensor, GPUFileId gpu_file_id, GPUControllerPtr gpu_controller, cudaStream_t stream);
         __host__ bool geminifs_GPU_write_kernel(const torch::Tensor& tensor, GPUFileId gpu_file_id, loff_t off, GPUControllerPtr gpu_controller, cudaStream_t stream);
-        __host__ bool geminifs_GPU_write_kernel(const torch::Tensor& k, const torch::Tensor& v, GPUFileId gpu_file_id, GPUControllerPtr gpu_controller, cudaStream_t stream);
-        __host__ bool geminifs_GPU_write_kernel(const torch::Tensor& k, const torch::Tensor& v, GPUFileId gpu_file_id, loff_t off, GPUControllerPtr gpu_controller, cudaStream_t stream);
         /**
          * Create and register a GPU controller for a specific device
          */
