@@ -215,7 +215,7 @@ __host__ bool GeminiFS::geminifs_register_tensor_with_gpu(const torch::Tensor& t
         geminifs_error("geminifs_register_tensor_with_gpu: No GPU controller found for device %d\n", device_id);
         return false;
     }
-    geminifs_info(" here is ok!\n");
+    // geminifs_info(" here is ok!\n");
     return gpu_controller->registerTensorMemory(tensor, granularity);
 }
 
