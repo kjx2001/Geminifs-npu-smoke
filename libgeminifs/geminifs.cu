@@ -246,16 +246,49 @@ GeminiFS::geminifs_batched_xfer(const std::vector<torch::Tensor>& k_caches,
                        layer_idx, gpu_file_ids.size());
         return false;
     }
-    // 判断一下tensor大小是否一致
-    
-    //
 
-    for (size_t i = 0; i < k_caches.size(); i++) {
-        if (k_caches[i].sizes() != v_caches[i].sizes()) {
-            geminifs_error("Tensor size mismatch at index %zu", i);
+    // Check for tensor and file size consistency
+    uint64_t tensor_size = k_caches[0].numel() * k_caches[0].element_size();
+    GPUFileDesc first_file_desc;
+    if (!gpu_file_manager_->getGPUFileById(gpu_file_ids[0], first_file_desc)) {
+        geminifs_error("geminifs_batched_xfer: Failed to get description for first GPU file ID %u\n", gpu_file_ids[0]);
+        return false;
+    }
+    size_t total_file_size = first_file_desc.total_file_size;
+    size_t tensor_object_size = first_file_desc.tensor_shape[2];
+    // Check that the write operation is within bounds for the first file
+    if (tensor_size != tensor_object_size) {
+        geminifs_error("geminifs_batched_xfer: Not enough space in GPU file\n");
+        return false;
+    }
+
+    for (size_t i = 1; i < k_caches.size(); ++i) {
+        // Check K-tensor size consistency
+        if (k_caches[i].numel() * k_caches[i].element_size() != tensor_size) {
+            geminifs_error("geminifs_batched_xfer: K-cache tensor size mismatch at index %zu. Expected %lu, got %lu.\n",
+                           i, tensor_size, k_caches[i].numel() * k_caches[i].element_size());
+            return false;
+        }
+        // Check V-tensor size consistency
+        if (v_caches[i].numel() * v_caches[i].element_size() != tensor_size) {
+            geminifs_error("geminifs_batched_xfer: V-cache tensor size mismatch at index %zu. Expected %lu, got %lu.\n",
+                           i, tensor_size, v_caches[i].numel() * v_caches[i].element_size());
+            return false;
+        }
+
+        // Check GPU file size consistency
+        GPUFileDesc current_file_desc;
+        if (!gpu_file_manager_->getGPUFileById(gpu_file_ids[i], current_file_desc)) {
+            geminifs_error("geminifs_batched_xfer: Failed to get description for GPU file ID %u at index %zu\n", gpu_file_ids[i], i);
+            return false;
+        }
+        if (current_file_desc.total_file_size != total_file_size) {
+            geminifs_error("geminifs_batched_xfer: GPU file size mismatch at index %zu. Expected %zu, got %zu.\n",
+                           i, total_file_size, current_file_desc.total_file_size);
             return false;
         }
     }
+
 
     std::vector<GPUIoContext> ioctxs;
 
@@ -323,7 +356,7 @@ GeminiFS::geminifs_batched_xfer(const std::vector<torch::Tensor>& k_caches,
         auto entry = batch_entries[i];
         auto this_batch_size = std::min(ioctxs_per_batch, ioctxs.size() - ioctxs_per_batch * i);
         
-        auto cudaError = cudaMemcpy(entry->d_ioctxs, ioctxs.data() + i * ioctxs_per_batch,
+        auto cudaError = cudaMemcpyAsync(entry->d_ioctxs, ioctxs.data() + i * ioctxs_per_batch,
                                         this_batch_size * sizeof(GPUIoContext), cudaMemcpyHostToDevice);
         if (cudaError != cudaSuccess) {
             geminifs_error("geminifs_batched_xfer: cudaMemcpy to d_ioctxs failed: %s\n", cudaGetErrorString(cudaError));
@@ -342,12 +375,12 @@ GeminiFS::geminifs_batched_xfer(const std::vector<torch::Tensor>& k_caches,
             return false;
         }
     }
-    auto err = cudaStreamSynchronize(stream);
-    if (err != cudaSuccess) {
-        geminifs_error("geminifs_batched_xfer: nvme_batch_xfer_kernel failed: %s\n", cudaGetErrorString(err));
-        release();
-        return false;
-    }
+    // auto err = cudaStreamSynchronize(stream);
+    // if (err != cudaSuccess) {
+    //     geminifs_error("geminifs_batched_xfer: nvme_batch_xfer_kernel failed: %s\n", cudaGetErrorString(err));
+    //     release();
+    //     return false;
+    // }
 
     release();
     return true;
@@ -425,11 +458,11 @@ GeminiFS::geminifs_xfer_kernel(const torch::Tensor& tensor, GPUFileId gpu_file_i
     const uint32_t THREADS_PER_BLOCK = 32;
     uint32_t blocks = (prp_mappings.size() + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
     nvme_xfer_kernel<<<blocks, THREADS_PER_BLOCK, 0, stream>>>(nvme_files, prp_mappings, len, off, is_read);
-    auto err = cudaStreamSynchronize(stream);
-    if (err != cudaSuccess) {
-        geminifs_error("GPU_read_kernel: GPU_Read_kernel_multi failed: %s\n", cudaGetErrorString(err));
-        return false;
-    }
+    // auto err = cudaStreamSynchronize(stream);
+    // if (err != cudaSuccess) {
+    //     geminifs_error("GPU_read_kernel: GPU_Read_kernel_multi failed: %s\n", cudaGetErrorString(err));
+    //     return false;
+    // }
     return true;
 }
 
@@ -465,11 +498,11 @@ GeminiFS::geminifs_kv_xfer_kernel(const torch::Tensor& k_cache,
     const uint32_t THREADS_PER_BLOCK = 32;
     uint32_t blocks = (k_prp_mappings.size() + v_prp_mappings.size() + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
     nvme_kv_xfer_kernel<<<blocks, THREADS_PER_BLOCK, 0, stream>>>(nvme_files, k_prp_mappings, v_prp_mappings, len, off, is_read);
-    auto err = cudaStreamSynchronize(stream);
-    if (err != cudaSuccess) {
-        geminifs_error("GPU_read_kernel: GPU_Read_kernel_multi failed: %s\n", cudaGetErrorString(err));
-        return false;
-    }
+    // auto err = cudaStreamSynchronize(stream);
+    // if (err != cudaSuccess) {
+    //     geminifs_error("GPU_read_kernel: GPU_Read_kernel_multi failed: %s\n", cudaGetErrorString(err));
+    //     return false;
+    // }
     return true;
 }
 
