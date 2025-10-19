@@ -153,7 +153,7 @@ int main(int argc, char** argv) {
                     .device(torch::kCUDA, group.gpu.cudaDevice)
                     .pinned_memory(false)
                 );
-        
+         auto file = torch::rand({2, 512*1024, 32}
         auto key_cache2 = torch::rand({4, 1024, 1024, 2}, // 512kb
                 torch::TensorOptions()
                     .dtype(torch::kFloat16)

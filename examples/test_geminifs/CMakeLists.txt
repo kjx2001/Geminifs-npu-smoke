@@ -66,3 +66,35 @@ set_target_properties(TestForGeminiFS PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
 )
+
+add_executable(TestForGeminiFS_register TestForGeminiFS_register.cu)
+
+# Link libraries
+target_link_libraries(TestForGeminiFS_register PRIVATE
+    geminifs
+    nvm
+    CUDA::cudart
+    "${TORCH_LIBRARIES}"
+)
+
+# Set CUDA properties
+set_target_properties(TestForGeminiFS_register PROPERTIES 
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+)
+
+add_executable(TestForGeminiFS_llama3_8B TestForGeminiFS_llama3_8B.cu)
+
+# Link libraries
+target_link_libraries(TestForGeminiFS_llama3_8B PRIVATE
+    geminifs
+    nvm
+    CUDA::cudart
+    "${TORCH_LIBRARIES}"
+)
+
+# Set CUDA properties
+set_target_properties(TestForGeminiFS_llama3_8B PROPERTIES 
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+)

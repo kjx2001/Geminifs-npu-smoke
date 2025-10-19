@@ -368,12 +368,12 @@ GeminiFS::geminifs_batched_xfer(const std::vector<torch::Tensor>& k_caches,
         int blocks = (this_batch_size + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
 
         nvme_batch_xfer_kernel<<<blocks, THREADS_PER_BLOCK, 0, stream>>>(entry, len, this_batch_size, is_read);
-        cudaError = cudaGetLastError();
-        if (cudaError != cudaSuccess) {
-            geminifs_error("kernel launch failed: %s", cudaGetErrorString(cudaError));
-            release();
-            return false;
-        }
+        // cudaError = cudaGetLastError();
+        // if (cudaError != cudaSuccess) {
+        //     geminifs_error("kernel launch failed: %s", cudaGetErrorString(cudaError));
+        //     release();
+        //     return false;
+        // }
     }
     // auto err = cudaStreamSynchronize(stream);
     // if (err != cudaSuccess) {
