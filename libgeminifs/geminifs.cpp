@@ -133,7 +133,10 @@ host_fd_t host_open_geminifs_file(const char *filename) {
 	// Read the complete header including l1 array
 	my_assert((off_t)(-1) != lseek(fd, 0, SEEK_SET));
 	my_assert((ssize_t)temp_hdr.first_block_base == read(fd, hdr, temp_hdr.first_block_base));
-
+	if(hdr->magic_num != the_geminiFS_magic.magic_num) {
+		printf("Error: File %s is not a valid geminifs file (bad magic number)\n", filename);
+		return nullptr;
+	}
 	my_assert(hdr->magic_num == the_geminiFS_magic.magic_num);
 	geminifs_debug("File %s's extents count: %d, first blk base: %lu\n", filename, hdr->extent_count, hdr->first_block_base);
 	for (uint32_t i = 0; i < hdr->extent_count; ++i) {
