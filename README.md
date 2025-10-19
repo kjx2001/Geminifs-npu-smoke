@@ -14,14 +14,14 @@ GeminiFS
 ```
 ## How to build
 ### 1. System Configurations ###
-* As mentioned above, `Above 4G Decoding` needs to be ENABLED in the BIOS
+* `Above 4G Decoding` needs to be ENABLED in the BIOS
 * The system's IOMMU should be disabled for ease of debugging.
   * In Intel Systems, this requires disabling `Vt-d` in the BIOS
   * In AMD Systems, this requires disabling `IOMMU` in the BIOS
 * The `iommu` support in Linux must be disabled too, which can be checked and disabled following the instructions [below](#disable-iommu-in-linux).
 * In the system's BIOS, `ACS` must be disabled if the option is available
-* Linux kernel (ie. 5.15).
-* CMake 3.10 or newer and the _FindCUDA_ package for CMake
+* Linux kernel (ie. native 5.15.0).  6.9 kernel and 5.15.0-100-generic in Ubuntu 20.04 may not work.
+* CMake 4.0.3 or newer and the _FindCUDA_ package for CMake. Using CMake 3.22.1 will report errors.
 * GCC version 5.4.0 or newer. Compiler must support C++11 and POSIX threads.
 * CUDA 12.4 or newer
 
