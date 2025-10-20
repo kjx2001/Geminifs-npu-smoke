@@ -96,7 +96,7 @@ struct GPUIoContext {
     off_t file_offset;
 };
 
-#define MAX_IOCTX_PER_BATCH 64u
+#define MAX_IOCTX_PER_BATCH 512u
 #define MAX_LAYER_PER_BATCH MAX_IOCTX_PER_BATCH
 
 struct BatchIoEntry {
