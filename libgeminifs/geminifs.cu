@@ -291,26 +291,28 @@ GeminiFS::geminifs_batched_xfer(const std::vector<torch::Tensor>& k_caches,
 
 
     std::vector<GPUIoContext> ioctxs;
-
-    ioctxs.reserve(k_caches.size() + v_caches.size());
     auto fill_ctx = [&gpu_file_ids, &gpu_controller, this]
-                    (std::vector<GPUIoContext>& out, const std::vector<torch::Tensor>& cache, off_t offset) -> bool {
+                    (const std::vector<torch::Tensor>& cache, off_t offset) -> std::vector<GPUIoContext> {
+        std::vector<GPUIoContext> out;
         for (size_t i = 0; i < cache.size(); i++) {
             NVMeFilesSpan nvme_files;
             PRPMappingEntrySpan cache_mappings;
 
             if (!get_nvme_files(gpu_file_ids[i], nvme_files)) {
                 geminifs_error("get_nvme_files failed: file %u at index %zu\n", gpu_file_ids[i], i);
-                return false;
+                return {};
             }
             if (!get_prp_mappings(cache[i], gpu_controller, cache_mappings)) {
                 geminifs_error("get_prp_mappings failed: tensor at index %zu\n", i);
-                return false;
+                return {};
             }
             if (nvme_files.empty() || cache_mappings.empty()) {
                 geminifs_error("empty nvme_files/prp_entry: file %u at index %zu\n", gpu_file_ids[i], i);
-                return false;
+                return {};
             }
+
+            // once allocate space
+            if (i == 0) out.reserve(cache_mappings.size() * cache.size());
             
             for (int j = 0; j < cache_mappings.size(); j++) {
                 GPUIoContext ctx = {
@@ -322,12 +324,24 @@ GeminiFS::geminifs_batched_xfer(const std::vector<torch::Tensor>& k_caches,
                 out.emplace_back(std::move(ctx));
             }
         }
-        return true;
+        return out;
     };
 
     uint64_t len = k_caches[0].numel() * k_caches[0].element_size();
-    if (!fill_ctx(ioctxs, k_caches, layer_idx * len * 2)) return false;
-    if (!fill_ctx(ioctxs, v_caches, layer_idx * len * 2 + len)) return false;
+
+    auto k_ioctxs = fill_ctx(k_caches, layer_idx * len * 2);
+    auto v_ioctxs = fill_ctx(v_caches, layer_idx * len * 2 + len);
+    if (k_ioctxs.empty() || v_ioctxs.empty() || k_ioctxs.size() != v_ioctxs.size()) {
+        geminifs_error("geminifs_batched_xfer: Failed to fill IO contexts\n");
+        return false;
+    }
+
+    // one by one combine
+    ioctxs.reserve(k_ioctxs.size() + v_ioctxs.size());
+    for (size_t i = 0; i < k_ioctxs.size(); i++) {
+        ioctxs.emplace_back(std::move(k_ioctxs[i]));
+        ioctxs.emplace_back(std::move(v_ioctxs[i]));
+    }
 
     auto batch_loop_size = (ioctxs.size() + MAX_IOCTX_PER_BATCH - 1) / MAX_IOCTX_PER_BATCH;
     std::vector<BatchIoEntry*> batch_entries(batch_loop_size, nullptr);
