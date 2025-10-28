@@ -22,6 +22,7 @@
 #include <unistd.h>
 #include <ctrl.h>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 #include <cuda_runtime.h>
 
@@ -234,6 +235,23 @@ __host__ bool GeminiFS::geminifs_batched_write(const std::vector<torch::Tensor>&
     return geminifs_batched_xfer(k_caches, v_caches, gpu_file_ids, layer_idx, gpu_controller, false, stream);
 }
 
+using IoctxDataPair = std::pair<std::vector<BatchIoEntry*>, GPUFileManager*>;
+void CUDART_CB release_ioctx(void *data) {
+    auto release = (IoctxDataPair *)data;
+    auto batches = release->first;
+    auto manager = release->second;
+    if (!manager) {
+        geminifs_error("file manager is null");
+        delete release;
+        return;
+    }
+
+    for (auto &entry: batches) {
+        if (entry)manager->releaseIoContexts(entry);
+    }
+    delete release;
+}
+
 __forceinline__ __host__ bool 
 GeminiFS::geminifs_batched_xfer(const std::vector<torch::Tensor>& k_caches, 
                                 const std::vector<torch::Tensor>& v_caches, 
@@ -345,10 +363,15 @@ GeminiFS::geminifs_batched_xfer(const std::vector<torch::Tensor>& k_caches,
 
     auto batch_loop_size = (ioctxs.size() + MAX_IOCTX_PER_BATCH - 1) / MAX_IOCTX_PER_BATCH;
     std::vector<BatchIoEntry*> batch_entries(batch_loop_size, nullptr);
-    auto release = [&batch_entries, this]() {
-        for (auto &entry : batch_entries) {
-            if (entry) gpu_file_manager_->releaseIoContexts(entry);
+
+    auto release = [](std::vector<BatchIoEntry*> batches, GPUFileManager* manager, cudaStream_t stream) {
+        auto data = new IoctxDataPair {batches, manager};
+        auto cudaErr = cudaLaunchHostFunc(stream, release_ioctx, (void *)data);
+        if (cudaErr != cudaSuccess) {
+            geminifs_error("Failed to launch host func");
+            return false;
         }
+        return true;
     };
 
     for (auto &entry : batch_entries) {
@@ -356,7 +379,7 @@ GeminiFS::geminifs_batched_xfer(const std::vector<torch::Tensor>& k_caches,
         if (!entry) {
             geminifs_error("geminifs_batched_xfer: Failed to allocate IO contexts from pool\n");
             // release previously allocated
-            release();
+            release(batch_entries, gpu_file_manager_.get(), stream);
             return false;
         }
     }
@@ -374,7 +397,7 @@ GeminiFS::geminifs_batched_xfer(const std::vector<torch::Tensor>& k_caches,
                                         this_batch_size * sizeof(GPUIoContext), cudaMemcpyHostToDevice);
         if (cudaError != cudaSuccess) {
             geminifs_error("geminifs_batched_xfer: cudaMemcpy to d_ioctxs failed: %s\n", cudaGetErrorString(cudaError));
-            release();
+            release(batch_entries, gpu_file_manager_.get(), stream);
             return false;
         }
 
@@ -396,7 +419,7 @@ GeminiFS::geminifs_batched_xfer(const std::vector<torch::Tensor>& k_caches,
     //     return false;
     // }
 
-    release();
+    release(batch_entries, gpu_file_manager_.get(), stream);
     return true;
 }
 
