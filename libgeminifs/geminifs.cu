@@ -394,7 +394,7 @@ GeminiFS::geminifs_batched_xfer(const std::vector<torch::Tensor>& k_caches,
         auto this_batch_size = std::min(ioctxs_per_batch, ioctxs.size() - ioctxs_per_batch * i);
         
         auto cudaError = cudaMemcpyAsync(entry->d_ioctxs, ioctxs.data() + i * ioctxs_per_batch,
-                                        this_batch_size * sizeof(GPUIoContext), cudaMemcpyHostToDevice);
+                                        this_batch_size * sizeof(GPUIoContext), cudaMemcpyHostToDevice, stream);
         if (cudaError != cudaSuccess) {
             geminifs_error("geminifs_batched_xfer: cudaMemcpy to d_ioctxs failed: %s\n", cudaGetErrorString(cudaError));
             release(batch_entries, gpu_file_manager_.get(), stream);
