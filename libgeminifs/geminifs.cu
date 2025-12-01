@@ -151,6 +151,18 @@ __host__ bool GeminiFS::geminifs_register_tensor_with_gpu(const torch::Tensor& t
     return gpu_controller->registerTensorMemory(tensor, granularity);
 }
 
+__host__ bool GeminiFS::geminifs_register_tensors_with_gpu(const std::vector<torch::Tensor>& tensor_list, uint64_t granularity) {
+    int device_id = tensor_list[0].device().index();
+    auto gpu_controller = geminifs_get_gpu_controller(device_id);
+
+    if (!gpu_controller) {
+        geminifs_error("geminifs_register_tensors_with_gpu: No GPU controller found for device %d\n", device_id);
+        return false;
+    }
+
+    return gpu_controller->registerTesnsorList(tensor_list, granularity);
+}
+
 
 /**
  * Unregister tensor memory from GPU controller

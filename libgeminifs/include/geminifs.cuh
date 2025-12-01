@@ -72,6 +72,8 @@ class GeminiFS {
          */
         __host__ bool geminifs_register_tensor_with_gpu(const torch::Tensor& tensor, uint64_t granularity = 0);
 
+        __host__ bool geminifs_register_tensors_with_gpu(const std::vector<torch::Tensor>& tensor_list, uint64_t granularity = 0);
+
         /**
          * Unregister tensor memory from GPU controller
          */

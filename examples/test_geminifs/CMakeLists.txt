@@ -98,3 +98,19 @@ set_target_properties(TestForGeminiFS_llama3_8B PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
 )
+
+
+add_executable(BatchRegisterTest BatchRegisterTest.cu)
+
+target_link_libraries(BatchRegisterTest PRIVATE
+    geminifs
+    nvm
+    CUDA::cudart
+    "${TORCH_LIBRARIES}"
+)
+
+# Set CUDA properties
+set_target_properties(BatchRegisterTest PROPERTIES 
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+)

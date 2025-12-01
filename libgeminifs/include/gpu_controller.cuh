@@ -65,7 +65,9 @@ public:
      * @param mappings 映射条目向量
      * @return 成功返回true
      */
-    bool addBatchMappings(uint64_t tensor_ptr, uint64_t tensor_size, const std::vector<PRPMappingEntry>& mappings);
+    bool addBatchMappings(uint64_t tensor_ptr, uint64_t tensor_size, 
+                          const std::vector<PRPMappingEntry>& mappings, 
+                          void *gpu_buffer = nullptr, size_t gpu_buffer_size = 0);
     
 
     GPUHashEntry* lookupMappings(uint64_t tensor_ptr) const;
@@ -148,6 +150,8 @@ public:
      * @return true if successful, false otherwise
      */
     bool unregisterTensorMemory(void* tensor_ptr);
+
+    bool registerTesnsorList(const std::vector<torch::Tensor> &tensor_list, uint64_t granularity = 0);
     
     /**
      * Get DMA context for a registered tensor
@@ -280,6 +284,8 @@ private:
      * @return DMA context or nullptr if failed
      */
     struct geminifs_dma* createDMAContext(const torch::Tensor& tensor, uint64_t granularity = 0);
+
+    std::vector<struct geminifs_dma*> createDMAContexts(const std::vector<torch::Tensor>& tensor_list, uint64_t granularity = 0);
     
     /**
      * Perform DMA memory slicing for a given tensor
@@ -299,12 +305,16 @@ private:
      */
     bool initializePRPEntries(geminifs_dma* dma_ctx);
 
+    bool initializePRPList(std::vector<geminifs_dma*> &dma_ctxs);
+
+    bool doInitializePRPList(geminifs_dma* dma_ctx, void *gpu_addr = nullptr, size_t gpu_size = 0);
+
     /**
      * Add PRP mappings to GPU memory for all granularity groups
      * @param dma_ctx DMA context with initialized PRP entries
      * @return true if successful, false otherwise
      */
-    bool addPRPMappingsToGPU(geminifs_dma* dma_ctx);
+    bool addPRPMappingsToGPU(geminifs_dma* dma_ctx, void *gpu_addr = nullptr, size_t gpu_size = 0);
 
 
 };

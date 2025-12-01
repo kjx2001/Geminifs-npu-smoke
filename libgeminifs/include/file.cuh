@@ -119,7 +119,7 @@ private:
         assert(nbytes % this->nvme_page_size == 0);
         assert(file_offset % this->nvme_page_size == 0);
         nvme_ofst_t nvme_ofst = __get_nvmeofst(file_offset);
-        uint32_t tid = threadIdx.x + blockIdx.x * blockDim.x;
+        // uint32_t tid = threadIdx.x + blockIdx.x * blockDim.x;
         uint64_t starting_lba = nvme_ofst >> hqps_block_size_log;
         // printf("NVMe_File: tid:%d, offset: %lx, nvme_ofst: %lx, starting_lba: %lx, nbytes: %lu\n", 
         //        tid, file_offset, (unsigned long) nvme_ofst, (unsigned long) starting_lba, (unsigned long) nbytes);

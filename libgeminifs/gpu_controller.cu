@@ -1,6 +1,7 @@
 #include "geminifs_helper.h"
 #include "geminifs_mem.h"
 #include "buffer.h"
+#include <cstddef>
 #include <cstdint>
 #include <cuda_runtime.h>
 #include <cassert>
@@ -9,8 +10,10 @@
 #include <algorithm>
 #include <sys/types.h>
 #include <unordered_set>
+#include <vector>
 #include "gpu_controller.cuh"
 #include "nvme_controller.cuh"
+#include "prp_mapping_entry.h"
 
 
 
@@ -38,7 +41,9 @@ void GPUMemoryMapper::cleanup() {
 }
 
 
-bool GPUMemoryMapper::addBatchMappings(uint64_t tensor_ptr, uint64_t tensor_size, const std::vector<PRPMappingEntry>& mappings) {
+bool GPUMemoryMapper::addBatchMappings(uint64_t tensor_ptr, uint64_t tensor_size, 
+									   const std::vector<PRPMappingEntry>& mappings, 
+									   void *gpu_buffer, size_t gpu_buffer_size) {
     if (!initialized_) {
         geminifs_error("GPU Memory Mapper: Not initialized on device %d\n", device_id_);
         return false;
@@ -51,15 +56,25 @@ bool GPUMemoryMapper::addBatchMappings(uint64_t tensor_ptr, uint64_t tensor_size
 
     auto createAndCopy = [&]() -> GPUHashEntry* {
         PRPMappingEntry *d_mappings = nullptr;
-        auto err = cudaMalloc(&d_mappings, mappings.size() * sizeof(PRPMappingEntry));
+		bool allocated = false;
+		if (gpu_buffer) {
+			if (gpu_buffer_size < mappings.size() * sizeof(PRPMappingEntry)) {
+				geminifs_error("GPU Memory Mapper: gpu buffer is not enough for mapping\n");
+				return nullptr;
+			}
+			d_mappings = static_cast<PRPMappingEntry*>(gpu_buffer);
+		} else {
+			if (cudaMalloc(&d_mappings, mappings.size() * sizeof(PRPMappingEntry)) != cudaSuccess) {
+				geminifs_error("GPU Memory Mapper: cudaMalloc failed for mappings on device %d\n", device_id_);
+				return nullptr;
+			}
+			allocated = true;
+		}
+
+		auto err = cudaMemcpy(d_mappings, mappings.data(), mappings.size() * sizeof(PRPMappingEntry), cudaMemcpyHostToDevice);
         if (err != cudaSuccess) {
-            geminifs_error("GPU Memory Mapper: cudaMalloc failed for mappings on device %d", device_id_);
-            return nullptr;
-        }
-        err = cudaMemcpy(d_mappings, mappings.data(), mappings.size() * sizeof(PRPMappingEntry), cudaMemcpyHostToDevice);
-        if (err != cudaSuccess) {
-            geminifs_error("GPU Memory Mapper: cudaMemcpy failed for mappings on device %d", device_id_);
-            cudaFree(d_mappings);
+            geminifs_error("GPU Memory Mapper: cudaMemcpy failed for mappings on device %d, mapping size %ld, error %d\n", device_id_, mappings.size(), err);
+            if (allocated) cudaFree(d_mappings);
             return nullptr;
         }
         GPUHashEntry *entry = (GPUHashEntry*)std::malloc(sizeof(GPUHashEntry));
@@ -265,6 +280,70 @@ void GPUController::cleanup()
 
 // === Memory Management Methods ===
 
+bool GPUController::registerTesnsorList(const std::vector<torch::Tensor> &tensor_list, uint64_t granularity) {
+    if (!isInitialized()) {
+        geminifs_error("GPU Controller: Device %d is not initialized\n", device_id_);
+        return false;
+    }
+
+    for(const auto &tensor : tensor_list) {
+        if (!validateTensor(tensor)) return false;
+    }
+
+    if (granularity > 0 && granularity % 4096 != 0) {
+        geminifs_error("GPU Controller: Granularity %lu is not 4K aligned. Memory registration failed.\n", granularity);
+        return false;
+    }
+
+	{
+		std::lock_guard<std::mutex> lock(memory_mutex_);
+		std::vector<torch::Tensor> to_register;
+		for (const auto &tensor : tensor_list) {
+			uint64_t tensor_ptr = reinterpret_cast<uint64_t>(tensor.data_ptr());
+			// Check if tensor is already registered
+			if (dma_contexts_.find(tensor_ptr) != dma_contexts_.end()) {
+				geminifs_warn("GPU Controller: Tensor at %p is already registered\n", tensor.data_ptr());
+				continue;
+			}
+			to_register.push_back(tensor);
+		}
+
+		auto dma_ctx_list = createDMAContexts(to_register, granularity);
+		if (dma_ctx_list.empty() || dma_ctx_list.size() != to_register.size()) {
+			geminifs_error("GPU Controller: Failed to create DMA contexts for tensor list\n");
+			return false;
+		}
+
+		for (size_t i = 0; i < to_register.size(); ++i) {
+			const auto &tensor = to_register[i];
+			uint64_t tensor_ptr = reinterpret_cast<uint64_t>(tensor.data_ptr());
+			auto tensor_size = tensor.numel() * tensor.element_size();
+			if (granularity > 0) {
+				// Add multiple pointers according to granularity, all pointing to the same dma_ctx
+				size_t num_granules = (tensor_size + granularity - 1) / granularity; // Round up
+
+				geminifs_debug("GPU Controller: Registering tensor at %p with size %lu using granularity %lu (%zu granules) on device %d\n",
+							  tensor.data_ptr(), tensor_size, granularity, num_granules, device_id_);
+
+				for (size_t j = 0; j < num_granules; ++j) {
+					uint64_t granule_ptr = tensor_ptr + (j * granularity);
+					dma_contexts_[granule_ptr] = dma_ctx_list[i];
+				}
+			} else {
+				// Traditional single mapping for the entire tensor
+				dma_contexts_[tensor_ptr] = dma_ctx_list[i];
+			}
+		}
+
+		return true;
+	}
+
+	geminifs_info("GPU Controller: Successfully registered tensor list for device %d\n", device_id_);
+    return true;
+}
+
+
+
 bool GPUController::registerTensorMemory(const torch::Tensor &tensor, uint64_t granularity)
 {
     if (!isInitialized())
@@ -280,20 +359,6 @@ bool GPUController::registerTensorMemory(const torch::Tensor &tensor, uint64_t g
 
     uint64_t tensor_ptr = reinterpret_cast<uint64_t>(tensor.data_ptr());
     auto tensor_size = tensor.numel() * tensor.element_size();
-
-    // Check 4K alignment for tensor pointer
-    if (tensor_ptr % 4096 != 0)
-    {
-        geminifs_error("GPU Controller: Tensor pointer 0x%lx is not 4K aligned. Memory registration failed.\n", tensor_ptr);
-        return false;
-    }
-
-    // Check 4K alignment for tensor size
-    if (tensor_size % 4096 != 0)
-    {
-        geminifs_error("GPU Controller: Tensor size %zu is not 4K aligned. Memory registration failed.\n", tensor_size);
-        return false;
-    }
 
     // Check 4K alignment for granularity (if specified)
     if (granularity > 0 && granularity % 4096 != 0)
@@ -699,6 +764,125 @@ bool GPUController::performDMASlicing(geminifs_dma *dma_ctx, size_t tensor_size,
     return true;
 }
 
+inline bool checkTensorEntries(const std::vector<torch::Tensor>& tensor_list) {
+	auto tensor_size = tensor_list[0].numel() * tensor_list[0].element_size();
+	for (const auto &entry : tensor_list) {
+		auto entry_size = entry.numel() * entry.element_size();
+		if (entry_size != tensor_size) {
+			geminifs_error("GPU Controller: Inconsistent tensor sizes in the list. Expected %zu, got %zu\n",
+						   tensor_size, entry_size);
+			return false;
+		}
+	}
+	return true;
+}
+
+
+inline uint64_t getPrpMappingSize(const geminifs_dma *dma_ctx) {
+    if (!dma_ctx) {
+        geminifs_error("GPU Controller: Invalid DMA context\n");
+        return 0;
+    }
+
+    uint64_t nr_mappings = 0;
+    for (const auto &group : dma_ctx->granularity_groups) {
+        nr_mappings += group.prp_mappings.size();
+    }
+
+    return nr_mappings * sizeof(PRPMappingEntry);
+}
+
+std::vector<struct geminifs_dma*> GPUController::createDMAContexts(const std::vector<torch::Tensor>& tensor_list, uint64_t granularity) {
+	if (!checkTensorEntries(tensor_list)) {
+		return {};
+	}
+
+	auto tensor_size = tensor_list[0].numel() * tensor_list[0].element_size();
+	if (granularity > 0 && tensor_size > granularity && tensor_size % granularity != 0) {
+		geminifs_error("GPU Controller: Tensor size %zu is not a multiple of granularity %lu. Memory registration failed.\n",
+					   tensor_size, granularity);
+		return {};
+	}
+
+	if (nvme_controllers_.empty()) {
+		geminifs_error("GPU Controller: No NVMe controllers available for DMA context creation\n");
+		return {};
+	}
+
+	auto first_controller = nvme_controllers_[0];
+    if (!first_controller || !first_controller->controller) {
+        geminifs_error("GPU Controller: Invalid NVMe controller for DMA context creation\n");
+        return {};
+    }
+
+	std::vector<geminifs_dma*> dma_ctx_list(tensor_list.size(), nullptr);
+	auto releaseDMAContexts = [&ctxs = dma_ctx_list]() {
+		for (auto &ctx : ctxs) {
+			if (ctx != nullptr) {
+				delete ctx;
+			}
+		}
+	};
+
+	for (size_t i = 0; i < tensor_list.size(); i++) {
+		auto &dma_ctx = dma_ctx_list[i];
+		dma_ctx = new geminifs_dma();
+		dma_ctx->dma_ptr  = getDeviceDma(first_controller->controller->ctrl,
+									  tensor_list[i].data_ptr(), tensor_size, device_id_);
+		if (dma_ctx->dma_ptr == nullptr) {
+			geminifs_error("GPU Controller: Failed to get DMA pointer for tensor at %p\n", tensor_list[i].data_ptr());
+			// 清理已创建的DMA上下文
+			releaseDMAContexts();
+			return {};
+		}
+
+		if (!performDMASlicing(dma_ctx, tensor_size, granularity)) {
+			geminifs_error("GPU Controller: Failed to perform DMA slicing for tensor at %p\n", tensor_list[i].data_ptr());
+			// 清理已创建的DMA上下文
+			releaseDMAContexts();
+			return {};
+		}
+	}
+
+	if (!initializePRPList(dma_ctx_list)) {
+		geminifs_error("GPU Controller: Failed to initialize PRP list for DMA contexts\n");
+		// 清理已创建的DMA上下文
+		releaseDMAContexts();
+		return {};
+	}
+
+	auto nr_mappings = getPrpMappingSize(dma_ctx_list[0]);
+	if (nr_mappings == 0) {
+		geminifs_error("GPU Controller: empty prp mappings\n");
+		return {};
+	}
+
+	// assume all dma ctx have the same prp mappings
+	void *prp_buffers = nullptr;
+	auto prp_mappings_bytes = nr_mappings * sizeof(PRPMappingEntry);
+	if (cudaMalloc(&prp_buffers,  prp_mappings_bytes * dma_ctx_list.size()) != cudaSuccess) {
+		geminifs_error("GPU Controller: Failed to allocate GPU memory for PRP buffers\n");
+		return {};
+	}
+
+	geminifs_debug("GPU Controller: Allocated %lu bytes for PRP mappings for %zu tensors at %p\n",
+				  prp_mappings_bytes * dma_ctx_list.size(), dma_ctx_list.size(), prp_buffers);
+
+	uint64_t buffer_offset = 0ul;
+	for (size_t i = 0; i < tensor_list.size(); i++) {
+		auto &dma_ctx = dma_ctx_list[i];
+		if (!addPRPMappingsToGPU(dma_ctx, (void *)((uint64_t)prp_buffers + buffer_offset), prp_mappings_bytes)) {
+			geminifs_error("GPU Controller: Failed to add PRP mappings to GPU for tensor[%ld] at %p\n", i, tensor_list[i].data_ptr());
+			// 清理已创建的DMA上下文
+			releaseDMAContexts();
+			return {};
+		}
+		buffer_offset += prp_mappings_bytes;
+	}
+
+	return dma_ctx_list;
+}
+
 geminifs_dma *GPUController::createDMAContext(const torch::Tensor &tensor, uint64_t granularity)
 {
     auto tensor_size = tensor.numel() * tensor.element_size();
@@ -738,18 +922,6 @@ geminifs_dma *GPUController::createDMAContext(const torch::Tensor &tensor, uint6
         return nullptr;
     }
 
-    // clangd在new和delete关键词会报错，这里该用malloc/free
-    // geminifs_info("here is okay1\n");
-    // geminifs_dma *dma_ctx = (geminifs_dma *)std::malloc(sizeof(geminifs_dma));
-    // if (!dma_ctx) {
-    //     geminifs_error("GPU Controller: Failed to allocate memory for DMA context\n");
-    //     return nullptr;
-    // }
-    // geminifs_info("here is okay2\n");
-    // *dma_ctx = geminifs_dma();
-    // geminifs_info("here is okay3\n");
-    // dma_ctx->dma_ptr = dma_ptr;
-    // geminifs_info("here is okay4\n");
     geminifs_dma *dma_ctx = new geminifs_dma();
     dma_ctx->dma_ptr = dma_ptr;
 
@@ -772,6 +944,171 @@ geminifs_dma *GPUController::createDMAContext(const torch::Tensor &tensor, uint6
 
     return dma_ctx;
 }
+
+static inline size_t getPrpListSize(geminifs_dma *dma_ctx) {
+    size_t nr_prp_lists = 0;
+    for (const auto &group : dma_ctx->granularity_groups) {
+        for (size_t sub_idx = 0; sub_idx < group.sub_slices.size(); sub_idx++) {
+            const auto &sub_slice = group.sub_slices[sub_idx];
+            if (sub_slice.size > PRP_SIZE_DUAL_PAGE) {
+                nr_prp_lists++;
+            } 
+        }    
+    }
+    return nr_prp_lists;
+}
+
+bool GPUController::initializePRPList(std::vector<geminifs_dma*> &dma_ctxs) {
+    if (dma_ctxs.empty()) {
+        geminifs_error("GPU Controller: DMA context is null\n");
+        return false;
+    }
+
+    if (nvme_controllers_.empty()) {
+        geminifs_error("GPU Controller: No NVMe controllers available\n");
+        return false;
+    }
+
+    for (const auto &ctx : dma_ctxs) {
+        if (ctx->granularity_groups.empty()) {
+            geminifs_error("GPU Controller: No granularity groups found\n");
+            return false;
+        }
+    }
+
+    // use the first dma_ctx to get the total number of prp lists
+    const auto prp_list_size = getPrpListSize(dma_ctxs[0]);
+    if (prp_list_size == 0) {
+        geminifs_debug("GPU Controller: No PRP lists needed for the provided DMA contexts\n");
+        return true;
+    }
+
+    const auto memory_size = prp_list_size * PRP_SIZE_SINGLE_PAGE; // 一个type 2 的prp list需要4KB
+
+    void *prp_list_gpu_addr = nullptr;
+    if (cudaMalloc(&prp_list_gpu_addr, memory_size * dma_ctxs.size()) != cudaSuccess) {
+        geminifs_error("GPU Controller: Failed to allocate GPU memory for PRP lists\n");
+        return false;
+    }
+
+    void *current_prp_list_gpu_addr = prp_list_gpu_addr;
+    for (const auto &dma_ctx : dma_ctxs) {
+		if (!dma_ctx) {
+			cudaFree(prp_list_gpu_addr);
+			geminifs_error("GPU Controller: Invalid DMA context in the list\n");
+			return false;
+		}
+
+        if (!doInitializePRPList(dma_ctx, current_prp_list_gpu_addr, memory_size)) {
+            cudaFree(prp_list_gpu_addr);
+            geminifs_error("GPU Controller: Failed to initialize PRP list for a DMA context\n");
+            return false;
+        }
+        current_prp_list_gpu_addr = reinterpret_cast<void*>(
+            reinterpret_cast<uint64_t>(current_prp_list_gpu_addr) + memory_size);
+    }
+    
+    return true;
+}
+
+bool GPUController::doInitializePRPList(geminifs_dma *dma_ctx, void *prp_list_gpu_addr, size_t gpu_size) {
+    auto first_controller = nvme_controllers_[0];
+    if (!first_controller || !first_controller->controller) {
+        geminifs_error("GPU Controller: Invalid NVMe controller for DMA context creation\n");
+        return false;
+    }
+
+    size_t prp_list_count = getPrpListSize(dma_ctx);
+    if (prp_list_count != 0 && prp_list_count != gpu_size / PRP_SIZE_SINGLE_PAGE) {
+        geminifs_error("GPU Controller: Mismatch in PRP list count and allocated GPU memory size\n");
+        return false;
+    }
+
+    if (prp_list_count != 0 && prp_list_gpu_addr != nullptr && gpu_size != 0) {
+        dma_ctx->type2_prp_dma_ptr = getDeviceDma(first_controller->controller->ctrl, 
+                                                prp_list_gpu_addr, gpu_size, device_id_);
+        if (!dma_ctx->type2_prp_dma_ptr) {
+            geminifs_error("GPU Controller: Failed to create DMA pointer for PRP list GPU memory\n");
+            return false;
+        }
+    }
+
+    size_t current_ioaddr_index = 0;   // 当前使用的ioaddrs索引
+    size_t prp_list_offset = 0;         // 当前PRP列表在GPU内存中的偏移量
+    for (size_t group_idx = 0; group_idx < dma_ctx->granularity_groups.size(); group_idx++) {
+        auto &group = dma_ctx->granularity_groups[group_idx];
+        for (size_t sub_idx = 0; sub_idx < group.sub_slices.size(); sub_idx++) {
+            const auto &sub_slice = group.sub_slices[sub_idx];
+            size_t slice_size = sub_slice.size;
+            size_t slice_pages = (slice_size + PRP_SIZE_SINGLE_PAGE - 1) / PRP_SIZE_SINGLE_PAGE; // 切片需要的4K页数（向上取整）
+            
+            auto transfer_type = getPrpTransferType(slice_size);
+            if (current_ioaddr_index + slice_pages > dma_ctx->dma_ptr->n_ioaddrs) {
+                geminifs_error("GPU Controller: Not enough IO addrs for PRP list initialization\n");
+                return false;
+            }
+
+            uint64_t prp1 = dma_ctx->dma_ptr->ioaddrs[current_ioaddr_index];
+            uint64_t prp2 = 0;
+            switch (transfer_type) {
+				case PRP_TYPE_SINGLE_PAGE: 
+                    break;
+                case PRP_TYPE_DUAL_PAGE: 
+                    prp2 = slice_pages > 1 ? dma_ctx->dma_ptr->ioaddrs[current_ioaddr_index + 1] : 0;
+					break;
+                case PRP_TYPE_LIST: {
+                    // 构建PRP列表
+                	if (dma_ctx->type2_prp_dma_ptr && dma_ctx->type2_prp_dma_ptr->n_ioaddrs > 0) {
+						auto page_index = prp_list_offset / PRP_SIZE_SINGLE_PAGE;
+						if (page_index < dma_ctx->type2_prp_dma_ptr->n_ioaddrs) {
+							prp2 = dma_ctx->type2_prp_dma_ptr->ioaddrs[page_index];
+						} else {
+							geminifs_error("GPU Controller: PRP list offset exceeds allocated GPU memory\n");
+							return false;
+						}
+                	} else {
+						geminifs_error("GPU Controller: Invalid DMA pointer for PRP list\n");
+						return false;
+					}
+
+					auto remaining_pages = slice_pages - 1;
+					std::vector<uint64_t> prp_list_host(PRP_ENTRIES_PER_PAGE + 1, 0); // last entry for next PRP list pointer
+					for (size_t j = 0; j < remaining_pages && j < PRP_ENTRIES_PER_PAGE; j++) {
+						prp_list_host[j] = dma_ctx->dma_ptr->ioaddrs[current_ioaddr_index + 1 + j];
+					}
+
+					if (remaining_pages > PRP_ENTRIES_PER_PAGE) {
+						geminifs_warn("GPU Controller: PRP list exceeds single page, chaining not implemented in this example\n");
+					}
+
+					auto err = cudaMemcpy(
+						static_cast<uint8_t*>(dma_ctx->type2_prp_dma_ptr->vaddr) + prp_list_offset,
+						prp_list_host.data(),
+						PRP_SIZE_SINGLE_PAGE,
+						cudaMemcpyHostToDevice);
+
+					if (err != cudaSuccess) {
+						geminifs_error("GPU Controller: cudaMemcpy failed during PRP list initialization: %s\n", cudaGetErrorString(err));
+						return false;
+					}
+
+					prp_list_offset += PRP_SIZE_SINGLE_PAGE;
+					break;
+                }
+                default:
+                    geminifs_error("GPU Controller: Unknown transfer type %d during PRP list initialization\n", transfer_type);
+                    return false;
+            }
+
+			group.prp_mappings.push_back(PRPMappingEntry(transfer_type, 
+								(uint32_t)slice_size, prp1, prp2, sub_slice.offset));
+			current_ioaddr_index += slice_pages;
+        }
+    }
+
+    return true;
+}
+
 
 bool GPUController::initializePRPEntries(geminifs_dma *dma_ctx)
 {
@@ -858,7 +1195,7 @@ bool GPUController::initializePRPEntries(geminifs_dma *dma_ctx)
     // 为第三种类型的PRP分配4KB对齐的GPU内存
     if (total_type2_count > 0)
     {
-        size_t memory_size = total_type2_count * 4096; // 每个第三种类型需要4KB
+        size_t memory_size = total_type2_count * PRP_SIZE_SINGLE_PAGE; // 每个第三种类型需要4KB
         dma_ctx->type2_prp_dma_ptr = createDma(first_controller->controller->ctrl, memory_size, device_id_);
         if (!dma_ctx->type2_prp_dma_ptr)
         {
@@ -889,7 +1226,7 @@ bool GPUController::initializePRPEntries(geminifs_dma *dma_ctx)
         {
             const auto &sub_slice = group.sub_slices[sub_idx];
             size_t slice_size = sub_slice.size;
-            size_t slice_pages = (slice_size + 4095) / 4096; // 切片需要的4K页数（向上取整）
+            size_t slice_pages = (slice_size + PRP_SIZE_SINGLE_PAGE - 1) / PRP_SIZE_SINGLE_PAGE; // 切片需要的4K页数（向上取整）
 
             PRPMappingEntry &group_entry = group.prp_mappings[sub_idx];
 
@@ -938,7 +1275,7 @@ bool GPUController::initializePRPEntries(geminifs_dma *dma_ctx)
                 // PRP2指向type2_prp_gpu_memory中对应的4K空间
                 if (dma_ctx->type2_prp_dma_ptr && dma_ctx->type2_prp_dma_ptr->n_ioaddrs > 0)
                 {
-                    size_t type2_page_index = type2_gpu_memory_offset / 4096;
+                    size_t type2_page_index = type2_gpu_memory_offset / PRP_SIZE_SINGLE_PAGE;
                     if (type2_page_index < dma_ctx->type2_prp_dma_ptr->n_ioaddrs)
                     {
                         group_entry.prp2 = dma_ctx->type2_prp_dma_ptr->ioaddrs[type2_page_index];
@@ -972,7 +1309,7 @@ bool GPUController::initializePRPEntries(geminifs_dma *dma_ctx)
                 cudaError_t err = cudaMemcpy(
                     static_cast<char *>(dma_ctx->type2_prp_dma_ptr->vaddr) + type2_gpu_memory_offset,
                     prp_list_host.data(),
-                    4096,
+                    PRP_SIZE_SINGLE_PAGE,
                     cudaMemcpyHostToDevice);
 
                 if (err != cudaSuccess)
@@ -985,7 +1322,7 @@ bool GPUController::initializePRPEntries(geminifs_dma *dma_ctx)
                 // geminifs_info("GPU Controller: Group[%zu] Sub-slice[%zu] Type2: PRP1=0x%lx, PRP2=0x%lx, filled %zu ioaddrs into GPU memory\n",
                             //   group_idx, sub_idx, group_entry.prp1, group_entry.prp2, remaining_pages);
 
-                type2_gpu_memory_offset += 4096; // 移动到下一个4K空间
+                type2_gpu_memory_offset += PRP_SIZE_SINGLE_PAGE; // 移动到下一个4K空间
             }
 
             current_ioaddr_index += slice_pages; // 移动到下一个切片的起始ioaddr
@@ -1001,7 +1338,7 @@ bool GPUController::initializePRPEntries(geminifs_dma *dma_ctx)
     return true;
 }
 
-bool GPUController::addPRPMappingsToGPU(geminifs_dma *dma_ctx)
+bool GPUController::addPRPMappingsToGPU(geminifs_dma *dma_ctx, void *gpu_buffer, uint64_t gpu_buffer_size)
 {
     if (!dma_ctx)
     {
@@ -1021,32 +1358,42 @@ bool GPUController::addPRPMappingsToGPU(geminifs_dma *dma_ctx)
         return false;
     }
 
-    // geminifs_info("GPU Controller: Adding PRP mappings to GPU memory for %zu granularity groups\n",
-                //   dma_ctx->granularity_groups.size());
+    geminifs_debug("GPU Controller: Adding PRP mappings to GPU memory for %zu granularity groups, gpu_buffer %p, buffer_size %ld\n",
+                  dma_ctx->granularity_groups.size(), gpu_buffer, gpu_buffer_size);
 
     // 遍历每个granularity group，将其PRP映射注册到GPU内存
-    for (size_t group_idx = 0; group_idx < dma_ctx->granularity_groups.size(); group_idx++)
-    {
+	uint64_t buffer_offset = 0;
+    for (size_t group_idx = 0; group_idx < dma_ctx->granularity_groups.size(); group_idx++) {
         const auto &group = dma_ctx->granularity_groups[group_idx];
-
-        if (group.prp_mappings.empty())
-        {
+        if (group.prp_mappings.empty()) {
             geminifs_warn("GPU Controller: Group[%zu] has no PRP mappings to register\n", group_idx);
             continue;
         }
 
-        // geminifs_info("GPU Controller: Registering %zu PRP mappings for Group[%zu] (gpu_ptr=0x%lx, size=%zu)\n",
-        //               group.prp_mappings.size(), group_idx, group.gpu_tensor_ptr, group.granularity_size);
+		const uint64_t group_bytes = group.prp_mappings.size() * sizeof(PRPMappingEntry);
+		if (gpu_buffer && gpu_buffer_size != 0) {
+			if (buffer_offset + group_bytes > gpu_buffer_size) {
+				geminifs_error(
+					"GPU Controller: Insufficient GPU buffer for Group[%zu] "
+					"(need %llu, left %llu)\n",
+					group_idx,
+					(unsigned long long)group_bytes,
+					(unsigned long long)(gpu_buffer_size - buffer_offset));
+				return false;
+			}
+		}
 
-        // 使用addBatchMappings批量添加该group的所有PRP映射
-        bool success = memory_mapper_->addBatchMappings(group.gpu_tensor_ptr, group.granularity_size, group.prp_mappings);
+        auto cur_gpu_buffer = gpu_buffer != nullptr ? (void *)((uint64_t)gpu_buffer + buffer_offset) : nullptr;
+        bool success = memory_mapper_->addBatchMappings(group.gpu_tensor_ptr, group.granularity_size, 
+														group.prp_mappings, cur_gpu_buffer, 
+														group_bytes);
 
-        if (!success)
-        {
+        if (!success) {
             geminifs_error("GPU Controller: Failed to add batch mappings for Group[%zu]\n", group_idx);
             return false;
         }
 
+		buffer_offset += group_bytes;
         // geminifs_info("GPU Controller: Successfully registered %zu PRP mappings for Group[%zu]\n",
         //               group.prp_mappings.size(), group_idx);
     }
