@@ -114,7 +114,7 @@ bind_to_nvme() {
     
     # Create new_id entry if nvme driver doesn't already support this device
     if ! grep -q "$vendor_id $device_id" /sys/bus/pci/drivers/nvme/new_id 2>/dev/null; then
-        echo "$vendor_id $device_id" > /sys/bus/pci/drivers/nvme/new_id
+        echo "$vendor_id $device_id" > /sys/bus/pci/drivers/nvme/new_id 2>/dev/null || true
         echo "✓ Added device ID to nvme driver"
     fi
     
