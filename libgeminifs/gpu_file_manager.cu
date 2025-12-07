@@ -107,7 +107,6 @@ bool GPUFileManager::createGPUFiles(size_t total_file_size,
         return false;
     }
 
-    geminifs_info("Allocating slots for %zu new GPU files\n", to_create);
     {
         std::lock_guard<std::mutex> lock(mtx_);
         slot_indexs = findMultipleFreeSlots(to_create);
@@ -132,14 +131,12 @@ bool GPUFileManager::createGPUFiles(size_t total_file_size,
         }
     }
 
-    geminifs_info("Creating %zu GPU files, each of size %zu bytes\n", to_create, total_file_size);
     auto createNVMeFilesTask = [&](size_t idx) -> std::vector<uint32_t> {
         std::vector<uint32_t> nvme_files;
         if (!createNVMeFilesPerDevice(total_file_size, to_create, idx, nvme_files)) {
             geminifs_error("Failed to create NVMe files for GPU file index %zu\n", idx);
             return {};
         }
-        geminifs_info("Created %zu NVMe files on controller %zu for GPU files\n", nvme_files.size(), idx);
         return nvme_files;
     };
 
@@ -161,7 +158,6 @@ bool GPUFileManager::createGPUFiles(size_t total_file_size,
         }
     }
 
-    geminifs_info("Successfully created NVMe files on all %zu controllers\n", nvme_count);
     std::vector<std::vector<uint32_t>> nvme_file_ids(out_files.size());
     for (size_t i = 0; i < out_files.size(); ++i) {
         nvme_file_ids[i].reserve(nvme_count);
@@ -201,8 +197,6 @@ bool GPUFileManager::createGPUFiles(size_t total_file_size,
             return false;
         }
     }
-
-    geminifs_info("Successfully wrote GPU file records for %zu files\n", out_files.size());
 
     {
         std::lock_guard<std::mutex> lock(mtx_);
@@ -767,8 +761,6 @@ bool GPUFileManager::createNVMeFilesPerDevice(size_t file_size, size_t to_create
         return false;
     }
 
-    geminifs_info("Creating %zu NVMe files on controller %zu for GPU files\n", to_create, nvme_idx);
-
     // 计算每个NVMe控制器管理的文件大小
     size_t per_nvme_file_size = file_size / nvme_count;
     const size_t ALIGN_SIZE = 64 * 1024;  // 64KB
@@ -799,11 +791,6 @@ bool GPUFileManager::createNVMeFilesPerDevice(size_t file_size, size_t to_create
         if (nvme_file_id == UINT32_MAX) {
             geminifs_error("Failed to create NVMe file on controller %zu\n", nvme_idx);
             goto cleanup;
-        }
-
-        if (i % 10000 == 0) {
-            geminifs_info("Created NVMe file with ID %u on controller %zu for GPU file index %zu\n", 
-                           nvme_file_id, nvme_idx, i);
         }
         
         nvme_file_ids.push_back(nvme_file_id);
