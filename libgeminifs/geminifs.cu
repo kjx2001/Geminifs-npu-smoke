@@ -827,20 +827,15 @@ __host__ void GeminiFS::init(const std::string& config_file_path, int GPU_file_n
         geminifs_info("GeminiFS::init: Creating %zu additional GPU files of size %zu bytes each\n", 
                       files_to_create, file_size);
         
-        for (size_t i = 0; i < files_to_create; ++i) {
-            GPUFileId gpu_file_id;
-            std::vector<size_t> tensor_shape = {GPU_file_shape[0], GPU_file_shape[1], GPU_file_shape[2]};
-            
-            if (!gpu_file_manager_->createGPUFile(file_size, tensor_shape, gpu_file_id)) {
-                geminifs_error("GeminiFS::init: Failed to create GPU file %zu of size %zu bytes\n", 
-                               existing_file_count + i, file_size);
-                return;
-            }
-            
-            geminifs_debug("GeminiFS::init: Successfully created GPU file %zu with ID %u\n", 
-                           existing_file_count + i, gpu_file_id);
+        std::vector<GPUFileId> new_gpu_file_ids;
+        if (!gpu_file_manager_->createGPUFiles(file_size, files_to_create,
+                                               {GPU_file_shape[0], 
+                                                              GPU_file_shape[1], 
+                                                              GPU_file_shape[2]}, 
+                                               new_gpu_file_ids)) {
+            geminifs_error("GeminiFS::init: Failed to create new GPU files\n");
+            return;
         }
-        
         geminifs_info("GeminiFS::init: Successfully created %zu new GPU files, total files now: %zu\n", 
                       files_to_create, existing_file_count + files_to_create);
     }

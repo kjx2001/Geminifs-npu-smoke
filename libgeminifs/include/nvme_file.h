@@ -11,7 +11,7 @@
 #include <cstdio> // For FILE*
 
 
-constexpr size_t BITMAP_SIZE_BYTES = 128 * 1024; // 128 KB
+constexpr size_t BITMAP_SIZE_BYTES = 2 * 128 * 1024; // 128 KB
 constexpr size_t BITS_PER_BYTE = 8;
 constexpr size_t MAX_RECORDS = BITMAP_SIZE_BYTES * BITS_PER_BYTE; // 1,048,576 records
 

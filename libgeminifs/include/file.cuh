@@ -22,7 +22,7 @@
 #include "geminifs_helper.h"
 #include "geminifs.h"
 
-constexpr uint32_t NUM_FILES = 1000000;
+constexpr uint32_t NUM_FILES = 2000000;
 
 typedef enum FileXferType {
     FILE_XFER_READ = 0,
