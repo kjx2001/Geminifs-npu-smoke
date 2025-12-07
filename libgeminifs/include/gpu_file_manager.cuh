@@ -1,6 +1,7 @@
 #ifndef GPU_FILE_MANAGER_H
 #define GPU_FILE_MANAGER_H
 
+#include <cstddef>
 #include <string>
 #include <sys/types.h>
 #include <vector>
@@ -25,7 +26,7 @@ using GPUControllerPtr = std::shared_ptr<GPUController>;
 // GPUFile的唯一标识符
 using GPUFileId = uint32_t;
 
-constexpr size_t GPU_BITMAP_SIZE_BYTES = 128 * 1024; // 128 KB
+constexpr size_t GPU_BITMAP_SIZE_BYTES = 2 * 128 * 1024; // 128 KB
 constexpr size_t GPU_BITS_PER_BYTE = 8;
 constexpr size_t GPU_MAX_RECORDS = GPU_BITMAP_SIZE_BYTES * GPU_BITS_PER_BYTE; // 1,048,576 records
 
@@ -174,6 +175,8 @@ public:
     GPUFileManager& operator=(GPUFileManager&&) = delete;
 
     // 核心文件操作接口 - 重新设计为直接管理NVMe文件
+    bool createGPUFiles(size_t total_file_size, size_t to_create, const std::vector<size_t>& tensor_shape, std::vector<GPUFileId> &out_files);
+
     bool createGPUFile(size_t total_file_size, const std::vector<size_t>& tensor_shape, GPUFileId& out_file_id);
     bool deleteGPUFile(GPUFileId file_id);
     bool initGPUFile(GPUFileId file_id);
@@ -197,6 +200,7 @@ private:
     void loadFromFile();
     void persistBitmap();
     long findNextFreeSlot();
+    std::vector<long> findMultipleFreeSlots(size_t count);
     bool writeRecordToSlot(const GPUFileDesc& desc, uint64_t slot_index);
 
     static const uint64_t MAGIC_NUMBER = 0x4750554649544C45; // "GPUFILE"
@@ -222,6 +226,8 @@ private:
     // GPU控制器管理
     GPUControllerPtr gpu_controller_;
     
+    // 快速为一个nvme设备分配多个文件
+    bool createNVMeFilesPerDevice(size_t file_size, size_t to_create, size_t nvme_idx, std::vector<uint32_t>& nvme_file_ids);
     // 辅助方法：管理NVMe文件
     bool createNVMeFilesForGPUFile(size_t file_size, std::vector<uint32_t>& nvme_file_ids);
     bool deleteNVMeFilesForGPUFile(const CompactNVMeMapping& nvme_mapping);

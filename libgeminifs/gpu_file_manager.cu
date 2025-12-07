@@ -19,14 +19,18 @@
  * @date        2025-01-27
  */
 
+#include "geminifs_helper.h"
 #include "include/gpu_file_manager.cuh"
 #include "include/gpu_controller.cuh"  // 添加GPU控制器头文件
 #include "ops.h"  // 包含geminifs_debug宏定义
+#include <cstddef>
 #include <cstring>
 #include <chrono>
+#include <future>
 #include <iostream>
 #include <algorithm>
 #include <memory>
+#include <mutex>
 #include <vector>
 
 // 构造函数
@@ -76,6 +80,147 @@ GPUFileManager::~GPUFileManager() {
     
     geminifs_debug("GPUFileManager destroyed\n");
 }
+
+bool GPUFileManager::createGPUFiles(size_t total_file_size, 
+                                    size_t to_create,
+                                    const std::vector<size_t>& tensor_shape, 
+                                    std::vector<GPUFileId> &out_files) {
+    out_files.resize(to_create);
+    std::vector<long> slot_indexs(to_create, -1);
+
+    auto release_slots_without_lock = [&]() {
+        for (size_t i = 0; i < to_create; ++i) {
+            if (slot_indexs[i] >= 0) {
+                dirty_bitmap_[slot_indexs[i]] = false;
+            }
+        }
+    };
+
+    auto release_slots_with_lock = [&]() {
+        std::lock_guard<std::mutex> lock(mtx_);
+        release_slots_without_lock();
+    };
+
+    // 检查tensor_shape参数
+    if (tensor_shape.size() != 3) {
+        geminifs_debug("tensor_shape must have exactly 3 dimensions, got %zu\n", tensor_shape.size());
+        return false;
+    }
+
+    geminifs_info("Allocating slots for %zu new GPU files\n", to_create);
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        slot_indexs = findMultipleFreeSlots(to_create);
+        if (slot_indexs.size() != to_create) {
+            geminifs_debug("Not enough free slots available for %zu new GPU files\n", to_create);
+            release_slots_without_lock();
+            return false;
+        }
+
+        for (size_t i = 0; i < to_create; ++i) {
+            out_files[i] = static_cast<GPUFileId>(slot_indexs[i]);
+            dirty_bitmap_[slot_indexs[i]] = true;
+        }
+
+        // 检查文件ID是否已存在
+        for (const auto& file_id : out_files) {
+            if (file_id_to_desc_map_.find(file_id) != file_id_to_desc_map_.end()) {
+                geminifs_debug("GPU file with ID %u already exists\n", file_id);
+                release_slots_without_lock();
+                return false;
+            }
+        }
+    }
+
+    geminifs_info("Creating %zu GPU files, each of size %zu bytes\n", to_create, total_file_size);
+    auto createNVMeFilesTask = [&](size_t idx) -> std::vector<uint32_t> {
+        std::vector<uint32_t> nvme_files;
+        if (!createNVMeFilesPerDevice(total_file_size, to_create, idx, nvme_files)) {
+            geminifs_error("Failed to create NVMe files for GPU file index %zu\n", idx);
+            return {};
+        }
+        geminifs_info("Created %zu NVMe files on controller %zu for GPU files\n", nvme_files.size(), idx);
+        return nvme_files;
+    };
+
+    // thread to create NVMe files in parallel
+    size_t nvme_count = gpu_controller_->getControllerCount();
+    std::vector<std::future<std::vector<uint32_t>>> futures;
+    for (size_t i = 0; i < nvme_count; ++i) {
+        futures.emplace_back(std::async(std::launch::async, createNVMeFilesTask, i));
+    }
+
+    std::vector<std::vector<uint32_t>> controller_results(nvme_count);
+    for (size_t i = 0; i < futures.size(); ++i) {
+        controller_results[i] = futures[i].get();
+        if (controller_results[i].empty() ||
+            controller_results[i].size() != out_files.size()) {
+            geminifs_error("Failed to create NVMe files on controller %zu\n", i);
+            release_slots_with_lock();
+            return false;
+        }
+    }
+
+    geminifs_info("Successfully created NVMe files on all %zu controllers\n", nvme_count);
+    std::vector<std::vector<uint32_t>> nvme_file_ids(out_files.size());
+    for (size_t i = 0; i < out_files.size(); ++i) {
+        nvme_file_ids[i].reserve(nvme_count);
+        for (size_t j = 0; j < nvme_count; ++j) {
+            nvme_file_ids[i].push_back(controller_results[j][i]);
+        }
+    }
+
+    std::vector<GPUFileDesc> descs(out_files.size());
+    for (size_t i = 0; i < out_files.size(); ++i) {
+        descs[i] = {
+            .file_id = out_files[i],
+            .total_file_size = total_file_size,
+            .block_size = tensor_shape[2],
+        };
+        // 设置tensor形状
+        descs[i].tensor_shape[0] = tensor_shape[0];
+        descs[i].tensor_shape[1] = tensor_shape[1];
+        descs[i].tensor_shape[2] = tensor_shape[2];
+
+        descs[i].nvme_mapping = CompactNVMeMapping(); // 默认构造函数初始化
+        descs[i].nvme_mapping.set_valid(true);
+        for (size_t j = 0; j < nvme_file_ids[i].size() && j < 4; ++j) {
+            descs[i].nvme_mapping.nvme_file_ids[j] = nvme_file_ids[i][j];
+            descs[i].nvme_mapping.set_nvme_controller_exists(j, true);
+            geminifs_debug("Mapped NVMe file ID %u to controller %zu for GPU file ID %u\n", 
+                           nvme_file_ids[i][j], j, out_files[i]);
+        }
+
+        if (!writeRecordToSlot(descs[i], slot_indexs[i])) {
+            geminifs_debug("Failed to write GPU file record to slot %ld\n", slot_indexs[i]);
+            // 删除已创建的NVMe文件
+            for (size_t j = 0; j <= i; ++j) {
+                deleteNVMeFilesForGPUFile(descs[j].nvme_mapping);
+            }
+            release_slots_with_lock();
+            return false;
+        }
+    }
+
+    geminifs_info("Successfully wrote GPU file records for %zu files\n", out_files.size());
+
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        for (size_t i = 0; i < out_files.size(); ++i) {
+            file_id_to_desc_map_[out_files[i]] = descs[i];
+        }
+        pending_writes_count_ += out_files.size();
+
+        // 检查是否需要持久化
+        if (pending_writes_count_ >= persistence_threshold_) {
+            persistBitmap();
+        }
+        geminifs_debug("Successfully created %zu GPU files\n", out_files.size());
+    }
+
+    return true;
+}
+
 
 // 创建GPU文件
 // 创建GPU文件 - 重新设计为直接管理NVMe文件
@@ -559,6 +704,14 @@ void GPUFileManager::persistBitmap() {
     geminifs_debug("Persisted GPU bitmap with %zu active records\n", header_.active_record_count);
 }
 
+struct node {
+    long *bitmap;
+    node *next;
+    node *prev;
+};
+
+// bitmaps[10000000]
+
 // 查找下一个空闲slot
 long GPUFileManager::findNextFreeSlot() {
     for (size_t i = 0; i < GPU_MAX_RECORDS; ++i) {
@@ -568,6 +721,22 @@ long GPUFileManager::findNextFreeSlot() {
     }
     return -1; // 没有可用slot
 }
+
+// must hold mtx_ before calling
+std::vector<long> GPUFileManager::findMultipleFreeSlots(size_t count) {
+    std::vector<long> free_slots;
+    for (size_t i = 0; i < GPU_MAX_RECORDS && free_slots.size() < count; ++i) {
+        if (!dirty_bitmap_[i]) {
+            free_slots.push_back(static_cast<long>(i));
+        }
+    }
+    if (free_slots.size() < count) {
+        free_slots.clear(); // 不足，返回空
+    }
+    return free_slots;
+}
+
+
 
 // 将记录写入指定slot
 bool GPUFileManager::writeRecordToSlot(const GPUFileDesc& desc, uint64_t slot_index) {
@@ -579,6 +748,76 @@ bool GPUFileManager::writeRecordToSlot(const GPUFileDesc& desc, uint64_t slot_in
     fseek(log_file_handle_, file_offset, SEEK_SET);
     
     return fwrite(&desc, sizeof(GPUFileDesc), 1, log_file_handle_) == 1;
+}
+
+bool GPUFileManager::createNVMeFilesPerDevice(size_t file_size, size_t to_create, size_t nvme_idx, std::vector<uint32_t>& nvme_file_ids) {
+    if (!gpu_controller_) {
+        geminifs_error("GPU controller is null\n");
+        return false;
+    }
+
+    size_t nvme_count = gpu_controller_->getControllerCount();
+    if (nvme_count == 0) {
+        geminifs_error("No NVMe controllers available\n");
+        return false;
+    }
+
+    if (nvme_idx >= nvme_count) {
+        geminifs_error("Invalid NVMe controller index %zu\n", nvme_idx);
+        return false;
+    }
+
+    geminifs_info("Creating %zu NVMe files on controller %zu for GPU files\n", to_create, nvme_idx);
+
+    // 计算每个NVMe控制器管理的文件大小
+    size_t per_nvme_file_size = file_size / nvme_count;
+    const size_t ALIGN_SIZE = 64 * 1024;  // 64KB
+    if (per_nvme_file_size % ALIGN_SIZE != 0) {
+        per_nvme_file_size = ((per_nvme_file_size / ALIGN_SIZE) + 1) * ALIGN_SIZE;
+    }
+    
+    if (per_nvme_file_size < ALIGN_SIZE) {
+        geminifs_error("File size too small, minimum 64KB per NVMe controller\n");
+        return false;
+    }
+
+    nvme_file_ids.clear();
+    nvme_file_ids.reserve(to_create);
+    for (size_t i = 0; i < to_create; ++i) {
+        auto nvme_controller = gpu_controller_->getNVMeController(nvme_idx);
+        if (!nvme_controller) {
+            geminifs_error("Failed to get NVMe controller %zu\n", nvme_idx);
+            goto cleanup;
+        }
+
+        // 创建NVMe文件，让FileManager自动分配ID并生成对应的文件名
+        uint32_t nvme_file_id = nvme_controller->host_file_create_managed(
+            nvme_controller->controller->page_size,
+            per_nvme_file_size
+        );
+        
+        if (nvme_file_id == UINT32_MAX) {
+            geminifs_error("Failed to create NVMe file on controller %zu\n", nvme_idx);
+            goto cleanup;
+        }
+
+        if (i % 10000 == 0) {
+            geminifs_info("Created NVMe file with ID %u on controller %zu for GPU file index %zu\n", 
+                           nvme_file_id, nvme_idx, i);
+        }
+        
+        nvme_file_ids.push_back(nvme_file_id);
+    }
+    return true;
+cleanup:
+    for (auto &files : nvme_file_ids) {
+        auto cleanup_ctrl = gpu_controller_->getNVMeController(nvme_idx);
+        if (cleanup_ctrl) {
+            geminifs_debug("Cleaning up NVMe file ID %u from controller %zu\n", files, nvme_idx);
+            cleanup_ctrl->host_file_delete_managed(files);
+        }
+    }
+    return false;
 }
 
 // 为GPU文件创建NVMe文件
