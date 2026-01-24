@@ -11,12 +11,15 @@
 #include <cstdio> // For FILE*
 
 
-constexpr size_t BITMAP_SIZE_BYTES = 128 * 1024; // 128 KB
+constexpr size_t BITMAP_SIZE_BYTES = 2 * 128 * 1024; // 128 KB
 constexpr size_t BITS_PER_BYTE = 8;
 constexpr size_t MAX_RECORDS = BITMAP_SIZE_BYTES * BITS_PER_BYTE; // 1,048,576 records
 
 // Forward declaration
 struct LogHeader;
+
+using NVMeFileId = uint32_t;
+using NVMeCtrlId = uint32_t;
 
 
 
@@ -72,9 +75,15 @@ public:
     FileManager& operator=(FileManager&&) = delete;
 
     bool createFile(const std::string& filename, NVMeFileDesc& out_desc, size_t file_size = 0);
-    bool deleteFile(const std::string& filename);
-    bool getFileByFilename(const std::string& filename, NVMeFileDesc& out_desc) const;
-    std::vector<std::string> getAllFilenames() const;
+    bool createFile(NVMeFileDesc& out_desc, size_t file_size = 0);  // Auto-generate filename based on slot ID
+    bool deleteFile(uint32_t file_id);
+    bool getFileById(uint32_t file_id, NVMeFileDesc& out_desc) const;
+    uint32_t getFileIdByFilename(const std::string& filename) const;
+    std::vector<uint32_t> getAllFileIds() const;
+    
+    // Utility methods for NVMe ID <-> filename conversion
+    static std::string generateFilenameFromId(uint32_t file_id);
+    static uint32_t parseFileIdFromFilename(const std::string& filename);
 
     // Host file descriptor management
     void registerOpenFile(host_fd_t fd, const std::string& filename, size_t hdr_size);
@@ -102,7 +111,7 @@ private:
     std::vector<bool> dirty_bitmap_;
     
     mutable std::mutex mtx_;
-    std::unordered_map<std::string, NVMeFileDesc> filename_to_file_map_;
+    std::unordered_map<uint32_t, NVMeFileDesc> nvme_file_id_to_file_map_;  // ID to file mapping for efficiency
 
     // Host file descriptor tracking for automatic cleanup
     std::vector<OpenFileHandle> open_files_;
@@ -120,4 +129,4 @@ private:
 
 #endif
 
-#endif 
+#endif

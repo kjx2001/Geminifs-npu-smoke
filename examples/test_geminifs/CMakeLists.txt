@@ -51,10 +51,10 @@ link_directories(
 )
                                                                                                                                   
 
-add_executable(TestForNVMeLayer_rw TestForNVMeLayer_rw.cu)
+add_executable(TestForGeminiFS TestForGeminiFS.cu)
 
 # Link libraries
-target_link_libraries(TestForNVMeLayer_rw PRIVATE
+target_link_libraries(TestForGeminiFS PRIVATE
     geminifs
     nvm
     CUDA::cudart
@@ -62,15 +62,15 @@ target_link_libraries(TestForNVMeLayer_rw PRIVATE
 )
 
 # Set CUDA properties
-set_target_properties(TestForNVMeLayer_rw PROPERTIES 
+set_target_properties(TestForGeminiFS PROPERTIES 
     CUDA_SEPARABLE_COMPILATION ON
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
 )
 
-add_executable(TestForNVMeLayer_open TestForNVMeLayer_open.cu)
+add_executable(TestForGeminiFS_register TestForGeminiFS_register.cu)
 
 # Link libraries
-target_link_libraries(TestForNVMeLayer_open PRIVATE
+target_link_libraries(TestForGeminiFS_register PRIVATE
     geminifs
     nvm
     CUDA::cudart
@@ -78,15 +78,15 @@ target_link_libraries(TestForNVMeLayer_open PRIVATE
 )
 
 # Set CUDA properties
-set_target_properties(TestForNVMeLayer_open PROPERTIES 
+set_target_properties(TestForGeminiFS_register PROPERTIES 
     CUDA_SEPARABLE_COMPILATION ON
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
 )
 
-add_executable(TestForNVMe_file_size TestForNVMe_file_size.cu)
+add_executable(TestForGeminiFS_llama3_8B TestForGeminiFS_llama3_8B.cu)
 
 # Link libraries
-target_link_libraries(TestForNVMe_file_size PRIVATE
+target_link_libraries(TestForGeminiFS_llama3_8B PRIVATE
     geminifs
     nvm
     CUDA::cudart
@@ -94,7 +94,23 @@ target_link_libraries(TestForNVMe_file_size PRIVATE
 )
 
 # Set CUDA properties
-set_target_properties(TestForNVMe_file_size PROPERTIES 
+set_target_properties(TestForGeminiFS_llama3_8B PROPERTIES 
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+)
+
+
+add_executable(BatchRegisterTest BatchRegisterTest.cu)
+
+target_link_libraries(BatchRegisterTest PRIVATE
+    geminifs
+    nvm
+    CUDA::cudart
+    "${TORCH_LIBRARIES}"
+)
+
+# Set CUDA properties
+set_target_properties(BatchRegisterTest PROPERTIES 
     CUDA_SEPARABLE_COMPILATION ON
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
 )

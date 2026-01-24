@@ -14,8 +14,6 @@
 
 using ControllerPtr = std::shared_ptr<Controller>;
 
-
-
 // Forward declarations
 struct nvme_ctrl_param;
 struct DeviceFileHandle;
@@ -53,22 +51,38 @@ public:
     void* g_open(std::string filename, size_t file_size, uint32_t o_flag);
 
     // Managed file operations - automatically handle file descriptor tracking
-    host_fd_t host_file_create_managed(int block_size, size_t file_size, const std::string& filename);
+    uint32_t host_file_create_managed(int block_size, size_t file_size, const std::string& filename);
+    uint32_t host_file_create_managed(int block_size, size_t file_size);  // Auto-generate filename based on file ID
+    bool host_file_create_only_managed(int block_size, size_t file_size, const std::string& filename);
     host_fd_t host_file_open_managed(const std::string& filepath, uint32_t o_flag);
+    host_fd_t host_file_open_managed(uint32_t nvme_file_id, uint32_t o_flag);
     void host_file_close_managed(host_fd_t fd);
 
     // Device file operations - manage host to device fd mapping
     dev_fd_t device_file_create_managed(int block_size, size_t file_size, const std::string& filename);
-    dev_fd_t device_file_open_managed(const std::string& filename, size_t file_size);
+    dev_fd_t device_file_open_managed(const std::string& filename);
+    dev_fd_t device_file_open_managed(uint32_t nvme_file_id);
     void device_file_close_managed(dev_fd_t device_fd);
     
     // delete up all files managed by this controller
     bool device_file_delete_all_files_managed();
     
+    // Delete a single file managed by this controller by filename
+    bool device_file_delete_single_managed(const std::string& filename);
+    
+    // Delete a single file managed by this controller by NVMe file ID
+    bool host_file_delete_managed(uint32_t nvme_file_id);
+    
+    // Get the count of managed files
+    size_t device_file_get_managed_file_count() const;
+    
+    // Validate files with expected size and return count of valid files
+    size_t device_file_validate_sizes(size_t expected_size) const;
+    
     // Check if controller is properly initialized
     bool is_initialized() const { return is_initialized_; }
 
-
+    size_t next_nvme_file_id() { return next_nvme_file_id_++; }
 
 
 private:
@@ -77,13 +91,17 @@ private:
     bool check_snvme_control_exists();
     ControllerPtr open_single_controller(const std::string& pci_addr, const nvme_ctrl_param& params);
     
+    // Internal helper to create host_fd_t (for device operations)
+    host_fd_t create_host_fd_internal(int block_size, size_t file_size, const std::string& filename);
+    
     // Device file management helper methods
     dev_fd_t copy_host_fd_to_device(host_fd_t host_fd, size_t hdr_size);
     void cleanup_device_files();
+    string get_file_path(const NVMeFileDesc& file_desc);
     
     // Initialization state
     bool is_initialized_;
-    
+    size_t next_nvme_file_id_ = 0;
     // Device file descriptor management
     std::vector<DeviceFileHandle> device_files_;
     mutable std::mutex device_files_mtx_;
@@ -93,10 +111,10 @@ private:
 using NVMeControllerPtr = std::shared_ptr<NVMeController>;
 
 __device__
-void * nvme_controller_g_read(dev_fd_t device_fd, uint64_t prp1, uint64_t prp2, size_t file_offset, size_t nbytes);
+void nvme_controller_g_read(dev_fd_t device_fd, uint64_t prp1, uint64_t prp2, size_t file_offset, size_t nbytes);
 
 __device__
-void * nvme_controller_g_write(dev_fd_t device_fd, uint64_t prp1, uint64_t prp2, size_t file_offset, size_t nbytes);
+void nvme_controller_g_write(dev_fd_t device_fd, uint64_t prp1, uint64_t prp2, size_t file_offset, size_t nbytes);
 
 __global__
 void nvme_controller_g_read_kernel(dev_fd_t device_fd, uint64_t prp1, uint64_t prp2, size_t file_offset, size_t nbytes);

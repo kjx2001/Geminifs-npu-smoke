@@ -4285,6 +4285,11 @@ static const struct file_operations snvm_fops = {
 	.unlocked_ioctl	= snvm_ioctl,
 };
 
+static char *get_snvme_mode(struct device *dev, umode_t *mode) {
+    if (mode) *mode = 0666;
+    return NULL;
+}
+
 static int snvm_cdev_init(void)
 {
 	int ret;
@@ -4296,9 +4301,10 @@ static int snvm_cdev_init(void)
 	if (IS_ERR(dev_class)) {
 		ret = PTR_ERR(dev_class);
 		pr_err("failed to create class: %d\n", ret);
-		return ret;;
+		return ret;
 	}
 
+	dev_class->devnode = get_snvme_mode;
 	ret = alloc_chrdev_region(&dev_first, 0, max_num_ctrls, DRIVER_NAME);
 	if (ret < 0) {
 		pr_err("failed to allocate device numbers: %d\n", ret);

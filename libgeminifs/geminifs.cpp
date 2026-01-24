@@ -12,12 +12,13 @@
 #include <sys/stat.h>
 #include <sys/mman.h>
 #include <sys/ioctl.h>
-#include <linux/fiemap.h>
 #include <linux/fs.h>
 #include <cuda_runtime.h>
 
 #include "geminifs.h"
+#include "geminifs_helper.h"
 #include "nvm_error.h"
+#include "gemini_fiemap.h"
 
 // Definition of the global magic number
 union geminiFS_magic the_geminiFS_magic = {
@@ -51,12 +52,6 @@ static rawfile_ofst_t host__convert_va__to(host_fd_t host_fd, vaddr_t va) {
 
 
 #define ROUND_UP(x, align)(((uint64_t) (x) + ((uint64_t)align - 1)) & ~((uint64_t)align - 1))
-host_fd_t host_create_geminifs_file_1(const char *filename,
-                          uint64_t block_size,
-			  uint64_t page_size,
-                          uint64_t virtual_space_size) {
-	return host_create_geminifs_file(filename, block_size, ROUND_UP(virtual_space_size, page_size));
-}
 
 #define FILE_BLOCK_SIZE 512 // disk block size
 static inline struct fiemap *read_fiemap(int fd, u_int64_t fiemap_start, u_int64_t fiemap_length);
@@ -69,7 +64,7 @@ host_fd_t host_create_geminifs_file(const char *filename,
 
 	my_assert(virtual_space_size % block_size == 0);
 
-	auto hdr_size = ROUND_UP(GEMINI_HDR_MAX_SIZE, block_size);
+	auto hdr_size = GEMINI_HDR_MAX_SIZE;
 
 	hdr = (struct geminiFS_hdr *)malloc(hdr_size);
 	hdr->magic_num = the_geminiFS_magic.magic_num;
@@ -99,7 +94,7 @@ host_fd_t host_create_geminifs_file(void *buf,
 	my_assert(virtual_space_size % block_size == 0);
 
 	hdr->magic_num = the_geminiFS_magic.magic_num;
-	hdr->first_block_base = ROUND_UP(GEMINI_HDR_MAX_SIZE, block_size);
+	hdr->first_block_base = GEMINI_HDR_MAX_SIZE;
 	hdr->virtual_space_size = ROUND_UP(virtual_space_size, block_size);
 	hdr->block_bit = one_nr__of__binary_int(block_size - 1);
 	
@@ -137,7 +132,17 @@ host_fd_t host_open_geminifs_file(const char *filename) {
 
 	// Read the complete header including l1 array
 	my_assert((off_t)(-1) != lseek(fd, 0, SEEK_SET));
-	my_assert(temp_hdr.first_block_base == read(fd, hdr, temp_hdr.first_block_base));
+	my_assert((ssize_t)temp_hdr.first_block_base == read(fd, hdr, temp_hdr.first_block_base));
+	if(hdr->magic_num != the_geminiFS_magic.magic_num) {
+		printf("Error: File %s is not a valid geminifs file (bad magic number)\n", filename);
+		return nullptr;
+	}
+	my_assert(hdr->magic_num == the_geminiFS_magic.magic_num);
+	geminifs_debug("File %s's extents count: %d, first blk base: %lu\n", filename, hdr->extent_count, hdr->first_block_base);
+	for (uint32_t i = 0; i < hdr->extent_count; ++i) {
+		geminifs_debug("File %s's extents: fe_physical %llx fe_len %llx\n", filename,
+		 (unsigned long long)hdr->extents[i].fe_physical, (unsigned long long)hdr->extents[i].fe_length);
+	}
 
 	hdr->fd = fd;
 
@@ -292,11 +297,18 @@ void host_refine_nvmeofst(host_fd_t fd) {
 										fd->fd,
 										0);
 	my_assert(MAP_FAILED != file_mmap);
+
 	struct fiemap *mapping = read_fiemap(hdr->fd, hdr->first_block_base, hdr->virtual_space_size);
 	my_assert(NULL != mapping);
-	if (mapping->fm_mapped_extents > GEMINI_HDR_MAX_EXTENTS) {
+
+	
+    gemini_fiemap* gemini_map = convert_fiemap_to_gemini_fiemap(mapping);
+    my_assert(NULL != gemini_map);
+    free(mapping); // Original fiemap is no longer needed
+	
+	if (gemini_map->fm_mapped_extents > GEMINI_HDR_MAX_EXTENTS) {
 		fprintf(stderr, "FATAL: Allocated file has too many extents: %u, max allowed: %ld\n",
-				mapping->fm_mapped_extents, GEMINI_HDR_MAX_EXTENTS);
+				gemini_map->fm_mapped_extents, GEMINI_HDR_MAX_EXTENTS);
 		exit(EXIT_FAILURE);
 	}
 
@@ -305,9 +317,10 @@ void host_refine_nvmeofst(host_fd_t fd) {
 	file_mmap->virtual_space_size = hdr->virtual_space_size;
 	file_mmap->fd = hdr->fd;
 	file_mmap->block_bit = hdr->block_bit;
-	file_mmap->extent_count = mapping->fm_mapped_extents;
-	memcpy(file_mmap->extents, mapping->fm_extents,
-		   mapping->fm_mapped_extents * sizeof(struct fiemap_extent));
+	file_mmap->extent_count = gemini_map->fm_mapped_extents;
+	memcpy(file_mmap->extents, gemini_map->fm_extents,
+		   gemini_map->fm_mapped_extents * sizeof(struct gemini_fiemap_extent));
 
+    free(gemini_map); // Clean up the converted map
 	munmap(file_mmap, hdr->first_block_base);
 }

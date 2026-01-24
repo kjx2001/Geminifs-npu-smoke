@@ -97,7 +97,8 @@ static void getDeviceMemory(int device, void*& bufferPtr, void*& devicePtr, size
     bufferPtr = (void*) ((((uint64_t)bufferPtr) + (64*1024))  & 0xffffffffff0000);
 }
 
-static void getDeviceMemory3(int device, void*& bufferPtr, void*& devicePtr, size_t size)
+[[maybe_unused]]
+static void getDeviceMemory3(int device, void*& bufferPtr, void*& devicePtr, [[maybe_unused]]size_t size)
 {
 
     cudaError_t err = cudaSetDevice(device);

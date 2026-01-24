@@ -13,7 +13,6 @@
 #include <sys/stat.h>
 #include <sys/mman.h>
 #include <sys/ioctl.h>
-#include <linux/fiemap.h>
 #include <linux/fs.h>
 #include <iostream>
 #include <cuda_runtime.h>
@@ -24,7 +23,9 @@
 #include <map>
 #include <set>
 #include <sstream>
+#include <algorithm>
 #include "ioctl.h"
+#include "gemini_fiemap.h"
 
 // Include for PyTorch TORCH_CHECK macro
 #ifdef TORCH_CHECK
@@ -58,7 +59,7 @@ static inline int ioctl_get_pci_distance(const char *snvme_control_path, struct 
 }
 
 static std::string pci_bdf_to_string(const PCI_BDF& bdf) {
-    char buffer[13];
+    char buffer[14];
     snprintf(buffer, sizeof(buffer), "%04x:%02x:%02x.%x", 
              bdf.domain, bdf.bus, bdf.device, bdf.function);
     return std::string(buffer, sizeof(buffer));
@@ -306,30 +307,30 @@ void show_fd_limits() {
 
 // 自动配置文件描述符限制
 void auto_configure_fd_limits(int num_files_to_open) {
-    std::cout << "\n=== Configuring File Descriptor Limits ===" << std::endl;
+    // std::cout << "\n=== Configuring File Descriptor Limits ===" << std::endl;
     
     // 显示当前限制
-    show_fd_limits();
+    // show_fd_limits();
     
     // 根据要打开的文件数量计算需要的限制
     // num_files_to_open + 一些余量用于系统文件描述符 (stdin, stdout, stderr, 日志文件等)
     rlim_t required_limit = static_cast<rlim_t>(num_files_to_open) + 100;
     
-    std::cout << "Planning to open " << num_files_to_open << " files" << std::endl;
-    std::cout << "Required limit for operation: " << required_limit << " file descriptors" << std::endl;
+    // std::cout << "Planning to open " << num_files_to_open << " files" << std::endl;
+    // std::cout << "Required limit for operation: " << required_limit << " file descriptors" << std::endl;
     
     // 尝试设置更高的限制 (推荐值)
     rlim_t recommended_limit = std::max(required_limit, (rlim_t)65536);
     
-    std::cout << "Attempting to set recommended limit: " << recommended_limit << std::endl;
+    // std::cout << "Attempting to set recommended limit: " << recommended_limit << std::endl;
     
     if (increase_fd_limit(recommended_limit)) {
-        std::cout << "✓ File descriptor limit configured successfully!" << std::endl;
+        // std::cout << "✓ File descriptor limit configured successfully!" << std::endl;
     } else {
-        std::cout << "⚠ Warning: Could not achieve recommended limit." << std::endl;
-        std::cout << "   Operation may fail if trying to open too many files simultaneously." << std::endl;
-        std::cout << "   Consider running with elevated privileges or adjusting system limits." << std::endl;
-        std::cout << "   Quick fix: sudo ulimit -n 65536 && your_program" << std::endl;
+        // std::cout << "⚠ Warning: Could not achieve recommended limit." << std::endl;
+        // std::cout << "   Operation may fail if trying to open too many files simultaneously." << std::endl;
+        // std::cout << "   Consider running with elevated privileges or adjusting system limits." << std::endl;
+        // std::cout << "   Quick fix: sudo ulimit -n 65536 && your_program" << std::endl;
     }
     
     // 显示最终限制
@@ -541,6 +542,24 @@ std::vector<nvme_ctrl_param> convert_to_nvme_ctrl_params(const ParsedSystemConfi
     return params;
 }
 
+// Convert parsed config to nvme_ctrl_param structures
+std::vector<nvme_ctrl_param> convert_to_nvme_ctrl_params_group(const SystemConfigGroup & group_config) {
+    std::vector<nvme_ctrl_param> params;
+   
+    for (const auto& nvme : group_config.nvmes) {
+        nvme_ctrl_param param;
+        param.mount_path = nvme.mount_path;
+        param.pci_addr = nvme.pci_addr;
+        param.cudaDevice = nvme.cudaDevice;
+        param.ns_id = nvme.ns_id;
+        param.queueDepth = nvme.queueDepth;
+        param.numQueues = nvme.numQueues;
+        param.maxIOsize = nvme.maxIOsize;
+        params.push_back(param);
+    }
+    return params;
+}
+
 /**
  * Check if a pointer is a CUDA device pointer
  * @param ptr The pointer to check
@@ -583,4 +602,67 @@ cudaError_t cudaMallocAligned(void** alignedPtr, void** rawPtr, size_t size, siz
     *alignedPtr = reinterpret_cast<void*>(aligned_ptr_val);
 
     return cudaSuccess;
+}
+
+// 用户确认危险操作
+bool confirm_dangerous_operation(const std::string& operation_description) {
+    std::cout << "\n⚠️  WARNING: Dangerous Operation ⚠️" << std::endl;
+    std::cout << "You are about to perform a potentially destructive operation:" << std::endl;
+    std::cout << operation_description << std::endl;
+    std::cout << "\nThis action may cause data loss or system changes that cannot be undone." << std::endl;
+    std::cout << "Are you sure you want to continue? (y/N): ";
+    std::cout.flush();
+    
+    std::string input;
+    std::getline(std::cin, input);
+    
+    // 转换为小写并去除空格
+    std::transform(input.begin(), input.end(), input.begin(), ::tolower);
+    input = trim(input);
+    
+    if (input == "y" || input == "yes") {
+        std::cout << "✓ Operation confirmed by user" << std::endl;
+        return true;
+    } else {
+        std::cout << "✗ Operation cancelled by user" << std::endl;
+        return false;
+    }
+}
+
+// File system utility functions (avoiding std::filesystem for compatibility)
+std::string build_file_path(const std::string& directory, const std::string& filename) {
+    std::string path = directory;
+    if (!path.empty() && path.back() != '/') {
+        path += "/";
+    }
+    path += filename;
+    return path;
+}
+
+bool create_directories(const std::string& path) {
+    if (path.empty()) {
+        return false;
+    }
+    
+    // Check if directory already exists
+    struct stat st;
+    if (stat(path.c_str(), &st) == 0) {
+        return S_ISDIR(st.st_mode);
+    }
+    
+    // Find parent directory
+    size_t last_slash = path.find_last_of('/');
+    if (last_slash != std::string::npos && last_slash > 0) {
+        std::string parent = path.substr(0, last_slash);
+        if (!create_directories(parent)) {
+            return false;
+        }
+    }
+    
+    // Create this directory
+    if (mkdir(path.c_str(), 0755) != 0 && errno != EEXIST) {
+        return false;
+    }
+    
+    return true;
 }

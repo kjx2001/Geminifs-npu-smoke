@@ -6,23 +6,25 @@
 #include <cstdint>
 #include <cstring>
 #include "buffer.h"
+#include "prp_mapping_entry.h"
 
 // 前向声明
-struct PRPMappingEntry;
+// struct PRPMappingEntry;
 
 
 // PRP List 相关常量
-constexpr size_t PRP_PAGE_SIZE = 4096;                           // 4KB 页面大小
+constexpr size_t PRP_SIZE_SINGLE_PAGE = 4096;                           // 4KB 页面大小
+constexpr size_t PRP_SIZE_DUAL_PAGE = 2 * PRP_SIZE_SINGLE_PAGE; // 双页传输大小 8KB
 constexpr size_t PRP_ENTRY_SIZE = 8;                             // 每个 PRP entry 8 字节
-constexpr size_t PRP_ENTRIES_PER_PAGE = (PRP_PAGE_SIZE - PRP_ENTRY_SIZE) / PRP_ENTRY_SIZE;  // 511 entries (最后8B存类型)
+constexpr size_t PRP_ENTRIES_PER_PAGE = (PRP_SIZE_SINGLE_PAGE - PRP_ENTRY_SIZE) / PRP_ENTRY_SIZE;  // 511 entries (最后8B存类型)
 constexpr size_t MAX_TRANSFER_SIZE = 128 * 1024 * 1024;          // 最大传输 128MB
-constexpr size_t MAX_DATA_PER_PRP_PAGE = PRP_ENTRIES_PER_PAGE * PRP_PAGE_SIZE;  // 每个 PRP 页面可寻址的最大数据
+constexpr size_t MAX_DATA_PER_PRP_PAGE = PRP_ENTRIES_PER_PAGE * PRP_SIZE_SINGLE_PAGE;  // 每个 PRP 页面可寻址的最大数据
 
 // PRP 传输类型
 enum PRPTransferType : uint64_t {
-    PRP_TYPE_SINGLE_PAGE = 1,      // 单页传输 (≤ 4KB)
-    PRP_TYPE_DUAL_PAGE = 2,        // 双页传输 (4KB < size ≤ 8KB) 
-    PRP_TYPE_LIST = 3              // PRP List 传输 (> 8KB)
+    PRP_TYPE_SINGLE_PAGE = 0,      // 单页传输 (≤ 4KB)
+    PRP_TYPE_DUAL_PAGE = 1,        // 双页传输 (4KB < size ≤ 8KB) 
+    PRP_TYPE_LIST = 2              // PRP List 传输 (> 8KB)
 };
 
 // PRP List 页面结构
@@ -34,6 +36,16 @@ struct PRPListPage {
         memset(prp_entries, 0, sizeof(prp_entries));
     }
 };
+
+inline int getPrpTransferType(size_t slice_size) {
+    if (slice_size <= PRP_SIZE_SINGLE_PAGE) {
+        return PRP_TYPE_SINGLE_PAGE;
+    } else if (slice_size <= PRP_SIZE_DUAL_PAGE) {
+        return PRP_TYPE_DUAL_PAGE; // 大于4K小于等于8K
+    } else {
+        return PRP_TYPE_LIST; // 大于8K
+    }
+}
 
 
 

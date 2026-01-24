@@ -70,7 +70,7 @@ int main(int argc, char** argv) {
     // 在程序开始时自动配置文件描述符限制
     auto_configure_fd_limits(NUM_FILES);
 
-    ParsedSystemConfig config = parse_system_config("/home/qs/CompanionFS/Geminifs/sys_config.ini");
+    ParsedSystemConfig config = parse_system_config("/home/zwh/Geminifs/sys_config.ini");
     std::vector<nvme_ctrl_param> nvme_params;
     if (config.valid) {
         // 转换为nvme_ctrl_param格式
@@ -153,7 +153,7 @@ int main(int argc, char** argv) {
                     .device(torch::kCUDA, group.gpu.cudaDevice)
                     .pinned_memory(false)
                 );
-        
+         auto file = torch::rand({2, 512*1024, 32}
         auto key_cache2 = torch::rand({4, 1024, 1024, 2}, // 512kb
                 torch::TensorOptions()
                     .dtype(torch::kFloat16)

@@ -2,6 +2,8 @@
 #include "helper.cuh"
 #include "geminifs_helper.h"
 #include "nvm_cmd.h"
+#include "geminifs.h"
+
 #include <cuda_runtime.h>
 #include <unistd.h>
 #include <cassert>
@@ -10,6 +12,9 @@
 #include <errno.h>
 #include <filesystem>
 #include <fcntl.h>  // For fallocate
+
+using namespace std;
+
 // Static paths for system components
 static char snvme_control_path[] = "/dev/snvm_control";
 static char sys_config_path[] = "/mnt/sys_GPU_NVMe_topology.json";
@@ -28,7 +33,6 @@ __global__ void init_nvme_file_kernel(NVMe_File* d_nvme_file,
                                        Controller* d_ctrl_ptr,
                                        struct geminiFS_hdr* device_fd,
                                        QueueAcquireHelper* d_queue_acquire_helper,
-                                       size_t file_size,
                                        uint32_t nvme_page_size,
                                        uint32_t block_size,
                                        uint32_t hqps_block_size_log) {
@@ -51,13 +55,13 @@ NVMeController::NVMeController(const nvme_ctrl_param& params) : is_initialized_(
     
     // Check if maxIOsize is within supported limits (params.maxIOsize is in KB)
     if (params.maxIOsize > 1024) {
-        geminifs_error("NVMeController initialization failed: maxIOsize (%llu KB) exceeds maximum supported size (1024 KB). Current system only supports up to 1MB NVMe I/O\n", params.maxIOsize);
+        geminifs_error("NVMeController initialization failed: maxIOsize (%lu KB) exceeds maximum supported size (1024 KB). Current system only supports up to 1MB NVMe I/O\n", params.maxIOsize);
         throw std::runtime_error("maxIOsize exceeds supported limit of 1024 KB");
     }
     
     // Check if maxIOsize is 4K aligned
     if (maxIOsize % 4096 != 0) {
-        geminifs_error("NVMeController initialization failed: maxIOsize (%llu bytes) is not 4K aligned. maxIOsize must be a multiple of 4096 bytes\n", maxIOsize);
+        geminifs_error("NVMeController initialization failed: maxIOsize (%lu bytes) is not 4K aligned. maxIOsize must be a multiple of 4096 bytes\n", maxIOsize);
         throw std::runtime_error("maxIOsize is not 4K aligned");
     }
     
@@ -95,7 +99,7 @@ NVMeController::NVMeController(const nvme_ctrl_param& params) : is_initialized_(
             throw std::runtime_error("Failed to initialize QueueAcquireHelper on GPU");
         }
         
-        geminifs_debug("Successfully allocated and initialized QueueAcquireHelper on GPU at %p for %d queues\n", 
+        geminifs_debug("Successfully allocated and initialized QueueAcquireHelper on GPU at %p for %lu queues\n", 
                        d_queue_acquire_helper, params.numQueues);
     }
     
@@ -160,8 +164,12 @@ void * NVMeController::g_open(std::string filename, size_t file_size, uint32_t o
                   filename.c_str(), file_size, o_flag);
     
     // Check if file exists in the file_manager log
+    uint32_t file_id = file_manager->getFileIdByFilename(filename);
+    bool file_exists_in_log = (file_id != UINT32_MAX);
     NVMeFileDesc file_desc;
-    bool file_exists_in_log = file_manager->getFileByFilename(filename, file_desc);
+    if (file_exists_in_log) {
+        file_manager->getFileById(file_id, file_desc);
+    }
     
     void* result_fd = nullptr;
     
@@ -179,7 +187,7 @@ void * NVMeController::g_open(std::string filename, size_t file_size, uint32_t o
                     return nullptr;
                 }
             } else if (o_flag & O_DEVICE) {
-                result_fd = device_file_open_managed(filename, file_size);
+                result_fd = device_file_open_managed(filename);
                 if (result_fd == nullptr) {
                     geminifs_error("g_open: Failed to open existing device file '%s'\n", filename.c_str());
                     return nullptr;
@@ -191,7 +199,7 @@ void * NVMeController::g_open(std::string filename, size_t file_size, uint32_t o
         } else {
             // File exists in log but physical file missing, remove from log and recreate
             geminifs_debug("g_open: File '%s' exists in log but physical file missing, recreating\n", filename.c_str());
-            file_manager->deleteFile(filename);
+            file_manager->deleteFile(file_id);
             file_exists_in_log = false;  // Force recreation below
         }
     }
@@ -209,8 +217,8 @@ void * NVMeController::g_open(std::string filename, size_t file_size, uint32_t o
         
         // Create new file
         if (o_flag & O_HOST) {
-            // Create for host-side operations
-            result_fd = host_file_create_managed(controller->page_size, file_size, filename);
+            // Create for host-side operations using internal method to get host_fd_t
+            result_fd = create_host_fd_internal(controller->page_size, file_size, filename);
             if (result_fd == nullptr) {
                 geminifs_error("g_open: Failed to create host file '%s'\n", filename.c_str());
                 return nullptr;
@@ -222,7 +230,9 @@ void * NVMeController::g_open(std::string filename, size_t file_size, uint32_t o
                 geminifs_error("g_open: Failed to create file record in log for '%s'\n", filename.c_str());
                 // Clean up the created file using managed close function
                 host_file_close_managed((host_fd_t)result_fd);
-                std::filesystem::remove(file_path);
+                // Build file path and remove it
+                string file_path_str = string(controller->dev_mount_path) + "/" + filename;
+                unlink(file_path_str.c_str());
                 return nullptr;
             }
             
@@ -257,25 +267,26 @@ void * NVMeController::g_open(std::string filename, size_t file_size, uint32_t o
     return result_fd;
 }
 
-// Helper function for binary bit counting (needed by NVMeController member functions)
-static int one_nr__of__binary_int(unsigned long long i) {
-    int count = 0;
-    while (i != 0) {
-        if ((i & 1) == 1)
-            count++;
-        i = i >> 1;
-    }
-    return count;
-}
+// // Helper function for binary bit counting (needed by NVMeController member functions)
+// static int one_nr__of__binary_int(unsigned long long i) {
+//     int count = 0;
+//     while (i != 0) {
+//         if ((i & 1) == 1)
+//             count++;
+//         i = i >> 1;
+//     }
+//     return count;
+// }
 
 /**
  * NVMeController member function to create a file with automatic FileManager integration
+ * Returns the slot_index from NVMeFileDesc as the file ID
  */
-host_fd_t NVMeController::host_file_create_managed(int block_size, size_t file_size, const std::string& filename) {
+uint32_t NVMeController::host_file_create_managed(int block_size, size_t file_size, const std::string& filename) {
     // Check if controller is properly initialized
     if (!is_initialized()) {
         geminifs_error("host_file_create_managed: NVMeController is not properly initialized\n");
-        return nullptr;
+        return UINT32_MAX; // Invalid file ID
     }
     
     assert(file_size % block_size == 0);
@@ -283,56 +294,177 @@ host_fd_t NVMeController::host_file_create_managed(int block_size, size_t file_s
     auto nvpage_size = controller->page_size;
     assert(block_size % nvpage_size == 0);
 
-    auto hdr_size = ROUND_UP(GEMINI_HDR_MAX_SIZE, block_size);
+    auto hdr_size = GEMINI_HDR_MAX_SIZE;
 
     // Allocate host memory for the header
     struct geminiFS_hdr *hdr = (struct geminiFS_hdr *)malloc(hdr_size);
     if (!hdr) {
         geminifs_error("host_file_create_managed: Failed to allocate memory for header\n");
-        return nullptr;
+        return UINT32_MAX;
     }
     
-    std::filesystem::path dev_mount_path(controller->dev_mount_path);
-    std::filesystem::path dir_path = dev_mount_path;
-    std::filesystem::create_directories(dir_path);
-    std::filesystem::path file_path = dir_path / filename;
+    // Build file path using string concatenation to avoid filesystem issues
+    string file_path_str = string(controller->dev_mount_path) + "/" + filename;
     
     // Initialize header
     hdr->magic_num = the_geminiFS_magic.magic_num;
     hdr->first_block_base = hdr_size;
     hdr->virtual_space_size = file_size;
-    hdr->block_bit = __builtin_clzll(block_size); // Block size in bits
+    hdr->block_bit = __builtin_ctzll(block_size); // Block size in bits
 
     // Open file
-    int fd = open(file_path.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0666);
+    int fd = open(file_path_str.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0666);
     if (fd < 0) {
-        geminifs_error("host_file_create_managed: Failed to create file '%s'\n", file_path.c_str());
+        geminifs_error("host_file_create_managed: Failed to create file '%s': %s\n", file_path_str.c_str(), strerror(errno));
         free(hdr);
-        return nullptr;
+        return UINT32_MAX;
     }
     
     // Set file size using fallocate to actually allocate space
     if (fallocate(fd, 0, 0, hdr_size + file_size) != 0) {
-        geminifs_error("host_file_create_managed: Failed to allocate file space\n");
+        geminifs_error("host_file_create_managed: Failed to allocate file space: %s\n", strerror(errno));
         close(fd);
         free(hdr);
-        return nullptr;
+        return UINT32_MAX;
     }
     
     hdr->fd = fd;
     
     // Refine NVMe offsets
     host_refine_nvmeofst(hdr);
+   
+    // // Write header to file
+    // if (write(fd, hdr, hdr_size) != (ssize_t)hdr_size) {
+    //     geminifs_error("host_file_create_managed: Failed to write header to file '%s': %s\n", 
+    //                   file_path_str.c_str(), strerror(errno));
+    //     close(fd);
+    //     free(hdr);
+    //     return UINT32_MAX;
+    // }
     
-    // Register with FileManager for automatic cleanup
-    if (file_manager != nullptr) {
-        file_manager->registerOpenFile(hdr, filename, hdr_size);
+    // Close file immediately - we only create it, don't keep it open
+    close(fd);
+    
+    // Create file record in FileManager and get the slot_index
+    NVMeFileDesc file_desc;
+    if (file_manager == nullptr || !file_manager->createFile(filename, file_desc, file_size)) {
+        geminifs_error("host_file_create_managed: Failed to create file record in FileManager for '%s'\n", filename.c_str());
+        // Clean up the created physical file
+        unlink(file_path_str.c_str());
+        free(hdr);
+        return UINT32_MAX;
     }
     
-    geminifs_debug("host_file_create_managed: Created file '%s' with size %zu, hdr_size %zu\n", 
-                   filename.c_str(), file_size, hdr_size);
+    // Clean up header memory
+    free(hdr);
     
-    return hdr;
+    geminifs_debug("host_file_create_managed: Created file '%s' with size %zu, slot_index %u (file closed)\n", 
+                   filename.c_str(), file_size, file_desc.slot_index);
+    
+    return file_desc.slot_index; // Return the slot_index as file ID
+}
+
+/**
+ * Create a new host file with auto-generated filename based on NVMe ID naming convention
+ * @param block_size The block size for the file
+ * @param file_size The size of the file to create
+ * @return The file ID (slot_index), or UINT32_MAX if creation failed
+ */
+uint32_t NVMeController::host_file_create_managed(int block_size, size_t file_size) {
+    // Check if controller is properly initialized
+    if (!is_initialized()) {
+        geminifs_error("host_file_create_managed: NVMeController is not properly initialized\n");
+        return UINT32_MAX; // Invalid file ID
+    }
+    
+    if (!file_manager) {
+        geminifs_error("host_file_create_managed: FileManager is not available\n");
+        return UINT32_MAX;
+    }
+    
+    // Use FileManager's auto-filename generation feature
+    NVMeFileDesc file_desc;
+    if (!file_manager->createFile(file_desc, file_size)) {
+        geminifs_error("host_file_create_managed: Failed to create file in FileManager\n");
+        return UINT32_MAX;
+    }
+    
+    // The filename is automatically generated based on slot_index (file ID)
+    std::string filename(file_desc.filename);
+    
+    assert(file_size % block_size == 0);
+
+    auto nvpage_size = controller->page_size;
+    assert(block_size % nvpage_size == 0);
+
+    auto hdr_size = GEMINI_HDR_MAX_SIZE;
+
+    // Allocate host memory for the header
+    struct geminiFS_hdr *hdr = (struct geminiFS_hdr *)malloc(hdr_size);
+    if (!hdr) {
+        geminifs_error("host_file_create_managed: Failed to allocate memory for header\n");
+        // Clean up the FileManager entry
+        file_manager->deleteFile(file_desc.slot_index);
+        return UINT32_MAX;
+    }
+    
+    // Build file path using string concatenation
+    string file_path_str = string(controller->dev_mount_path) + "/" + filename;
+    
+    // Initialize header
+    hdr->magic_num = the_geminiFS_magic.magic_num;
+    hdr->first_block_base = hdr_size;
+    hdr->virtual_space_size = file_size;
+    hdr->block_bit = __builtin_ctzll(block_size); // Block size in bits
+
+    // Create and write file, then immediately close
+    int fd = open(file_path_str.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0666);
+    if (fd < 0) {
+        geminifs_error("host_file_create_managed: Failed to create file '%s': %s\n", 
+                       file_path_str.c_str(), strerror(errno));
+        free(hdr);
+        // Clean up the FileManager entry
+        file_manager->deleteFile(file_desc.slot_index);
+        return UINT32_MAX;
+    }
+    
+    // Set file size using fallocate to actually allocate space
+    if (fallocate(fd, 0, 0, hdr_size + file_size) != 0) {
+        geminifs_error("host_file_create_managed: Failed to allocate file space for '%s': %s\n", 
+                       file_path_str.c_str(), strerror(errno));
+        close(fd);
+        free(hdr);
+        // Clean up the FileManager entry
+        file_manager->deleteFile(file_desc.slot_index);
+        return UINT32_MAX;
+    }
+    
+    // Set temporary fd for header operations
+    hdr->fd = fd;
+    
+    // Refine NVMe offsets
+    host_refine_nvmeofst(hdr);
+
+    // // Write header to file
+    // if (write(fd, hdr, hdr_size) != (ssize_t)hdr_size) {
+    //     geminifs_error("host_file_create_managed: Failed to write header to file '%s': %s\n", 
+    //                    file_path_str.c_str(), strerror(errno));
+    //     close(fd);
+    //     unlink(file_path_str.c_str()); // Delete the incomplete file
+    //     free(hdr);
+    //     // Clean up the FileManager entry
+    //     file_manager->deleteFile(file_desc.slot_index);
+    //     return UINT32_MAX;
+    // }
+
+    // Close file immediately - we only created it, don't need to keep it open
+    close(fd);
+    free(hdr);
+    
+    geminifs_debug("host_file_create_managed: Created file '%s' with auto-generated name, size %zu, slot_index %u\n", 
+                   filename.c_str(), file_size, file_desc.slot_index);
+    
+    return file_desc.slot_index; // Return the slot_index as file ID
 }
 
 /**
@@ -376,6 +508,18 @@ host_fd_t NVMeController::host_file_open_managed(const std::string& filepath, ui
 }
 
 /**
+ * NVMeController member function to open a file with automatic FileManager integration
+ */
+host_fd_t NVMeController::host_file_open_managed(uint32_t id, uint32_t o_flag) {
+    NVMeFileDesc file_desc;
+    file_manager->getFileById(id, file_desc);
+
+    std::string filepath = get_file_path(file_desc);
+    
+    return host_file_open_managed(filepath, o_flag);
+}
+
+/**
  * NVMeController member function to close a file with automatic FileManager cleanup
  */    
 void NVMeController::host_file_close_managed(host_fd_t fd) {
@@ -395,6 +539,63 @@ void NVMeController::host_file_close_managed(host_fd_t fd) {
 }
 
 /**
+ * Internal helper function to create a host file descriptor
+ * This is used when we need the actual host_fd_t for device operations
+ */
+host_fd_t NVMeController::create_host_fd_internal(int block_size, size_t file_size, const std::string& filename) {
+    assert(file_size % block_size == 0);
+
+    auto nvpage_size = controller->page_size;
+    assert(block_size % nvpage_size == 0);
+
+    auto hdr_size = GEMINI_HDR_MAX_SIZE;
+
+    // Allocate host memory for the header
+    struct geminiFS_hdr *hdr = (struct geminiFS_hdr *)malloc(hdr_size);
+    if (!hdr) {
+        geminifs_error("create_host_fd_internal: Failed to allocate memory for header\n");
+        return nullptr;
+    }
+    
+    // Build file path using string concatenation
+    string file_path_str = string(controller->dev_mount_path) + "/" + filename;
+    
+    // Initialize header
+    hdr->magic_num = the_geminiFS_magic.magic_num;
+    hdr->first_block_base = hdr_size;
+    hdr->virtual_space_size = file_size;
+    hdr->block_bit = __builtin_ctzll(block_size);
+
+    // Open file
+    int fd = open(file_path_str.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0666);
+    if (fd < 0) {
+        geminifs_error("create_host_fd_internal: Failed to create file '%s': %s\n", file_path_str.c_str(), strerror(errno));
+        free(hdr);
+        return nullptr;
+    }
+    
+    // Set file size using fallocate
+    if (fallocate(fd, 0, 0, hdr_size + file_size) != 0) {
+        geminifs_error("create_host_fd_internal: Failed to allocate file space: %s\n", strerror(errno));
+        close(fd);
+        free(hdr);
+        return nullptr;
+    }
+    
+    hdr->fd = fd;
+    
+    // Refine NVMe offsets
+    host_refine_nvmeofst(hdr);
+    
+    // Register with FileManager for cleanup tracking
+    if (file_manager != nullptr) {
+        file_manager->registerOpenFile(hdr, filename, hdr_size);
+    }
+    
+    return hdr;
+}
+
+/**
  * NVMeController member function to create a device file with host-to-device mapping
  */
 dev_fd_t NVMeController::device_file_create_managed(int block_size, size_t file_size, const std::string& filename) {
@@ -404,15 +605,23 @@ dev_fd_t NVMeController::device_file_create_managed(int block_size, size_t file_
         return nullptr;
     }
     
-    // First create the host file
-    host_fd_t host_fd = host_file_create_managed(block_size, file_size, filename);
+    // First create the host file using internal method
+    host_fd_t host_fd = create_host_fd_internal(block_size, file_size, filename);
     if (host_fd == nullptr) {
         geminifs_error("device file create managed: Failed to create host file '%s'\n", filename.c_str());
         return nullptr;
     }
     
+    // Create file record in FileManager
+    NVMeFileDesc file_desc;
+    if (file_manager == nullptr || !file_manager->createFile(filename, file_desc, file_size)) {
+        geminifs_error("device file create managed: Failed to create file record in FileManager for '%s'\n", filename.c_str());
+        host_file_close_managed(host_fd);
+        return nullptr;
+    }
+    
     // Calculate header size
-    size_t hdr_size = ROUND_UP(GEMINI_HDR_MAX_SIZE, block_size);
+    size_t hdr_size = GEMINI_HDR_MAX_SIZE;
     
     // Copy host file descriptor to device
     dev_fd_t device_fd = copy_host_fd_to_device(host_fd, hdr_size);
@@ -438,7 +647,6 @@ dev_fd_t NVMeController::device_file_create_managed(int block_size, size_t file_
                                      (Controller*)controller->d_ctrl_ptr,
                                      (struct geminiFS_hdr*)device_fd,
                                      d_queue_acquire_helper,
-                                     file_size,
                                      controller->page_size,
                                      block_size,
                                      controller->h_qps[0]->block_size_log);
@@ -477,7 +685,7 @@ dev_fd_t NVMeController::device_file_create_managed(int block_size, size_t file_
 /**
  * NVMeController private function to open an existing file as a device file
  */
-dev_fd_t NVMeController::device_file_open_managed(const std::string& filename, size_t file_size) {
+dev_fd_t NVMeController::device_file_open_managed(const std::string& filename) {
     // Check if controller is properly initialized
     if (!is_initialized()) {
         geminifs_error("device file open managed: NVMeController is not properly initialized\n");
@@ -503,12 +711,12 @@ dev_fd_t NVMeController::device_file_open_managed(const std::string& filename, s
     }
     
     // Validate file size
-    if (host_fd->virtual_space_size != file_size) {
-        geminifs_error("device file open managed: File size mismatch. Expected %zu, got %zu\n", 
-                       file_size, host_fd->virtual_space_size);
-        host_file_close_managed(host_fd);
-        return nullptr;
-    }
+    // if (host_fd->virtual_space_size != file_size) {
+    //     geminifs_error("device file open managed: File size mismatch. Expected %zu, got %zu\n", 
+    //                    file_size, host_fd->virtual_space_size);
+    //     host_file_close_managed(host_fd);
+    //     return nullptr;
+    // }
     
     // Calculate header size
     size_t hdr_size = host_fd->first_block_base;
@@ -536,7 +744,6 @@ dev_fd_t NVMeController::device_file_open_managed(const std::string& filename, s
                                      (Controller*)controller->d_ctrl_ptr,
                                      (struct geminiFS_hdr*)device_fd,
                                      d_queue_acquire_helper,
-                                     file_size,
                                      controller->page_size,
                                      controller->blk_size,
                                      controller->blk_size_log);
@@ -570,6 +777,15 @@ dev_fd_t NVMeController::device_file_open_managed(const std::string& filename, s
                    filename.c_str(), device_fd);
     
     return d_nvme_file;
+}
+
+dev_fd_t NVMeController::device_file_open_managed(uint32_t id) {
+    NVMeFileDesc file_desc;
+    file_manager->getFileById(id, file_desc);
+
+    std::string filepath = get_file_path(file_desc);
+    
+    return device_file_open_managed(filepath);
 }
 
 /**
@@ -678,6 +894,11 @@ void NVMeController::cleanup_device_files() {
     device_files_.clear();
 }
 
+string NVMeController::get_file_path(const NVMeFileDesc& file_desc) {
+    std::filesystem::path file_path = std::filesystem::path(controller->dev_mount_path) / file_desc.filename;
+    return file_path.string();
+}
+
 ControllerPtr NVMeController::open_single_controller(const std::string& pci_addr, const nvme_ctrl_param& params) {
     // Create mount path for this specific controller
     std::filesystem::path mount_path_param(params.mount_path);
@@ -737,55 +958,60 @@ bool NVMeController::device_file_delete_all_files_managed() {
     }
     
     geminifs_debug("device_file_delete_all_files_managed: Starting cleanup for mount path '%s'\n", 
-                   controller->dev_mount_path);
+                   controller->dev_mount_path.c_str());
     
-    // Get all filenames from the FileManager log
-    std::vector<std::string> all_filenames = file_manager->getAllFilenames();
+    // Get all file IDs from the FileManager log
+    std::vector<uint32_t> all_file_ids = file_manager->getAllFileIds();
     
-    if (all_filenames.empty()) {
+    if (all_file_ids.empty()) {
         geminifs_debug("device_file_delete_all_files_managed: No files found in log, cleanup complete\n");
         return true;
     }
     
-    geminifs_debug("device_file_delete_all_files_managed: Found %zu files to clean up\n", all_filenames.size());
+    geminifs_debug("device_file_delete_all_files_managed: Found %zu files to clean up\n", all_file_ids.size());
     
     size_t files_deleted = 0;
     size_t files_failed = 0;
     
     // Process each file
-    for (const auto& filename : all_filenames) {
-        geminifs_debug("device_file_delete_all_files_managed: Processing file '%s'\n", filename.c_str());
+    for (const auto& file_id : all_file_ids) {
+        // Get file descriptor to get filename
+        NVMeFileDesc file_desc;
+        if (!file_manager->getFileById(file_id, file_desc)) {
+            geminifs_error("device_file_delete_all_files_managed: Failed to get file descriptor for ID %u\n", file_id);
+            files_failed++;
+            continue;
+        }
+        
+        std::string filename(file_desc.filename);
+        geminifs_debug("device_file_delete_all_files_managed: Processing file '%s' (ID: %u)\n", filename.c_str(), file_id);
         
         // Build full path to the physical file
-        std::filesystem::path file_path = controller->dev_mount_path;
-        file_path = file_path / filename;
+        string file_path_str = string(controller->dev_mount_path) + "/" + filename;
+        const char* file_path_cstr = file_path_str.c_str();
         
         bool physical_file_deleted = false;
         bool log_entry_deleted = false;
         
         // Try to delete the physical file if it exists
-        if (std::filesystem::exists(file_path)) {
-            try {
-                if (std::filesystem::remove(file_path)) {
-                    geminifs_debug("device_file_delete_all_files_managed: Successfully deleted physical file '%s'\n", 
-                                   file_path.c_str());
-                    physical_file_deleted = true;
-                } else {
-                    geminifs_error("device_file_delete_all_files_managed: Failed to delete physical file '%s'\n", 
-                                   file_path.c_str());
-                }
-            } catch (const std::filesystem::filesystem_error& e) {
-                geminifs_error("device_file_delete_all_files_managed: Exception while deleting physical file '%s': %s\n", 
-                               file_path.c_str(), e.what());
+        struct stat st;
+        if (stat(file_path_cstr, &st) == 0) {
+            if (unlink(file_path_cstr) == 0) {
+                geminifs_debug("device_file_delete_all_files_managed: Successfully deleted physical file '%s'\n", 
+                               file_path_cstr);
+                physical_file_deleted = true;
+            } else {
+                geminifs_error("device_file_delete_all_files_managed: Failed to delete physical file '%s': %s\n", 
+                               file_path_cstr, strerror(errno));
             }
         } else {
             geminifs_debug("device_file_delete_all_files_managed: Physical file '%s' does not exist\n", 
-                           file_path.c_str());
+                           file_path_cstr);
             physical_file_deleted = true; // Consider it as "successfully deleted" if it doesn't exist
         }
         
         // Delete the entry from FileManager log
-        if (file_manager->deleteFile(filename)) {
+        if (file_manager->deleteFile(file_id)) {
             geminifs_debug("device_file_delete_all_files_managed: Successfully deleted log entry for '%s'\n", 
                            filename.c_str());
             log_entry_deleted = true;
@@ -810,8 +1036,8 @@ bool NVMeController::device_file_delete_all_files_managed() {
     
     // Report results
     geminifs_debug("device_file_delete_all_files_managed: Cleanup complete. "
-                   "Successfully deleted: %zu, Failed: %zu, Total: %zu\n", 
-                   files_deleted, files_failed, all_filenames.size());
+                   "Successfully deleted: %zu, Failed: %zun", 
+                   files_deleted, files_failed);
     
     if (files_failed > 0) {
         geminifs_error("device_file_delete_all_files_managed: %zu files could not be completely cleaned up\n", 
@@ -821,6 +1047,242 @@ bool NVMeController::device_file_delete_all_files_managed() {
     
     geminifs_debug("device_file_delete_all_files_managed: All files successfully cleaned up\n");
     return true;
+}
+
+/**
+ * Delete a single file managed by this NVMe controller by filename
+ * @param filename The name of the file to delete
+ * @return true if successful, false otherwise
+ */
+bool NVMeController::device_file_delete_single_managed(const std::string& filename) {
+    // Check if controller is properly initialized
+    if (!is_initialized()) {
+        geminifs_error("device_file_delete_single_managed: NVMeController is not properly initialized\n");
+        return false;
+    }
+    
+    if (!file_manager) {
+        geminifs_error("device_file_delete_single_managed: FileManager is not available\n");
+        return false;
+    }
+    
+    geminifs_debug("device_file_delete_single_managed: Deleting file '%s' from mount path '%s'\n", 
+                   filename.c_str(), controller->dev_mount_path.c_str());
+    
+    // Parse file ID directly from filename (since filename = nvme_id.toString())
+    uint32_t file_id = FileManager::parseFileIdFromFilename(filename);
+    if (file_id == UINT32_MAX) {
+        geminifs_error("device_file_delete_single_managed: Cannot parse file ID from filename '%s'\n", filename.c_str());
+        return false;
+    }
+    
+    // Build full path to the physical file using string concatenation
+    string file_path_str = string(controller->dev_mount_path) + "/" + filename;
+    
+    bool physical_file_deleted = false;
+    bool log_entry_deleted = false;
+    
+    // Try to delete the physical file if it exists
+    struct stat stat_buf;
+    if (stat(file_path_str.c_str(), &stat_buf) == 0) {
+        if (unlink(file_path_str.c_str()) == 0) {
+            geminifs_debug("device_file_delete_single_managed: Successfully deleted physical file '%s'\n", 
+                           file_path_str.c_str());
+            physical_file_deleted = true;
+        } else {
+            geminifs_error("device_file_delete_single_managed: Failed to delete physical file '%s': %s\n", 
+                           file_path_str.c_str(), strerror(errno));
+        }
+    } else {
+        geminifs_debug("device_file_delete_single_managed: Physical file '%s' does not exist\n", 
+                       file_path_str.c_str());
+        physical_file_deleted = true; // Consider it as "successfully deleted" if it doesn't exist
+    }
+    
+    // Delete the entry from FileManager log
+    if (file_manager->deleteFile(file_id)) {
+        geminifs_debug("device_file_delete_single_managed: Successfully deleted log entry for '%s'\n", 
+                       filename.c_str());
+        log_entry_deleted = true;
+    } else {
+        geminifs_error("device_file_delete_single_managed: Failed to delete log entry for '%s'\n", 
+                       filename.c_str());
+    }
+    
+    // Remove from device_files_ if it exists there
+    {
+        std::lock_guard<std::mutex> lock(device_files_mtx_);
+        auto it = std::find_if(device_files_.begin(), device_files_.end(),
+                              [&filename](const DeviceFileHandle& handle) {
+                                  return handle.filename == filename;
+                              });
+        
+        if (it != device_files_.end()) {
+            geminifs_debug("device_file_delete_single_managed: Removing device file handle for '%s'\n", 
+                           filename.c_str());
+            
+            // Free GPU NVMeFile if allocated
+            if (it->d_nvme_file != nullptr) {
+                cudaError_t err = cudaFree(it->d_nvme_file);
+                if (err != cudaSuccess) {
+                    geminifs_error("device_file_delete_single_managed: Failed to free NVMeFile for '%s': %s\n", 
+                                  filename.c_str(), cudaGetErrorString(err));
+                }
+            }
+            
+            // Free device memory
+            if (it->device_fd != nullptr) {
+                cudaError_t err = cudaFree(it->device_fd);
+                if (err != cudaSuccess) {
+                    geminifs_error("device_file_delete_single_managed: Failed to free device memory for '%s': %s\n", 
+                                  filename.c_str(), cudaGetErrorString(err));
+                }
+            }
+            
+            device_files_.erase(it);
+        }
+    }
+    
+    // Force persistence of the log changes
+    file_manager->forcePersist();
+    
+    bool success = physical_file_deleted && log_entry_deleted;
+    if (success) {
+        geminifs_debug("device_file_delete_single_managed: Successfully deleted file '%s'\n", filename.c_str());
+    } else {
+        geminifs_error("device_file_delete_single_managed: Failed to completely delete file '%s'\n", filename.c_str());
+    }
+    
+    return success;
+}
+
+/**
+ * Delete a single file managed by this NVMe controller by NVMe file ID
+ * This method looks up the filename by file ID and then calls device_file_delete_single_managed
+ * @param nvme_file_id The NVMe file ID (usually the file descriptor or index)
+ * @return true if successful, false otherwise
+ */
+bool NVMeController::host_file_delete_managed(uint32_t nvme_file_id) {
+    // Check if controller is properly initialized
+    if (!is_initialized()) {
+        geminifs_error("host_file_delete_managed: NVMeController is not properly initialized\n");
+        return false;
+    }
+    
+    if (!file_manager) {
+        geminifs_error("host_file_delete_managed: FileManager is not available\n");
+        return false;
+    }
+    
+    geminifs_debug("host_file_delete_managed: Looking for file with NVMe ID %u\n", nvme_file_id);
+    
+    // Get file descriptor to check if file exists
+    NVMeFileDesc file_desc;
+    if (!file_manager->getFileById(nvme_file_id, file_desc)) {
+        geminifs_error("host_file_delete_managed: File with ID %u not found in log\n", nvme_file_id);
+        return false;
+    }
+    
+    std::string filename(file_desc.filename);
+    
+    // Use the single file deletion method
+    return device_file_delete_single_managed(filename);
+}
+
+/**
+ * Get the count of files managed by this NVMe controller
+ */
+size_t NVMeController::device_file_get_managed_file_count() const {
+    // Check if controller is properly initialized
+    if (!is_initialized()) {
+        geminifs_error("device_file_get_managed_file_count: NVMeController is not properly initialized\n");
+        return 0;
+    }
+    
+    if (!file_manager) {
+        geminifs_error("device_file_get_managed_file_count: FileManager is not initialized\n");
+        return 0;
+    }
+    
+    // Get all file IDs from the FileManager log
+    std::vector<uint32_t> all_file_ids = file_manager->getAllFileIds();
+    
+    geminifs_debug("device_file_get_managed_file_count: Found %zu managed files\n", all_file_ids.size());
+    
+    return all_file_ids.size();
+}
+
+/**
+ * Validate that all managed files have the expected size
+ */
+size_t NVMeController::device_file_validate_sizes(size_t expected_size) const {
+    // Check if controller is properly initialized
+    if (!is_initialized()) {
+        geminifs_error("device_file_validate_sizes: NVMeController is not properly initialized\n");
+        return 0;
+    }
+    
+    if (!file_manager) {
+        geminifs_error("device_file_validate_sizes: FileManager is not initialized\n");
+        return 0;
+    }
+    
+    // Get all file IDs from the FileManager log
+    std::vector<uint32_t> all_file_ids = file_manager->getAllFileIds();
+    
+    if (all_file_ids.empty()) {
+        geminifs_debug("device_file_validate_sizes: No files to validate\n");
+        return 0;
+    }
+    
+    geminifs_debug("device_file_validate_sizes: Validating %zu files for expected size %zu bytes\n", 
+                   all_file_ids.size(), expected_size);
+    
+    size_t valid_files = 0;
+    
+    for (const auto& file_id : all_file_ids) {
+        // Get file descriptor to get filename
+        NVMeFileDesc file_desc;
+        if (!file_manager->getFileById(file_id, file_desc)) {
+            geminifs_error("device_file_validate_sizes: Failed to get file descriptor for ID %u\n", file_id);
+            continue;
+        }
+        
+        std::string filename(file_desc.filename);
+        // Build file path using C-style string operations
+        std::string file_path = controller->dev_mount_path;
+        if (file_path.back() != '/') {
+            file_path += "/";
+        }
+        file_path += filename;
+        
+        // Use stat to get file size
+        struct stat file_stat;
+        if (stat(file_path.c_str(), &file_stat) == 0) {
+            size_t file_size = static_cast<size_t>(file_stat.st_size);
+            
+            // For GeminiFS files, we need to account for the header size
+            // The actual data size should be expected_size, but the file includes header
+            size_t expected_total_size = expected_size + GEMINI_HDR_MAX_SIZE;
+            
+            if (file_size == expected_total_size) {
+                valid_files++;
+                geminifs_debug("device_file_validate_sizes: File '%s' has correct size %zu bytes\n", 
+                              filename.c_str(), file_size);
+            } else {
+                geminifs_debug("device_file_validate_sizes: File '%s' has incorrect size %zu bytes (expected %zu bytes), skipping\n", 
+                              filename.c_str(), file_size, expected_total_size);
+            }
+        } else {
+            geminifs_debug("device_file_validate_sizes: Failed to get size of file '%s': %s, skipping\n", 
+                          file_path.c_str(), strerror(errno));
+        }
+    }
+    
+    geminifs_debug("device_file_validate_sizes: Validation complete. Valid files with expected size: %zu\n", 
+                   valid_files);
+    
+    return valid_files;
 }
 
 // GPU device-side read/write interface using NVMeFile pointer
@@ -843,7 +1305,7 @@ void nvme_controller_g_write_kernel(dev_fd_t device_fd, uint64_t prp1, uint64_t 
 }
 
 __device__
-void * nvme_controller_g_read(dev_fd_t device_fd, uint64_t prp1, uint64_t prp2, size_t file_offset, size_t nbytes)
+void nvme_controller_g_read(dev_fd_t device_fd, uint64_t prp1, uint64_t prp2, size_t file_offset, size_t nbytes)
 {
     auto *nvme_file = (NVMe_File*)device_fd;
     // Call the read method on the NVMe_File instance
@@ -851,10 +1313,110 @@ void * nvme_controller_g_read(dev_fd_t device_fd, uint64_t prp1, uint64_t prp2, 
 }
 
 __device__
-void * nvme_controller_g_write(dev_fd_t device_fd, uint64_t prp1, uint64_t prp2, size_t file_offset, size_t nbytes)
+void nvme_controller_g_write(dev_fd_t device_fd, uint64_t prp1, uint64_t prp2, size_t file_offset, size_t nbytes)
 {
     auto *nvme_file = (NVMe_File*)device_fd;
     // Call the write method on the NVMe_File instance
     nvme_file->write_out(prp1, prp2, file_offset, nbytes);
+}
+
+/**
+ * Create a managed file without opening it - only creates the file with proper header and size
+ * This function is optimized for file creation without the overhead of maintaining file descriptors
+ */
+bool NVMeController::host_file_create_only_managed(int block_size, size_t file_size, const std::string& filename) {
+    // Check if controller is properly initialized
+    if (!is_initialized()) {
+        geminifs_error("host_file_create_only_managed: NVMeController is not properly initialized\n");
+        return false;
+    }
+    
+    assert(file_size % block_size == 0);
+
+    auto nvpage_size = controller->page_size;
+    assert(block_size % nvpage_size == 0);
+
+    size_t hdr_size = GEMINI_HDR_MAX_SIZE;
+
+    // Allocate host memory for the header
+    struct geminiFS_hdr *hdr = (struct geminiFS_hdr *)malloc(hdr_size);
+    if (!hdr) {
+        geminifs_error("host_file_create_only_managed: Failed to allocate memory for header\n");
+        return false;
+    }
+    
+    // Build file path using helper function (avoiding std::filesystem)
+    std::string file_path = build_file_path(controller->dev_mount_path, filename);
+    
+    // Create directory if it doesn't exist
+    if (!create_directories(controller->dev_mount_path)) {
+        geminifs_error("host_file_create_only_managed: Failed to create directory '%s'\n", controller->dev_mount_path.c_str());
+        free(hdr);
+        return false;
+    }
+    
+    // Initialize header
+    hdr->magic_num = the_geminiFS_magic.magic_num;
+    hdr->first_block_base = hdr_size;
+    hdr->virtual_space_size = file_size;
+    hdr->block_bit = __builtin_ctzll(block_size); // Block size in bits
+
+    // Create and write file, then immediately close
+    int fd = open(file_path.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0666);
+    if (fd < 0) {
+        geminifs_error("host_file_create_only_managed: Failed to create file '%s': %s\n", 
+                      file_path.c_str(), strerror(errno));
+        free(hdr);
+        return false;
+    }
+    
+    // Set file size using fallocate to actually allocate space
+    if (fallocate(fd, 0, 0, hdr_size + file_size) != 0) {
+        geminifs_error("host_file_create_only_managed: Failed to allocate file space for '%s': %s\n", 
+                      file_path.c_str(), strerror(errno));
+        close(fd);
+        free(hdr);
+        return false;
+    }
+    
+    // Set temporary fd for header operations
+    hdr->fd = fd;
+    
+    // Refine NVMe offsets
+    host_refine_nvmeofst(hdr);
+    
+    // Write header to file
+    if (write(fd, hdr, hdr_size) != (ssize_t)hdr_size) {
+        geminifs_error("host_file_create_only_managed: Failed to write header to file '%s': %s\n", 
+                      file_path.c_str(), strerror(errno));
+        close(fd);
+        free(hdr);
+        return false;
+    }
+    
+    // Close file immediately - we only created it, don't need to keep it open
+    close(fd);
+    
+    // Create file record in log for consistency with g_open behavior
+    if (file_manager != nullptr) {
+        NVMeFileDesc new_desc;
+        if (!file_manager->createFile(filename, new_desc, file_size)) {
+            geminifs_error("host_file_create_only_managed: Failed to create file record in log for '%s'\n", filename.c_str());
+            // Clean up the created physical file
+            unlink(file_path.c_str());
+            free(hdr);
+            return false;
+        }
+        geminifs_debug("host_file_create_only_managed: Created file record in log for '%s' with slot %u\n", 
+                      filename.c_str(), new_desc.slot_index);
+    }
+    
+    // Clean up header memory
+    free(hdr);
+    
+    geminifs_debug("host_file_create_only_managed: Created file '%s' with size %zu, hdr_size %zu (file closed)\n", 
+                   filename.c_str(), file_size, hdr_size);
+    
+    return true;
 }
 
