@@ -87,7 +87,7 @@ set (CUDA_NVCC_FLAGS_RELEASE "${CMAKE_NVCC_FLAGS_RELEASE} -O2" CACHE INTERNAL ""
 set (CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xlinker -rpath=${CMAKE_BINARY_DIR}/lib -rdc=true --expt-relaxed-constexpr --expt-extended-lambda -lineinfo ${GPU_ARCHS}")
 set (CMAKE_CUDA_FLAGS_DEBUG "${CMAKE_CUDA_FLAGS_DEBUG} -G -DDEBUG" CACHE INTERNAL "" FORCE)
 set (CMAKE_CUDA_FLAGS_RELEASE "${CMAKE_CUDA_FLAGS_RELEASE} -O2" CACHE INTERNAL "" FORCE)
-set (CMAKE_CUDA_GEMINIFS_LIBS "${CMAKE_CUDA_GEMINIFS_LIBS} -L${PROJECT_BINARY_DIR}/libgeminifs -L${PROJECT_SOURCE_DIR}/include/geminifs -L${CMAKE_BINARY_DIR}/lib -lgeminifs -lnvm")
+set (CMAKE_CUDA_GEMINIFS_LIBS "${CMAKE_CUDA_GEMINIFS_LIBS} -L${PROJECT_BINARY_DIR}/libgeminifs -L${PROJECT_SOURCE_DIR}/filesystems/local/ext4/libgeminifs/include/geminifs -L${CMAKE_BINARY_DIR}/lib -lgeminifs -lnvm")
 
 if (no_cc)
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -D__NO_COHERENCE__")
@@ -95,9 +95,9 @@ if (no_cc)
     set(CCUDA_NVCC_FLAGS "${CMAKE_C_FLAGS} -D__NO_COHERENCE__")
 endif ()
 
-include_directories ("${PROJECT_SOURCE_DIR}/libnvm/src"
-                     "${PROJECT_SOURCE_DIR}/libnvm/include" 
-                     "${PROJECT_SOURCE_DIR}/libgeminifs/include")
+include_directories ("${PROJECT_SOURCE_DIR}/backends/local/nvme/libnvm/src"
+                     "${PROJECT_SOURCE_DIR}/backends/local/nvme/libnvm/include" 
+                     "${PROJECT_SOURCE_DIR}/filesystems/local/ext4/libgeminifs/include")
 
 # Try to find Nvidia driver
 if (CUDA_FOUND AND NOT no_cuda)
@@ -126,17 +126,17 @@ endif ()
 
 
 # Library source files
-set (libnvm_root "${PROJECT_SOURCE_DIR}/libnvm/")
+set (libnvm_root "${PROJECT_SOURCE_DIR}/backends/local/nvme/libnvm/")
 file (GLOB libnvm_source "${libnvm_root}/src/*.cpp")
 file (GLOB libnvm_linux_source "${libnvm_root}/src/linux/*.cpp")
 file (GLOB libnvm_include "${libnvm_root}/include/*.h")
 
 
 # # Module source files
-set (module_root "${PROJECT_SOURCE_DIR}/module")
+set (module_root "${PROJECT_SOURCE_DIR}/backends/local/kernel_modules/snvme")
 set (module_output "${CMAKE_BINARY_DIR}/module")
 # for Makefile.in, do not delete
-set (module_ccflags "-I${PROJECT_SOURCE_DIR}/libnvm/include -I${driver_include}")
+set (module_ccflags "-I${PROJECT_SOURCE_DIR}/backends/local/nvme/libnvm/include -I${driver_include}")
 configure_file ("${module_root}/Makefile.in" "${module_output}/Makefile" @ONLY)
 message (STATUS "Configuring module build in ${module_output}")
 
@@ -198,7 +198,7 @@ install (FILES ${libnvm_include} DESTINATION "include")
 install (TARGETS libnvm DESTINATION "lib")
 
 # libgeminifs
-set (libgeminifs_root "${PROJECT_SOURCE_DIR}/libgeminifs")
+set (libgeminifs_root "${PROJECT_SOURCE_DIR}/filesystems/local/ext4/libgeminifs")
 file (GLOB libgeminifs_cpp_source "${libgeminifs_root}/*.cpp")
 file (GLOB libgeminifs_cuda_source "${libgeminifs_root}/*.cu")
 file (GLOB libgeminifs_include "${libgeminifs_root}/include/geminifs/*.h" "${libgeminifs_root}/include/geminifs/*.cuh")

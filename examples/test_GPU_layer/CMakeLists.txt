@@ -41,8 +41,8 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${TORCH_CXX_FLAGS}")
 
 
 include_directories(
-    ${root}/libgeminifs/include/
-    ${root}/libnvm/include
+    ${root}/filesystems/local/ext4/libgeminifs/include/
+    ${root}/backends/local/nvme/libnvm/include
     ${root}/build/
 )
 
