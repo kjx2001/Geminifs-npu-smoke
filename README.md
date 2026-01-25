@@ -1,6 +1,6 @@
 <img src="doc/pics/tardis_logo.png" align="left" width="32" />
 
-## Tardis: Companion File System for GPUs
+## Geminifs: Companion File System for GPUs
 Data-centric Storage Architecture for GPU Application 
 
 ## Directory structure
