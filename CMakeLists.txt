@@ -21,6 +21,7 @@ set (CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -gencode arch=compute_90,code=sm_90")
 find_package (Threads REQUIRED)
 find_package(CUDAToolkit 12.6 REQUIRED)
 find_package(PkgConfig)
+find_package(yaml-cpp REQUIRED)
 
 pkg_check_modules(UNWIND REQUIRED libunwind)
 
@@ -87,7 +88,7 @@ set (CUDA_NVCC_FLAGS_RELEASE "${CMAKE_NVCC_FLAGS_RELEASE} -O2" CACHE INTERNAL ""
 set (CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xlinker -rpath=${CMAKE_BINARY_DIR}/lib -rdc=true --expt-relaxed-constexpr --expt-extended-lambda -lineinfo ${GPU_ARCHS}")
 set (CMAKE_CUDA_FLAGS_DEBUG "${CMAKE_CUDA_FLAGS_DEBUG} -G -DDEBUG" CACHE INTERNAL "" FORCE)
 set (CMAKE_CUDA_FLAGS_RELEASE "${CMAKE_CUDA_FLAGS_RELEASE} -O2" CACHE INTERNAL "" FORCE)
-set (CMAKE_CUDA_GEMINIFS_LIBS "${CMAKE_CUDA_GEMINIFS_LIBS} -L${PROJECT_BINARY_DIR}/libgeminifs -L${PROJECT_SOURCE_DIR}/filesystems/local/ext4/libgeminifs/include/geminifs -L${CMAKE_BINARY_DIR}/lib -lgeminifs -lnvm")
+set (CMAKE_CUDA_GEMINIFS_LIBS "${CMAKE_CUDA_GEMINIFS_LIBS} -L${PROJECT_BINARY_DIR}/libgeminifs -L${PROJECT_SOURCE_DIR}/filesystems/ext4/libgeminifs/include/geminifs -L${CMAKE_BINARY_DIR}/lib -lgeminifs -lnvm")
 
 if (no_cc)
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -D__NO_COHERENCE__")
@@ -97,7 +98,7 @@ endif ()
 
 include_directories ("${PROJECT_SOURCE_DIR}/backends/local/nvme/libnvm/src"
                      "${PROJECT_SOURCE_DIR}/backends/local/nvme/libnvm/include" 
-                     "${PROJECT_SOURCE_DIR}/filesystems/local/ext4/libgeminifs/include")
+                     "${PROJECT_SOURCE_DIR}/filesystems/ext4/libgeminifs/include")
 
 # Try to find Nvidia driver
 if (CUDA_FOUND AND NOT no_cuda)
@@ -198,7 +199,7 @@ install (FILES ${libnvm_include} DESTINATION "include")
 install (TARGETS libnvm DESTINATION "lib")
 
 # libgeminifs
-set (libgeminifs_root "${PROJECT_SOURCE_DIR}/filesystems/local/ext4/libgeminifs")
+set (libgeminifs_root "${PROJECT_SOURCE_DIR}/filesystems/ext4/libgeminifs")
 file (GLOB libgeminifs_cpp_source "${libgeminifs_root}/*.cpp")
 file (GLOB libgeminifs_cuda_source "${libgeminifs_root}/*.cu")
 file (GLOB libgeminifs_include "${libgeminifs_root}/include/geminifs/*.h" "${libgeminifs_root}/include/geminifs/*.cuh")
@@ -229,6 +230,18 @@ set_target_properties(libgeminifs PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 set_target_properties(libgeminifs PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 install (FILES ${libgeminifs_include} DESTINATION "include/geminifs")
 install (TARGETS libgeminifs DESTINATION "lib")
+
+# NVMeService
+set (nvmeservice_root "${PROJECT_SOURCE_DIR}/backends/local/NVMeService")
+file (GLOB nvmeservice_sources "${nvmeservice_root}/src/*.cpp" "${nvmeservice_root}/src/*.cu")
+
+add_library(nvmeservice ${nvmeservice_sources})
+target_include_directories(nvmeservice PUBLIC "${nvmeservice_root}/src")
+target_link_libraries(nvmeservice PRIVATE libnvm CUDA::cudart Threads::Threads)
+target_link_libraries(nvmeservice PRIVATE yaml-cpp)
+set_target_properties(nvmeservice PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+set_target_properties(nvmeservice PROPERTIES OUTPUT_NAME "nvmeservice")
+install (TARGETS nvmeservice DESTINATION "lib")
 
 
 # Macro for creating sample target

@@ -4,6 +4,7 @@
 #include <iostream>  
 #include <cstdlib>  
 #include <cstring>  
+#include <filesystem>
 #include <unistd.h>
 
 void executeCommand(const char *command) {  
@@ -33,6 +34,14 @@ void syncFileSystem(const char *device) {
 }  
 
 bool mountDevice(const char *device, const char *mountPoint) {  
+    std::error_code ec;
+    if (!std::filesystem::exists(mountPoint, ec)) {
+        if (!std::filesystem::create_directories(mountPoint, ec)) {
+            std::cerr << "Failed to create mount point: " << mountPoint << std::endl;
+            return false;
+        }
+    }
+
     char command[256];  
     snprintf(command, sizeof(command), "mount %s %s", device, mountPoint);  
     if (std::system(command) != 0) {  

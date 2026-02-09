@@ -18,3 +18,7 @@ GeminiFS
 ## How to build and run
 See [filesystems/local/ext4/README.md](filesystems/local/ext4/README.md).
 
+## Dependencies
+- yaml-cpp (for NVMeService YAML config parsing)
+	- Debian/Ubuntu: sudo apt install libyaml-cpp-dev
+
