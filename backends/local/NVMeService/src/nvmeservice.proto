@@ -55,6 +55,7 @@ message FsReleaseQueuesReq {
   uint32 controller_index = 1;
   int32 pid = 2;
   repeated uint32 qids = 3;
+  uint64 lease_id = 4;
 }
 
 message FsReleaseQueuesResp {

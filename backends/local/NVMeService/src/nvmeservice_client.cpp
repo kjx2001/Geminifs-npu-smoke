@@ -7,6 +7,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <thread>
 
 namespace nvmeservice {
 
@@ -96,9 +97,12 @@ bool NvmeServiceClient::shutdown() {
 bool NvmeServiceClient::allocQueues(uint32_t controller_index,
                                     uint32_t requested,
                                     int32_t pid,
+                                    uint64_t client_id,
                                     std::vector<uint32_t>& qids,
                                     std::string& d_qps_handle,
-                                    std::string& d_ctrl_handle) {
+                                    std::string& d_ctrl_handle,
+                                    uint64_t& lease_id,
+                                    uint32_t& ttl_ms) {
     grpc::ClientContext context;
     applyDeadline(context);
 
@@ -106,6 +110,7 @@ bool NvmeServiceClient::allocQueues(uint32_t controller_index,
     req.set_controller_index(controller_index);
     req.set_queue_count(normalizeQueueRequest(requested));
     req.set_pid(pid);
+    req.set_client_id(client_id);
 
     rpc::FsAllocQueuesResp resp;
     grpc::Status status = stub_->FsAllocQueues(&context, req, &resp);
@@ -120,6 +125,8 @@ bool NvmeServiceClient::allocQueues(uint32_t controller_index,
     }
     d_qps_handle = resp.d_qps_handle();
     d_ctrl_handle = resp.d_ctrl_handle();
+    lease_id = resp.lease_id();
+    ttl_ms = resp.ttl_ms();
     return true;
 }
 
@@ -137,6 +144,54 @@ bool NvmeServiceClient::releaseQueues(uint32_t controller_index, int32_t pid, co
     rpc::FsReleaseQueuesResp resp;
     grpc::Status status = stub_->FsReleaseQueues(&context, req, &resp);
     return status.ok() && resp.status() == rpc::Status::STATUS_OK;
+}
+
+bool NvmeServiceClient::releaseLease(uint64_t lease_id) {
+    grpc::ClientContext context;
+    applyDeadline(context);
+
+    rpc::FsReleaseQueuesReq req;
+    req.set_lease_id(lease_id);
+
+    rpc::FsReleaseQueuesResp resp;
+    grpc::Status status = stub_->FsReleaseQueues(&context, req, &resp);
+    return status.ok() && resp.status() == rpc::Status::STATUS_OK;
+}
+
+bool NvmeServiceClient::heartbeatLeases(uint64_t client_id,
+                                        const std::vector<uint64_t>& lease_ids,
+                                        uint32_t duration_ms,
+                                        uint32_t interval_ms) {
+    grpc::ClientContext context;
+    auto stream = stub_->LeaseHeartbeat(&context);
+    if (!stream) {
+        return false;
+    }
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(duration_ms);
+    while (std::chrono::steady_clock::now() < deadline) {
+        for (uint64_t lease_id : lease_ids) {
+            rpc::LeaseHeartbeatReq req;
+            req.set_lease_id(lease_id);
+            req.set_client_id(client_id);
+            if (!stream->Write(req)) {
+                break;
+            }
+
+            rpc::LeaseHeartbeatResp resp;
+            if (!stream->Read(&resp)) {
+                break;
+            }
+            if (resp.status() != rpc::Status::STATUS_OK) {
+                return false;
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(interval_ms));
+    }
+
+    stream->WritesDone();
+    grpc::Status status = stream->Finish();
+    return status.ok();
 }
 
 } // namespace nvmeservice

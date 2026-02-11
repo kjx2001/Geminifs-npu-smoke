@@ -116,6 +116,16 @@ public:
     grpc::Status FsReleaseQueues(grpc::ServerContext*, const rpc::FsReleaseQueuesReq* req, rpc::FsReleaseQueuesResp* resp) override {
         const uint32_t controller_index = req->controller_index();
         const int32_t pid = req->pid();
+        const uint64_t lease_id = req->lease_id();
+
+        if (lease_id != 0) {
+            if (!owner_.releaseLease(lease_id)) {
+                resp->set_status(rpc::Status::STATUS_DENIED);
+                return grpc::Status::OK;
+            }
+            resp->set_status(rpc::Status::STATUS_OK);
+            return grpc::Status::OK;
+        }
 
         std::vector<uint32_t> qids;
         qids.reserve(static_cast<size_t>(req->qids_size()));

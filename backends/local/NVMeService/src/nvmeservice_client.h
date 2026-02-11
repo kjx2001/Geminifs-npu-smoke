@@ -29,6 +29,7 @@ public:
                      uint64_t& lease_id,
                      uint32_t& ttl_ms);
     bool releaseQueues(uint32_t controller_index, int32_t pid, const std::vector<uint32_t>& qids);
+    bool releaseLease(uint64_t lease_id);
     bool heartbeatLeases(uint64_t client_id,
                          const std::vector<uint64_t>& lease_ids,
                          uint32_t duration_ms,

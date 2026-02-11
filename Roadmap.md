@@ -26,10 +26,11 @@
 1. 把“控制器创建 + 队列内存分配 + GPU 侧指针生成”从 GeminiFS 初始化中剥离
 	- 这些动作由常驻 GPU 守护进程完成并长期持有，避免每个进程重复 init
    - 守护进程启动时读取 sys_config.ini，一次性初始化多个 GPU 与 NVMe 控制器
+
 2. 引入“可共享的控制器资源包”
 	- 资源包包含：d_ctrl_ptr、d_qps、队列 DMA 内存、d_queue_acquire_helper 以及必要的门铃映射信息
 	- 对 GPU 侧指针使用 CUDA IPC（cudaIpcGetMemHandle / cudaIpcOpenMemHandle）共享
-	- 对 host 侧门铃/控制平面资源使用共享内存或 FD 传递（基于 UNIX socket）
+	- 对 host 侧门铃/控制平面资源使用共享内存或 FD 传递（基于 gRPC + TCP）
 3. NVMeController 支持两种模式
 	- 独立模式（现有）：当前进程自建 Controller 与队列
 	- 共享模式（新）：从 IPC 句柄 attach 既有资源，跳过 open_single_controller 与 init_queues
@@ -45,17 +46,17 @@
 	- 守护进程启动时读取 sys_config.yaml，完成多 GPU / 多 NVMe 初始化
 	- 守护进程启动时完成 Controller 初始化与队列池预分配
 2. 队列池分配与回收
-	- 实现 FsAllocQueues / FsReleaseQueues
+	- 实现 FsAllocQueues / FsReleaseQueues（gRPC）
 	- 增加 max_queues_per_process 等配额限制
 3. IPC 句柄协议
 	- 定义资源包传输结构（设备指针 IPC handle + 共享内存/FD）
-	- 增加“获取控制器资源包”的 RPC
+	- 增加“获取控制器资源包”的 RPC（gRPC）
 4. GeminiFS 资源抽象
 	- 抽出 NVMeControllerResource（或类似结构体），封装 Controller + 队列资源句柄
 	- 为 NVMeController 增加“从资源包构造/attach”的构造函数
 5. GeminiFS 接入
 	- parse_and_setup_controllers 中增加“通过守护进程 attach 控制器”的分支
-	- 配置层面增加开关：enable_nvme_daemon / daemon_socket_path
+	- 配置层面增加开关：enable_nvme_daemon / daemon_endpoint（gRPC endpoint）
 6. 生命周期与容错
 	- 进程退出时归还队列（显式 release 或心跳超时回收）
 	- 守护进程异常重启时的清理与重新初始化策略

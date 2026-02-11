@@ -6,16 +6,16 @@ NVMeService 是一个本地守护进程，用于在每块 GPU 上只初始化一
 本文档记录代码结构、构建目标和基础使用方法。
 
 ## 代码结构
-- src/nvmeservice_protocol.h
-  - IPC 消息头、命令与负载结构体。
+- src/nvmeservice.proto
+  - gRPC/Protobuf 接口定义。
 - src/nvmeservice_config.{h,cpp}
-  - sys_config.yaml 解析（socket/gpus/nvmes）。
+  - sys_config.yaml 解析（grpc/gpus/nvmes）。
 - src/nvmeservice_state.{h,cu}
   - 服务状态、控制器创建、队列池跟踪。
 - src/nvmeservice_server.{h,cpp}
-  - UNIX 域 socket 服务端与请求分发。
+  - gRPC 服务端与请求分发。
 - src/nvmeservice_client.{h,cpp}
-  - 简单客户端 API（信息查询）。
+  - gRPC 客户端 API（信息查询）。
 - examples/nvmeservice_daemon.cpp
   - 守护进程示例入口（读取 sys_config.yaml 后直接初始化并提供服务）。
 
@@ -25,10 +25,17 @@ NVMeService 是一个本地守护进程，用于在每块 GPU 上只初始化一
 ## 使用方法
 1. 启动守护进程（直接读取 sys_config.yaml 并初始化）
   - nvmeservice_daemon_example --config sys_config.yaml
+2. 客户端调用（只需 gRPC 端口）
+  - nvmeservice_client_example --endpoint 127.0.0.1:50051 --cmd ping
+  - nvmeservice_client_example --endpoint 127.0.0.1:50051 --cmd info
+  - nvmeservice_client_example --endpoint 127.0.0.1:50051 --cmd alloc --controller 0 --count 32 --pid $$
+  - nvmeservice_client_example --endpoint 127.0.0.1:50051 --cmd heartbeat --client <client_id> --lease <lease_id> --duration 5000 --interval 1000
+  - nvmeservice_client_example --endpoint 127.0.0.1:50051 --cmd release --lease <lease_id>
+  - nvmeservice_client_example --endpoint 127.0.0.1:50051 --cmd shutdown
 
 ## Docker 说明
-- 建议使用共享路径：/var/run/nvmeservice.sock
-- 示例：docker run ... -v /var/run:/var/run
+- 建议监听本机回环地址：127.0.0.1:50051
+- 示例：docker run ... -p 50051:50051
 
 ## 说明
 - nvmes 使用 gpu_id 绑定到 gpus 列表中的 GPU。
