@@ -1,126 +1,142 @@
 #include "nvmeservice_client.h"
 
+#include "nvmeservice.pb.h"
+
+#include <grpcpp/create_channel.h>
+#include <grpcpp/security/credentials.h>
+
+#include <chrono>
 #include <cstdio>
-#include <cstring>
-#include <sys/socket.h>
-#include <sys/un.h>
-#include <unistd.h>
 
 namespace nvmeservice {
 
+namespace rpc = nvmeservice::rpc;
+
 namespace {
 
-bool readExact(int fd, void* buf, size_t len) {
-    uint8_t* p = static_cast<uint8_t*>(buf);
-    size_t read_bytes = 0;
-    while (read_bytes < len) {
-        ssize_t r = ::read(fd, p + read_bytes, len - read_bytes);
-        if (r <= 0) return false;
-        read_bytes += static_cast<size_t>(r);
-    }
-    return true;
-}
+constexpr int kDefaultRpcTimeoutMs = 2000;
+constexpr int kMaxGrpcMessageBytes = 4 * 1024 * 1024;
+constexpr uint32_t kQueueRequestAlign = 16;
+constexpr uint32_t kDefaultQueueRequest = 32;
 
-bool writeExact(int fd, const void* buf, size_t len) {
-    const uint8_t* p = static_cast<const uint8_t*>(buf);
-    size_t written = 0;
-    while (written < len) {
-        ssize_t w = ::write(fd, p + written, len - written);
-        if (w <= 0) return false;
-        written += static_cast<size_t>(w);
+uint32_t normalizeQueueRequest(uint32_t requested) {
+    uint32_t count = requested == 0 ? kDefaultQueueRequest : requested;
+    if (count % kQueueRequestAlign != 0) {
+        count = ((count + kQueueRequestAlign - 1) / kQueueRequestAlign) * kQueueRequestAlign;
     }
-    return true;
+    return count;
 }
 
 } // namespace
 
-NvmeServiceClient::NvmeServiceClient(std::string socket_path)
-    : socket_path_(std::move(socket_path)) {}
+NvmeServiceClient::NvmeServiceClient(std::string grpc_endpoint)
+    : grpc_endpoint_(std::move(grpc_endpoint)) {
+    grpc::ChannelArguments args;
+    args.SetMaxReceiveMessageSize(kMaxGrpcMessageBytes);
+    args.SetMaxSendMessageSize(kMaxGrpcMessageBytes);
+    channel_ = grpc::CreateCustomChannel(grpc_endpoint_, grpc::InsecureChannelCredentials(), args);
+    stub_ = rpc::NvmeService::NewStub(channel_);
+}
 
-bool NvmeServiceClient::request(const MsgHeader& hdr, const void* payload, uint32_t payload_bytes, RespHeader& resp, std::vector<uint8_t>& resp_payload) {
-    int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
-    if (fd < 0) return false;
-
-    sockaddr_un addr{};
-    addr.sun_family = AF_UNIX;
-    std::snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", socket_path_.c_str());
-
-    if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
-        ::close(fd);
-        return false;
-    }
-
-    if (!writeExact(fd, &hdr, sizeof(hdr))) {
-        ::close(fd);
-        return false;
-    }
-    if (payload_bytes > 0 && payload != nullptr) {
-        if (!writeExact(fd, payload, payload_bytes)) {
-            ::close(fd);
-            return false;
-        }
-    }
-
-    if (!readExact(fd, &resp, sizeof(resp))) {
-        ::close(fd);
-        return false;
-    }
-
-    resp_payload.resize(resp.payload_bytes);
-    if (resp.payload_bytes > 0) {
-        if (!readExact(fd, resp_payload.data(), resp_payload.size())) {
-            ::close(fd);
-            return false;
-        }
-    }
-
-    ::close(fd);
-    return resp.magic == kMagic && resp.version == kVersion;
+void NvmeServiceClient::applyDeadline(grpc::ClientContext& context) const {
+    auto deadline = std::chrono::system_clock::now() + std::chrono::milliseconds(kDefaultRpcTimeoutMs);
+    context.set_deadline(deadline);
 }
 
 bool NvmeServiceClient::ping() {
-    MsgHeader hdr{};
-    hdr.magic = kMagic;
-    hdr.version = kVersion;
-    hdr.role = static_cast<uint16_t>(Role::Filesystem);
-    hdr.command = static_cast<uint16_t>(Command::Ping);
-    hdr.request_id = 1;
-    hdr.payload_bytes = 0;
+    grpc::ClientContext context;
+    applyDeadline(context);
 
-    RespHeader resp{};
-    std::vector<uint8_t> payload;
-    if (!request(hdr, nullptr, 0, resp, payload)) return false;
-    return resp.status == static_cast<uint16_t>(Status::Ok);
+    rpc::PingReq req;
+    rpc::PingResp resp;
+    grpc::Status status = stub_->Ping(&context, req, &resp);
+    return status.ok() && resp.status() == rpc::Status::STATUS_OK;
 }
 
 bool NvmeServiceClient::getInfo(std::string& mount_base_path, std::vector<CtrlConfig>& ctrls, uint32_t& max_queues_per_process) {
-    MsgHeader hdr{};
-    hdr.magic = kMagic;
-    hdr.version = kVersion;
-    hdr.role = static_cast<uint16_t>(Role::Filesystem);
-    hdr.command = static_cast<uint16_t>(Command::FsGetInfo);
-    hdr.request_id = 2;
-    hdr.payload_bytes = 0;
+    grpc::ClientContext context;
+    applyDeadline(context);
 
-    RespHeader resp{};
-    std::vector<uint8_t> payload;
-    if (!request(hdr, nullptr, 0, resp, payload)) return false;
-    if (resp.status != static_cast<uint16_t>(Status::Ok)) return false;
-    if (payload.size() < sizeof(FsGetInfoResp)) return false;
-
-    FsGetInfoResp info{};
-    std::memcpy(&info, payload.data(), sizeof(info));
-    mount_base_path = info.mount_base_path;
-    max_queues_per_process = info.max_queues_per_process;
-
-    size_t expected = sizeof(FsGetInfoResp) + info.ctrl_count * sizeof(CtrlConfig);
-    if (payload.size() < expected) return false;
-
-    ctrls.resize(info.ctrl_count);
-    if (info.ctrl_count > 0) {
-        std::memcpy(ctrls.data(), payload.data() + sizeof(FsGetInfoResp), info.ctrl_count * sizeof(CtrlConfig));
+    rpc::FsGetInfoReq req;
+    rpc::FsGetInfoResp resp;
+    grpc::Status status = stub_->FsGetInfo(&context, req, &resp);
+    if (!status.ok() || resp.status() != rpc::Status::STATUS_OK) {
+        return false;
     }
+
+    mount_base_path = resp.mount_base_path();
+    max_queues_per_process = resp.max_queues_per_process();
+    ctrls.clear();
+    ctrls.reserve(static_cast<size_t>(resp.ctrls_size()));
+    for (const auto& ctrl : resp.ctrls()) {
+        CtrlConfig cfg{};
+        std::snprintf(cfg.mount_path, sizeof(cfg.mount_path), "%s", ctrl.mount_path().c_str());
+        std::snprintf(cfg.pci_addr, sizeof(cfg.pci_addr), "%s", ctrl.pci_addr().c_str());
+        cfg.ns_id = ctrl.ns_id();
+        cfg.queue_depth = ctrl.queue_depth();
+        cfg.num_queues = ctrl.num_queues();
+        cfg.cuda_device = ctrl.cuda_device();
+        cfg.max_io_kb = ctrl.max_io_kb();
+        ctrls.push_back(cfg);
+    }
+
     return true;
+}
+
+bool NvmeServiceClient::shutdown() {
+    grpc::ClientContext context;
+    applyDeadline(context);
+
+    rpc::ShutdownReq req;
+    rpc::ShutdownResp resp;
+    grpc::Status status = stub_->Shutdown(&context, req, &resp);
+    return status.ok() && resp.status() == rpc::Status::STATUS_OK;
+}
+
+bool NvmeServiceClient::allocQueues(uint32_t controller_index,
+                                    uint32_t requested,
+                                    int32_t pid,
+                                    std::vector<uint32_t>& qids,
+                                    std::string& d_qps_handle,
+                                    std::string& d_ctrl_handle) {
+    grpc::ClientContext context;
+    applyDeadline(context);
+
+    rpc::FsAllocQueuesReq req;
+    req.set_controller_index(controller_index);
+    req.set_queue_count(normalizeQueueRequest(requested));
+    req.set_pid(pid);
+
+    rpc::FsAllocQueuesResp resp;
+    grpc::Status status = stub_->FsAllocQueues(&context, req, &resp);
+    if (!status.ok() || resp.status() != rpc::Status::STATUS_OK) {
+        return false;
+    }
+
+    qids.clear();
+    qids.reserve(static_cast<size_t>(resp.qids_size()));
+    for (int i = 0; i < resp.qids_size(); ++i) {
+        qids.push_back(resp.qids(i));
+    }
+    d_qps_handle = resp.d_qps_handle();
+    d_ctrl_handle = resp.d_ctrl_handle();
+    return true;
+}
+
+bool NvmeServiceClient::releaseQueues(uint32_t controller_index, int32_t pid, const std::vector<uint32_t>& qids) {
+    grpc::ClientContext context;
+    applyDeadline(context);
+
+    rpc::FsReleaseQueuesReq req;
+    req.set_controller_index(controller_index);
+    req.set_pid(pid);
+    for (uint32_t qid : qids) {
+        req.add_qids(qid);
+    }
+
+    rpc::FsReleaseQueuesResp resp;
+    grpc::Status status = stub_->FsReleaseQueues(&context, req, &resp);
+    return status.ok() && resp.status() == rpc::Status::STATUS_OK;
 }
 
 } // namespace nvmeservice

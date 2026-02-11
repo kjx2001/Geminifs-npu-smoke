@@ -41,19 +41,18 @@ bool optionalUint32(const YAML::Node& node, const char* key, uint32_t& out) {
     return true;
 }
 
-bool parseSocket(const YAML::Node& root, ParsedConfigAll& out, std::string* error_message) {
-    if (!root["socket"]) {
+bool parseGrpc(const YAML::Node& root, ParsedConfigAll& out, std::string* error_message) {
+    if (!root["grpc"]) {
         if (error_message) {
-            *error_message = "Missing socket section";
+            *error_message = "Missing grpc section";
         }
         return false;
     }
 
-    const auto socket = root["socket"];
-    out.socket_enabled = true;
-    out.socket_path = socket["path"] ? socket["path"].as<std::string>() : kDefaultSocketPath;
-    out.max_queues_per_process = socket["max_queues_per_process"]
-        ? socket["max_queues_per_process"].as<uint32_t>()
+    const auto grpc = root["grpc"];
+    out.grpc_endpoint = grpc["endpoint"] ? grpc["endpoint"].as<std::string>() : kDefaultGrpcEndpoint;
+    out.max_queues_per_process = grpc["max_queues_per_process"]
+        ? grpc["max_queues_per_process"].as<uint32_t>()
         : kDefaultMaxQueuesPerProcess;
     return true;
 }
@@ -170,7 +169,7 @@ bool parseSysConfig(const std::string& path, ParsedConfigAll& out, std::string* 
         return false;
     }
 
-    if (!parseSocket(root, out, error_message)) {
+    if (!parseGrpc(root, out, error_message)) {
         return false;
     }
 

@@ -1,0 +1,88 @@
+syntax = "proto3";
+
+package nvmeservice.rpc;
+
+enum Status {
+  STATUS_OK = 0;
+  STATUS_INVALID = 1;
+  STATUS_DENIED = 2;
+  STATUS_ERROR = 3;
+}
+
+message PingReq {}
+
+message PingResp {
+  Status status = 1;
+}
+
+message CtrlConfig {
+  string mount_path = 1;
+  string pci_addr = 2;
+  uint32 ns_id = 3;
+  uint32 queue_depth = 4;
+  uint32 num_queues = 5;
+  uint32 cuda_device = 6;
+  uint32 max_io_kb = 7;
+}
+
+message FsGetInfoReq {}
+
+message FsGetInfoResp {
+  Status status = 1;
+  string mount_base_path = 2;
+  uint32 max_queues_per_process = 3;
+  repeated CtrlConfig ctrls = 4;
+}
+
+message FsAllocQueuesReq {
+  uint32 controller_index = 1;
+  uint32 queue_count = 2;
+  int32 pid = 3;
+  uint64 client_id = 4;
+}
+
+message FsAllocQueuesResp {
+  Status status = 1;
+  uint32 granted = 2;
+  repeated uint32 qids = 3;
+  bytes d_qps_handle = 4;
+  bytes d_ctrl_handle = 5;
+  uint64 lease_id = 6;
+  uint32 ttl_ms = 7;
+}
+
+message FsReleaseQueuesReq {
+  uint32 controller_index = 1;
+  int32 pid = 2;
+  repeated uint32 qids = 3;
+}
+
+message FsReleaseQueuesResp {
+  Status status = 1;
+}
+
+message ShutdownReq {}
+
+message ShutdownResp {
+  Status status = 1;
+}
+
+message LeaseHeartbeatReq {
+  uint64 lease_id = 1;
+  uint64 client_id = 2;
+}
+
+message LeaseHeartbeatResp {
+  Status status = 1;
+  uint64 lease_id = 2;
+  uint32 ttl_ms = 3;
+}
+
+service NvmeService {
+  rpc Ping(PingReq) returns (PingResp);
+  rpc FsGetInfo(FsGetInfoReq) returns (FsGetInfoResp);
+  rpc FsAllocQueues(FsAllocQueuesReq) returns (FsAllocQueuesResp);
+  rpc FsReleaseQueues(FsReleaseQueuesReq) returns (FsReleaseQueuesResp);
+  rpc Shutdown(ShutdownReq) returns (ShutdownResp);
+  rpc LeaseHeartbeat(stream LeaseHeartbeatReq) returns (stream LeaseHeartbeatResp);
+}
