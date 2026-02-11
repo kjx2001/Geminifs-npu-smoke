@@ -1,5 +1,5 @@
-socket:
-  path: "/var/run/nvmeservice.sock"
+grpc:
+  endpoint: "127.0.0.1:50051"
   max_queues_per_process: 64
 
 gpus:

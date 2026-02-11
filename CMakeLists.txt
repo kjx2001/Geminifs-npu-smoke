@@ -235,9 +235,51 @@ install (TARGETS libgeminifs DESTINATION "lib")
 set (nvmeservice_root "${PROJECT_SOURCE_DIR}/backends/local/NVMeService")
 file (GLOB nvmeservice_sources "${nvmeservice_root}/src/*.cpp" "${nvmeservice_root}/src/*.cu")
 
-add_library(nvmeservice ${nvmeservice_sources})
-target_include_directories(nvmeservice PUBLIC "${nvmeservice_root}/src")
+set(Protobuf_PROTOC_EXECUTABLE "/usr/bin/protoc" CACHE FILEPATH "System protoc" FORCE)
+if (EXISTS "/usr/include/google/protobuf")
+    set(Protobuf_INCLUDE_DIR "/usr/include" CACHE PATH "System protobuf include" FORCE)
+    set(Protobuf_INCLUDE_DIRS "/usr/include" CACHE PATH "System protobuf includes" FORCE)
+endif ()
+if (EXISTS "/usr/lib/x86_64-linux-gnu/libprotobuf.so")
+    set(Protobuf_LIBRARY "/usr/lib/x86_64-linux-gnu/libprotobuf.so" CACHE FILEPATH "System protobuf lib" FORCE)
+elseif (EXISTS "/usr/lib64/libprotobuf.so")
+    set(Protobuf_LIBRARY "/usr/lib64/libprotobuf.so" CACHE FILEPATH "System protobuf lib" FORCE)
+elseif (EXISTS "/usr/lib/libprotobuf.so")
+    set(Protobuf_LIBRARY "/usr/lib/libprotobuf.so" CACHE FILEPATH "System protobuf lib" FORCE)
+endif ()
+
+find_package(Protobuf REQUIRED)
+find_package(gRPC REQUIRED)
+
+set(nvmeservice_proto "${nvmeservice_root}/src/nvmeservice.proto")
+get_target_property(GRPC_CPP_PLUGIN_LOCATION gRPC::grpc_cpp_plugin LOCATION)
+add_custom_command(
+    OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/nvmeservice.pb.cc"
+           "${CMAKE_CURRENT_BINARY_DIR}/nvmeservice.pb.h"
+           "${CMAKE_CURRENT_BINARY_DIR}/nvmeservice.grpc.pb.cc"
+           "${CMAKE_CURRENT_BINARY_DIR}/nvmeservice.grpc.pb.h"
+    COMMAND "${Protobuf_PROTOC_EXECUTABLE}"
+    ARGS --cpp_out "${CMAKE_CURRENT_BINARY_DIR}"
+         --grpc_out "${CMAKE_CURRENT_BINARY_DIR}"
+         -I "${nvmeservice_root}/src"
+         --plugin=protoc-gen-grpc="${GRPC_CPP_PLUGIN_LOCATION}"
+         "${nvmeservice_proto}"
+    DEPENDS "${nvmeservice_proto}"
+)
+
+set(NVMESERVICE_PROTO_SRCS "${CMAKE_CURRENT_BINARY_DIR}/nvmeservice.pb.cc")
+set(NVMESERVICE_PROTO_HDRS "${CMAKE_CURRENT_BINARY_DIR}/nvmeservice.pb.h")
+set(NVMESERVICE_GRPC_SRCS "${CMAKE_CURRENT_BINARY_DIR}/nvmeservice.grpc.pb.cc")
+set(NVMESERVICE_GRPC_HDRS "${CMAKE_CURRENT_BINARY_DIR}/nvmeservice.grpc.pb.h")
+
+add_library(nvmeservice ${nvmeservice_sources} ${NVMESERVICE_PROTO_SRCS} ${NVMESERVICE_GRPC_SRCS})
+target_include_directories(nvmeservice PUBLIC
+    "${nvmeservice_root}/src"
+    "${CMAKE_CURRENT_BINARY_DIR}"
+    "${Protobuf_INCLUDE_DIRS}"
+)
 target_link_libraries(nvmeservice PRIVATE libnvm CUDA::cudart Threads::Threads)
+target_link_libraries(nvmeservice PRIVATE gRPC::grpc++ protobuf::libprotobuf)
 target_link_libraries(nvmeservice PRIVATE yaml-cpp)
 set_target_properties(nvmeservice PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 set_target_properties(nvmeservice PROPERTIES OUTPUT_NAME "nvmeservice")
