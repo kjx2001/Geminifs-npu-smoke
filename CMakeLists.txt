@@ -85,7 +85,7 @@ set (CUDA_NVCC_FLAGS_DEBUG "${CMAKE_NVCC_FLAGS_DEBUG} -DDEBUG" CACHE INTERNAL ""
 set (CUDA_NVCC_FLAGS_RELEASE "${CMAKE_NVCC_FLAGS_RELEASE} -O2" CACHE INTERNAL "" FORCE)
 
 # set (CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xlinker -rpath=${CMAKE_BINARY_DIR}/lib --expt-relaxed-constexpr --expt-extended-lambda  -lcudart ${GPU_ARCHS}")
-set (CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xlinker -rpath=${CMAKE_BINARY_DIR}/lib -rdc=true --expt-relaxed-constexpr --expt-extended-lambda -lineinfo ${GPU_ARCHS}")
+set (CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xlinker -rpath=\\$ORIGIN -Xlinker -rpath=${CMAKE_BINARY_DIR}/lib -rdc=true --expt-relaxed-constexpr --expt-extended-lambda -lineinfo ${GPU_ARCHS}")
 set (CMAKE_CUDA_FLAGS_DEBUG "${CMAKE_CUDA_FLAGS_DEBUG} -G -DDEBUG" CACHE INTERNAL "" FORCE)
 set (CMAKE_CUDA_FLAGS_RELEASE "${CMAKE_CUDA_FLAGS_RELEASE} -O2" CACHE INTERNAL "" FORCE)
 set (CMAKE_CUDA_GEMINIFS_LIBS "${CMAKE_CUDA_GEMINIFS_LIBS} -L${PROJECT_BINARY_DIR}/libgeminifs -L${PROJECT_SOURCE_DIR}/filesystems/ext4/libgeminifs/include/geminifs -L${CMAKE_BINARY_DIR}/lib -lgeminifs -lnvm")
@@ -194,6 +194,7 @@ endif ()
 
 # Set name of library
 set_target_properties (libnvm PROPERTIES OUTPUT_NAME "nvm")
+set_target_properties (libnvm PROPERTIES BUILD_RPATH "$ORIGIN" INSTALL_RPATH "$ORIGIN")
 # Set install locations
 install (FILES ${libnvm_include} DESTINATION "include")
 install (TARGETS libnvm DESTINATION "lib")
@@ -228,6 +229,7 @@ target_link_libraries(libgeminifs
 set_target_properties(libgeminifs PROPERTIES OUTPUT_NAME "geminifs")
 set_target_properties(libgeminifs PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 set_target_properties(libgeminifs PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+set_target_properties(libgeminifs PROPERTIES BUILD_RPATH "$ORIGIN" INSTALL_RPATH "$ORIGIN")
 install (FILES ${libgeminifs_include} DESTINATION "include/geminifs")
 install (TARGETS libgeminifs DESTINATION "lib")
 
