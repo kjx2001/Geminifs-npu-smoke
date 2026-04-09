@@ -27,7 +27,7 @@ The runtime is intended to provide:
 - Both `CPU-side` and `GPU-side` read/write paths
 - A standalone memory subsystem for host/device allocation and registration
 - A backend SPI that can evolve toward `Local NVMe`, `GDS`, `RDMA`, and vendor-specific backends
-- Clear separation between `control plane`, `data plane`, and `memory model`
+- Clear separation between `device manager`, `IO engine`, and `memory model`
 
 `v0.1` explicitly does **not** define `cooperative submit`.
 
@@ -93,18 +93,20 @@ The current codebase does not yet match the `v0.1` target architecture. Main iss
    - Defines runtime object model, request model, error model, lifecycle, and capability queries
    - Must not depend on a concrete backend implementation
 
-4. `Memory Layer`
+4. `Memory Layer` *(independent — parallel to Device Manager)*
    - Manages host/device allocation, registration, deregistration, and region metadata
-   - Owns the memory model used by both the data plane and upper-layer integrations
+   - Owns the memory model used by both the IO engine and upper-layer integrations
+   - Has no dependency on the Device Manager
 
-5. `Control Plane Layer`
+5. `Device Manager Layer` *(independent — parallel to Memory Layer)*
    - Device discovery
    - topology and capability reporting
    - queue/resource lease management
    - process attach metadata
    - health and lifecycle management
+   - Has no dependency on the Memory Layer
 
-6. `Data Plane Layer`
+6. `IO Engine Layer` *(depends on both Memory Layer and Device Manager)*
    - Read/write submission
    - mapping and buffer preparation
    - completion handling
@@ -143,7 +145,7 @@ The system must support two runtime bootstrap paths:
   - `NVMeService` initializes and manages shared controller/queue resources
   - GPU processes attach later without owning low-level initialization
 
-`v0.1` should treat these as deployment modes over the same backend/control-plane model, not as separate architectures.
+`v0.1` should treat these as deployment modes over the same backend/device-manager model, not as separate architectures.
 
 ### Deployment and Compatibility Constraints
 
@@ -287,8 +289,8 @@ GeminiFS/
 ├── api/                # public runtime API definitions
 ├── runtime/            # core runtime objects and orchestration
 ├── memory/             # allocation, registration, region model
-├── control_plane/      # daemon/client/protocol for control plane
-├── data_plane/         # submission, mapping, completion, batching
+├── device_manager/      # daemon/client/protocol for device manager
+├── io_engine/         # submission, mapping, completion, batching
 ├── backends/           # backend SPI and backend implementations
 ├── adapters/           # LMCache, Mooncake, and future integrations
 └── doc/
@@ -311,7 +313,7 @@ Goals:
 Deliverables:
 
 - `v0.1` architecture document in this roadmap
-- stable terminology for runtime, memory, control plane, data plane, and backend SPI
+- stable terminology for runtime, memory, device manager, IO engine, and backend SPI
 - explicit rejection of `cooperative submit` in this version
 - naming transition requirement recorded so future APIs are not forced to retain the `GeminiFS` label
 
@@ -344,21 +346,21 @@ Deliverables:
 - host/device registration APIs
 - clear ownership and teardown semantics
 
-### Phase 3: Split Control Plane and Data Plane
+### Phase 3: Split Device Manager and IO Engine
 
 Goals:
 
-- Move discovery, topology, leases, and shared-resource metadata into the control plane
-- Keep read/write execution in the data plane
+- Move discovery, topology, leases, and shared-resource metadata into the device manager
+- Keep read/write execution in the IO engine
 - Separate service-owned bootstrap and process-owned bootstrap from upper-layer APIs
 
 Deliverables:
 
-- control plane responsibilities and interfaces
-- data plane responsibilities and interfaces
+- device manager responsibilities and interfaces
+- IO engine responsibilities and interfaces
 - runtime bootstrap mode definition
 - attach/init boundary for GPU process and `NVMeService`
-- explicit attach path between control plane and data plane
+- explicit attach path between device manager and IO engine
 
 ### Phase 4: Introduce Backend SPI
 
@@ -367,12 +369,14 @@ Goals:
 - Make backend replacement and extension possible without rewriting upper layers
 - Ensure future `RDMA` and `GDS` work is additive rather than invasive
 
+Design contract: [`doc/design/backend-spi.md`](doc/design/backend-spi.md)
+
 Deliverables:
 
-- backend factory interface
-- control plane provider interface
-- data plane provider interface
-- memory registration/provider hooks
+- `IBackendProvider` interface (`prepare_descriptors`, `acquire_queue`, `release_queue`, `launch_io_kernel`)
+- `BufferDescriptor` tagged union (NVMe + RDMA placeholder)
+- `BackendRegistry` wiring
+- `local_nvme` refactored to implement `IBackendProvider`
 
 ### Phase 5: Land the First Reference Backend
 

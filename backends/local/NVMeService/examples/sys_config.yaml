@@ -1,0 +1,23 @@
+grpc:
+  endpoint: "127.0.0.1:50051"
+  max_queues_per_process: 64
+
+gpus:
+  - id: 1
+    mount_path: "/mnt/nvme_layer"
+
+nvmes:
+  - mount_path: "nvme1"
+    pci_addr: "0000:41:00.0"
+    ns_id: 1
+    queueDepth: 1024
+    numQueues: 128
+    gpu_id: 1
+    maxIOsize: 1024
+  - mount_path: "nvme2"
+    pci_addr: "0000:42:00.0"
+    ns_id: 1
+    queueDepth: 1024
+    numQueues: 128
+    gpu_id: 1
+    maxIOsize: 1024

@@ -17,7 +17,7 @@ Use [`Roadmap.md`](Roadmap.md) for versioned architecture and roadmap planning.
 - [ ] Finalize the `v0.1` top-level public API boundaries
 - [ ] Define the core runtime object model
 - [ ] Define the standalone memory subsystem API
-- [ ] Define the control plane and data plane boundary
+- [ ] Define the device manager and IO engine boundary
 - [ ] Define the backend SPI for the first `local_nvme` backend
 - [ ] Define how `LMCache` and `Mooncake` adapters will attach to the runtime
 - [ ] Unify the configuration strategy and remove split config semantics over time

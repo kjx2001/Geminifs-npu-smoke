@@ -46,7 +46,7 @@ If you are changing architecture, interfaces, deployment flow, or naming, you mu
 
 ### Layering
 
-- Do not mix `control plane`, `data plane`, `memory`, and `backend` concerns in one new interface
+- Do not mix `device manager`, `IO engine`, `memory`, and `backend` concerns in one new interface
 - Do not expose backend-private implementation types through future public runtime APIs
 - Do not bind core abstractions to the current file-based implementation model
 - Do not introduce new top-level abstractions that permanently hardcode the `GeminiFS` name unless maintainers explicitly choose that path
@@ -104,7 +104,7 @@ Open a design discussion before landing major changes to:
 - public API shape
 - directory structure
 - backend SPI
-- control-plane/data-plane boundary
+- device-manager/io-engine boundary
 - memory model
 - config format
 - wire protocol
@@ -138,7 +138,7 @@ When applicable, include or describe validation for:
 - concurrency behavior
 - deployment impact
 - config compatibility
-- control-plane/data-plane interaction
+- device-manager/io-engine interaction
 
 If tests are not added, state the reason in the commit or review notes.
 
@@ -205,8 +205,8 @@ Rules:
 - `api`
 - `runtime`
 - `memory`
-- `control_plane`
-- `data_plane`
+- `device_manager`
+- `io_engine`
 - `backend/local_nvme`
 - `kernel`
 - `nvmeservice`
@@ -225,7 +225,7 @@ docs(repo): define contribution and commit rules
 refactor(memory): separate registration from allocation semantics
 fix(nvmeservice): validate queue lease release on expired client
 feat(api): add runtime capability query skeleton
-test(data_plane): cover cpu submit request validation
+test(io_engine): cover cpu submit request validation
 build(kernel): document module install prerequisites
 ```
 

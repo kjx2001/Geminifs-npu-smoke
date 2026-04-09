@@ -16,13 +16,13 @@ This repository currently contains:
 
 - the existing storage/runtime implementation
 - a modified local NVMe stack, including kernel-module changes
-- an `NVMeService` control-plane prototype
+- an `NVMeService` device-manager prototype
 - architecture and refactor planning documents for `v0.1`
 
 The repository is in a transition stage:
 
 - current code layout reflects historical implementation boundaries
-- target architecture is being redefined around `api`, `runtime`, `memory`, `control_plane`, `data_plane`, `backends`, and `adapters`
+- target architecture is being redefined around `api`, `runtime`, `memory`, `device_manager`, `io_engine`, `backends`, and `adapters`
 - interface and directory changes should be discussed before major code movement
 
 ## Start Here
@@ -46,8 +46,73 @@ If you are a new contributor or another AI agent, read these files first:
 
 After that, read the implementation-specific documents relevant to your area:
 
+- [`doc/design/backend-spi.md`](doc/design/backend-spi.md)
+  Backend SPI contract — read this before implementing any new storage backend.
+
+- [`doc/architecture/system-architecture.md`](doc/architecture/system-architecture.md)
+  Full system architecture with component diagrams and data flow.
+
 - [`backends/local/NVMeService/NVMeService.md`](backends/local/NVMeService/NVMeService.md)
 - [`filesystems/ext4/README.md`](filesystems/ext4/README.md)
+
+## Knowledge Keywords
+
+These keywords help human contributors and AI agents search and understand the codebase faster.
+
+### Domain Keywords
+
+- `NVMe Specification`
+- `PCIe`
+- `NVMe queue`
+- `submission queue`
+- `completion queue`
+- `queue pair`
+- `doorbell`
+- `PRP`
+- `DMA`
+- `pinned memory`
+- `CUDA`
+- `CUDA IPC`
+- `GPU Direct Storage`
+- `GDS`
+- `RDMA`
+- `Linux kernel module`
+- `DKMS`
+- `systemd`
+- `EXT4 file system`
+- `FIEMAP`
+- `LMCache`
+- `Mooncake`
+- `device manager`
+- `IO engine`
+- `memory registration`
+- `Unified Storage Runtime`
+
+### Code Search Keywords
+
+- `GeminiFS::init`
+- `parse_and_setup_controllers`
+- `GPUController`
+- `NVMeController`
+- `GPUFileManager`
+- `GPUMemoryMapper`
+- `FsAllocQueues`
+- `FsReleaseQueues`
+- `LeaseHeartbeat`
+- `Controller::init_queues`
+- `d_qps`
+- `d_ctrl_ptr`
+- `d_queue_acquire_helper`
+
+### Search Strategy
+
+When modifying or reviewing code, it is usually best to search in this order:
+
+1. the architecture and roadmap terms in [`Roadmap.md`](Roadmap.md)
+2. the subsystem documents
+3. the exact code identifiers above
+4. the local backend implementation under [`backends/local/`](backends/local/)
+5. the current monolithic path under [`filesystems/ext4/libgeminifs`](filesystems/ext4/libgeminifs)
 
 ## Repository Map
 
@@ -62,7 +127,7 @@ This is the current repository structure as it exists today.
   Modified Linux NVMe kernel-module lineage used to support CPU/GPU access to NVMe queue resources.
 
 - [`backends/local/NVMeService`](backends/local/NVMeService)
-  Local control-plane prototype for controller initialization, queue leasing, and process attach flow.
+  Local device-manager prototype for controller initialization, queue leasing, and process attach flow.
 
 - [`filesystems/ext4/libgeminifs`](filesystems/ext4/libgeminifs)
   Current monolithic implementation area. This is where GPU controller logic, NVMe controller logic, memory mapping, and GPU file management are currently mixed together.
