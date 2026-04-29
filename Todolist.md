@@ -26,6 +26,36 @@ Use [`Roadmap.md`](Roadmap.md) for versioned architecture and roadmap planning.
 - [ ] Define startup ordering for kernel module, service, and runtime attach flow
 - [ ] Add AI-consumable architecture docs under `doc/`
 
+## NVMeService Rewrite — Remaining Work
+
+Control-plane code, state, server, client, and `libnvm` shared-resource
+reconstruction are in place. Outstanding items to make it buildable and
+runnable end-to-end:
+
+- [ ] `backends/local/NVMeService/examples/nvmeservice_daemon.cpp` — daemon
+      entry point (parse `sys_config.yaml`, construct `ServiceState`,
+      start gRPC server, start reaper, wait for SIGINT)
+- [ ] `backends/local/NVMeService/examples/nvmeservice_client.cpp` — smoke
+      test that connects, lists devices, allocates, sleeps, releases
+- [ ] `backends/local/NVMeService/examples/sys_config.yaml` — example config
+      matching the new YAML schema (grpc / gpus / nvmes / queue_pool / lease)
+- [ ] `backends/local/NVMeService/examples/CMakeLists.txt` — build the two
+      example executables against the new `nvmeservice` library
+- [ ] Update root `CMakeLists.txt` NVMeService section: compile new file
+      layout (`nvmeservice_config.cpp`, `nvmeservice_state.cu`,
+      `nvmeservice_server.cpp`, `nvmeservice_client.cpp`) and the new
+      `backends/local/nvme/libnvm/src/shared_ctrl.cu`; add
+      `add_subdirectory(backends/local/NVMeService/examples)`
+- [ ] Add `BlockDeviceManager` second constructor that takes a
+      `std::shared_ptr<Controller>` plus mount path (skips own controller
+      init so it can consume a shared Controller from NVMeService)
+- [ ] Verify CUDA IPC works for PRP memory; if not, wire client-side PRP
+      allocation fallback (the server already honours `has_prp=false`)
+- [ ] Verify `cudaHostRegister(BAR0, cudaHostRegisterIoMemory)` works in a
+      non-daemon process (same SNVMe device was already mmapped by daemon)
+- [ ] End-to-end smoke: daemon + one client, run a trivial read/write via
+      `BlockDeviceManager` built on the shared `Controller`
+
 ## Discussion Required Before Major Refactor
 
 - [ ] Decide the future runtime/product name that may replace `GeminiFS`

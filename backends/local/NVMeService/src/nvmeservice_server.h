@@ -1,56 +1,45 @@
-#pragma once
+#ifndef __NVMESERVICE_SERVER_H__
+#define __NVMESERVICE_SERVER_H__
 
-#include <atomic>
-#include <chrono>
+/**
+ * nvmeservice_server.h -- gRPC service implementation.
+ *
+ * Thin translation layer: converts between proto messages and the
+ * protobuf-free ServiceState API. All mutable state lives in ServiceState.
+ */
+
 #include <memory>
-#include <mutex>
-#include <thread>
-#include <unordered_map>
-#include <string>
 
-#include <grpcpp/server.h>
+#include <grpcpp/grpcpp.h>
+#include "nvmeservice.grpc.pb.h"
 
 #include "nvmeservice_state.h"
 
 namespace nvmeservice {
 
-class NvmeServiceServer {
+class NvmeServiceImpl final : public NvmeService::Service {
 public:
-    explicit NvmeServiceServer(std::string grpc_endpoint);
+    explicit NvmeServiceImpl(std::shared_ptr<ServiceState> state);
 
-    bool serve(ServiceState& state);
-    void requestStop();
-    uint32_t leaseTtlMs() const;
-    uint64_t createLease(uint32_t controller_index,
-                         int32_t pid,
-                         uint64_t client_id,
-                         const std::vector<uint32_t>& qids);
-    bool renewLease(uint64_t lease_id, uint64_t client_id);
-    bool releaseLease(uint64_t lease_id);
-    size_t releaseLeasesByClient(uint64_t client_id);
+    grpc::Status ListDevices(grpc::ServerContext* ctx,
+                              const Empty* request,
+                              DeviceListResponse* response) override;
+
+    grpc::Status AllocateQueues(grpc::ServerContext* ctx,
+                                 const AllocRequest* request,
+                                 AllocResponse* response) override;
+
+    grpc::Status ReleaseQueues(grpc::ServerContext* ctx,
+                                const ReleaseRequest* request,
+                                ReleaseResponse* response) override;
+
+    grpc::Status Heartbeat(grpc::ServerContext* ctx,
+                            grpc::ServerReaderWriter<HeartbeatMsg, HeartbeatMsg>* stream) override;
 
 private:
-    struct LeaseInfo {
-        uint32_t controller_index = 0;
-        int32_t pid = 0;
-        uint64_t client_id = 0;
-        std::vector<uint32_t> qids;
-        std::chrono::steady_clock::time_point expires_at;
-    };
-
-    void leaseReaperLoop();
-    void releaseExpiredLeases();
-
-    std::string grpc_endpoint_;
-    std::atomic<bool> running_{false};
-    std::mutex server_mutex_;
-    std::unique_ptr<grpc::Server> server_;
-    std::atomic<uint64_t> lease_counter_{1};
-    std::chrono::milliseconds lease_ttl_{5000};
-    std::mutex leases_mutex_;
-    std::unordered_map<uint64_t, LeaseInfo> leases_;
-    ServiceState* state_ = nullptr;
-    std::thread lease_reaper_;
+    std::shared_ptr<ServiceState> state_;
 };
 
 } // namespace nvmeservice
+
+#endif // __NVMESERVICE_SERVER_H__

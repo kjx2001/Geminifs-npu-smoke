@@ -1,324 +1,161 @@
 #include "nvmeservice_server.h"
 
-#include "nvmeservice.grpc.pb.h"
-
-#include <grpcpp/grpcpp.h>
-
-#include "ctrl.h"
-
-#include <cuda_runtime.h>
-
-#include <vector>
-
-#include <chrono>
-#include <string>
-#include <thread>
+#include <cstring>
 
 namespace nvmeservice {
 
 namespace {
 
-namespace rpc = nvmeservice::rpc;
-
-constexpr uint32_t kQueueRequestAlign = 16;
-constexpr uint32_t kDefaultQueueRequest = 32;
-constexpr int kMaxGrpcMessageBytes = 4 * 1024 * 1024;
-constexpr uint32_t kDefaultLeaseTtlMs = 5000;
-
-uint32_t normalizeQueueRequest(uint32_t requested, uint32_t max_allowed) {
-    uint32_t count = requested == 0 ? kDefaultQueueRequest : requested;
-    if (count % kQueueRequestAlign != 0) {
-        count = ((count + kQueueRequestAlign - 1) / kQueueRequestAlign) * kQueueRequestAlign;
-    }
-    if (max_allowed > 0 && count > max_allowed) {
-        count = (max_allowed / kQueueRequestAlign) * kQueueRequestAlign;
-        if (count == 0) {
-            count = kQueueRequestAlign;
-        }
-    }
-    return count;
+// Copy a cudaIpcMemHandle_t (64 raw bytes) into a proto bytes field.
+inline void set_ipc_bytes(std::string* dst, const cudaIpcMemHandle_t& h) {
+    dst->assign(reinterpret_cast<const char*>(&h), sizeof(cudaIpcMemHandle_t));
 }
-
-class NvmeServiceImpl final : public rpc::NvmeService::Service {
-public:
-    NvmeServiceImpl(ServiceState& state, NvmeServiceServer& owner)
-        : state_(state), owner_(owner) {}
-
-    grpc::Status Ping(grpc::ServerContext*, const rpc::PingReq*, rpc::PingResp* resp) override {
-        resp->set_status(rpc::Status::STATUS_OK);
-        return grpc::Status::OK;
-    }
-
-    grpc::Status FsGetInfo(grpc::ServerContext*, const rpc::FsGetInfoReq*, rpc::FsGetInfoResp* resp) override {
-        resp->set_status(rpc::Status::STATUS_OK);
-        resp->set_mount_base_path(state_.mount_base_path);
-        resp->set_max_queues_per_process(state_.max_queues_per_process);
-
-        for (const auto& entry : state_.controllers) {
-            auto* ctrl = resp->add_ctrls();
-            ctrl->set_mount_path(entry.config.mount_path);
-            ctrl->set_pci_addr(entry.config.pci_addr);
-            ctrl->set_ns_id(entry.config.ns_id);
-            ctrl->set_queue_depth(entry.config.queue_depth);
-            ctrl->set_num_queues(entry.config.num_queues);
-            ctrl->set_cuda_device(entry.config.cuda_device);
-            ctrl->set_max_io_kb(entry.config.max_io_kb);
-        }
-
-        return grpc::Status::OK;
-    }
-
-    grpc::Status FsAllocQueues(grpc::ServerContext*, const rpc::FsAllocQueuesReq* req, rpc::FsAllocQueuesResp* resp) override {
-        const uint32_t controller_index = req->controller_index();
-        const uint32_t requested = req->queue_count();
-        const int32_t pid = req->pid();
-        const uint64_t client_id = req->client_id();
-
-        uint32_t count = normalizeQueueRequest(requested, state_.max_queues_per_process);
-        std::vector<uint32_t> qids;
-        if (!state_.allocQueues(controller_index, count, pid, qids)) {
-            resp->set_status(rpc::Status::STATUS_DENIED);
-            resp->set_granted(0);
-            return grpc::Status::OK;
-        }
-
-        resp->set_status(rpc::Status::STATUS_OK);
-        resp->set_granted(static_cast<uint32_t>(qids.size()));
-        for (uint32_t qid : qids) {
-            resp->add_qids(qid);
-        }
-
-        const uint64_t lease_id = owner_.createLease(controller_index, pid, client_id, qids);
-        resp->set_lease_id(lease_id);
-        resp->set_ttl_ms(owner_.leaseTtlMs());
-
-        if (controller_index < state_.controllers.size()) {
-            const auto& entry = state_.controllers[controller_index];
-            if (!entry.controller) {
-                return grpc::Status::OK;
-            }
-            cudaIpcMemHandle_t d_qps_handle{};
-            cudaIpcMemHandle_t d_ctrl_handle{};
-
-            cudaError_t qps_status = cudaIpcGetMemHandle(&d_qps_handle, entry.controller->d_qps);
-            cudaError_t ctrl_status = cudaIpcGetMemHandle(&d_ctrl_handle, entry.controller->d_ctrl_ptr);
-
-            if (qps_status == cudaSuccess) {
-                resp->set_d_qps_handle(std::string(reinterpret_cast<const char*>(&d_qps_handle), sizeof(d_qps_handle)));
-            }
-            if (ctrl_status == cudaSuccess) {
-                resp->set_d_ctrl_handle(std::string(reinterpret_cast<const char*>(&d_ctrl_handle), sizeof(d_ctrl_handle)));
-            }
-        }
-        return grpc::Status::OK;
-    }
-
-    grpc::Status FsReleaseQueues(grpc::ServerContext*, const rpc::FsReleaseQueuesReq* req, rpc::FsReleaseQueuesResp* resp) override {
-        const uint32_t controller_index = req->controller_index();
-        const int32_t pid = req->pid();
-        const uint64_t lease_id = req->lease_id();
-
-        if (lease_id != 0) {
-            if (!owner_.releaseLease(lease_id)) {
-                resp->set_status(rpc::Status::STATUS_DENIED);
-                return grpc::Status::OK;
-            }
-            resp->set_status(rpc::Status::STATUS_OK);
-            return grpc::Status::OK;
-        }
-
-        std::vector<uint32_t> qids;
-        qids.reserve(static_cast<size_t>(req->qids_size()));
-        for (int i = 0; i < req->qids_size(); ++i) {
-            qids.push_back(req->qids(i));
-        }
-
-        if (!state_.releaseQueues(controller_index, pid, qids)) {
-            resp->set_status(rpc::Status::STATUS_DENIED);
-            return grpc::Status::OK;
-        }
-
-        resp->set_status(rpc::Status::STATUS_OK);
-        return grpc::Status::OK;
-    }
-
-    grpc::Status Shutdown(grpc::ServerContext*, const rpc::ShutdownReq*, rpc::ShutdownResp* resp) override {
-        resp->set_status(rpc::Status::STATUS_OK);
-        owner_.requestStop();
-        return grpc::Status::OK;
-    }
-
-    grpc::Status LeaseHeartbeat(grpc::ServerContext*,
-                                grpc::ServerReaderWriter<rpc::LeaseHeartbeatResp, rpc::LeaseHeartbeatReq>* stream) override {
-        rpc::LeaseHeartbeatReq req;
-        uint64_t client_id = 0;
-
-        while (stream->Read(&req)) {
-            if (client_id == 0) {
-                client_id = req.client_id();
-            }
-            rpc::LeaseHeartbeatResp resp;
-            resp.set_lease_id(req.lease_id());
-            resp.set_ttl_ms(owner_.leaseTtlMs());
-
-            if (req.lease_id() == 0 || req.client_id() == 0) {
-                resp.set_status(rpc::Status::STATUS_INVALID);
-            } else if (owner_.renewLease(req.lease_id(), req.client_id())) {
-                resp.set_status(rpc::Status::STATUS_OK);
-            } else {
-                resp.set_status(rpc::Status::STATUS_DENIED);
-            }
-
-            if (!stream->Write(resp)) {
-                break;
-            }
-        }
-
-        if (client_id != 0) {
-            owner_.releaseLeasesByClient(client_id);
-        }
-        return grpc::Status::OK;
-    }
-
-private:
-    ServiceState& state_;
-    NvmeServiceServer& owner_;
-};
 
 } // namespace
 
-NvmeServiceServer::NvmeServiceServer(std::string grpc_endpoint)
-    : grpc_endpoint_(std::move(grpc_endpoint)), lease_ttl_(kDefaultLeaseTtlMs) {}
+NvmeServiceImpl::NvmeServiceImpl(std::shared_ptr<ServiceState> state)
+    : state_(std::move(state)) {}
 
-void NvmeServiceServer::requestStop() {
-    running_.store(false, std::memory_order_release);
-    std::lock_guard<std::mutex> lock(server_mutex_);
-    if (server_) {
-        server_->Shutdown();
-    }
-}
+// ---------------------------------------------------------------------------
+// ListDevices
+// ---------------------------------------------------------------------------
 
-uint32_t NvmeServiceServer::leaseTtlMs() const {
-    return static_cast<uint32_t>(lease_ttl_.count());
-}
-
-uint64_t NvmeServiceServer::createLease(uint32_t controller_index,
-                                        int32_t pid,
-                                        uint64_t client_id,
-                                        const std::vector<uint32_t>& qids) {
-    uint64_t lease_id = lease_counter_.fetch_add(1, std::memory_order_relaxed);
-    LeaseInfo info;
-    info.controller_index = controller_index;
-    info.pid = pid;
-    info.client_id = client_id;
-    info.qids = qids;
-    info.expires_at = std::chrono::steady_clock::now() + lease_ttl_;
-
-    std::lock_guard<std::mutex> lock(leases_mutex_);
-    leases_[lease_id] = std::move(info);
-    return lease_id;
-}
-
-bool NvmeServiceServer::renewLease(uint64_t lease_id, uint64_t client_id) {
-    std::lock_guard<std::mutex> lock(leases_mutex_);
-    auto it = leases_.find(lease_id);
-    if (it == leases_.end() || it->second.client_id != client_id) {
-        return false;
-    }
-    it->second.expires_at = std::chrono::steady_clock::now() + lease_ttl_;
-    return true;
-}
-
-bool NvmeServiceServer::releaseLease(uint64_t lease_id) {
-    LeaseInfo info;
-    {
-        std::lock_guard<std::mutex> lock(leases_mutex_);
-        auto it = leases_.find(lease_id);
-        if (it == leases_.end()) {
-            return false;
-        }
-        info = std::move(it->second);
-        leases_.erase(it);
-    }
-
-    if (!state_) {
-        return false;
-    }
-    return state_->releaseQueues(info.controller_index, info.pid, info.qids);
-}
-
-size_t NvmeServiceServer::releaseLeasesByClient(uint64_t client_id) {
-    std::vector<uint64_t> to_release;
-    {
-        std::lock_guard<std::mutex> lock(leases_mutex_);
-        for (const auto& kv : leases_) {
-            if (kv.second.client_id == client_id) {
-                to_release.push_back(kv.first);
-            }
+grpc::Status NvmeServiceImpl::ListDevices(grpc::ServerContext* /*ctx*/,
+                                           const Empty* /*request*/,
+                                           DeviceListResponse* response) {
+    const auto snaps = state_->list_devices();
+    for (const auto& s : snaps) {
+        DeviceInfo* di = response->add_devices();
+        di->set_device_id(s.device_id);
+        di->set_pci_addr(s.pci_addr);
+        di->set_snvme_dev_path(s.snvme_dev_path);
+        di->set_cuda_device(s.cuda_device);
+        di->set_namespace_id(s.namespace_id);
+        di->set_page_size(s.page_size);
+        di->set_blk_size(s.blk_size);
+        di->set_blk_size_log(s.blk_size_log);
+        di->set_queue_depth(s.queue_depth);
+        di->set_dstrd(s.dstrd);
+        di->set_bar0_size(s.bar0_size);
+        di->set_total_queues(s.total_queues);
+        di->set_available_queues(s.available_queues);
+        for (const auto& g : s.groups) {
+            QueueGroupInfo* qg = di->add_queue_groups();
+            qg->set_cuda_device(g.cuda_device);
+            qg->set_queue_start_idx(g.queue_start_idx);
+            qg->set_queue_count(g.queue_count);
+            qg->set_available(g.available);
         }
     }
-
-    for (uint64_t lease_id : to_release) {
-        releaseLease(lease_id);
-    }
-    return to_release.size();
+    return grpc::Status::OK;
 }
 
-void NvmeServiceServer::releaseExpiredLeases() {
-    std::vector<uint64_t> expired;
-    const auto now = std::chrono::steady_clock::now();
-    {
-        std::lock_guard<std::mutex> lock(leases_mutex_);
-        for (const auto& kv : leases_) {
-            if (kv.second.expires_at <= now) {
-                expired.push_back(kv.first);
-            }
+// ---------------------------------------------------------------------------
+// AllocateQueues
+// ---------------------------------------------------------------------------
+
+grpc::Status NvmeServiceImpl::AllocateQueues(grpc::ServerContext* /*ctx*/,
+                                              const AllocRequest* request,
+                                              AllocResponse* response) {
+    auto result = state_->allocate(request->device_id(),
+                                    request->cuda_device(),
+                                    request->num_queues(),
+                                    request->client_pid());
+
+    if (!result.success) {
+        response->set_error_message(result.error);
+        return grpc::Status::OK;  // report via error_message, not gRPC status
+    }
+
+    const auto& g = result.grant;
+    response->set_allocation_id(g.allocation_id);
+    response->set_pci_addr(g.pci_addr);
+    response->set_snvme_dev_path(g.snvme_dev_path);
+    response->set_bar0_size(g.bar0_size);
+    response->set_dstrd(g.dstrd);
+    response->set_queue_start_idx(g.queue_start_idx);
+    response->set_queue_count(g.queue_count);
+    response->set_namespace_id(g.namespace_id);
+    response->set_page_size(g.page_size);
+    response->set_blk_size(g.blk_size);
+    response->set_blk_size_log(g.blk_size_log);
+    response->set_queue_depth(g.queue_depth);
+    response->set_heartbeat_interval_sec(g.heartbeat_interval_sec);
+    response->set_lease_timeout_sec(g.lease_timeout_sec);
+
+    for (const auto& qs : g.queue_shared) {
+        QueueSharedMem* m = response->add_queue_shared_mem();
+        m->set_queue_id(qs.queue_id);
+
+        std::string sq_bytes;
+        set_ipc_bytes(&sq_bytes, qs.ipc_sq);
+        m->set_ipc_handle_sq(std::move(sq_bytes));
+
+        std::string cq_bytes;
+        set_ipc_bytes(&cq_bytes, qs.ipc_cq);
+        m->set_ipc_handle_cq(std::move(cq_bytes));
+
+        if (qs.has_prp) {
+            std::string prp_bytes;
+            set_ipc_bytes(&prp_bytes, qs.ipc_prp);
+            m->set_ipc_handle_prp(std::move(prp_bytes));
+        }  // else leave empty -> client allocates its own PRP
+
+        m->set_sq_entries(qs.sq_entries);
+        m->set_cq_entries(qs.cq_entries);
+        m->set_sq_ioaddr(qs.sq_ioaddr);
+        m->set_cq_ioaddr(qs.cq_ioaddr);
+    }
+
+    return grpc::Status::OK;
+}
+
+// ---------------------------------------------------------------------------
+// ReleaseQueues
+// ---------------------------------------------------------------------------
+
+grpc::Status NvmeServiceImpl::ReleaseQueues(grpc::ServerContext* /*ctx*/,
+                                             const ReleaseRequest* request,
+                                             ReleaseResponse* response) {
+    std::string err;
+    bool ok = state_->release(request->allocation_id(),
+                               request->client_pid(),
+                               &err);
+    response->set_success(ok);
+    if (!ok) response->set_error_message(err);
+    return grpc::Status::OK;
+}
+
+// ---------------------------------------------------------------------------
+// Heartbeat (bidi stream)
+// ---------------------------------------------------------------------------
+
+grpc::Status NvmeServiceImpl::Heartbeat(grpc::ServerContext* /*ctx*/,
+                                         grpc::ServerReaderWriter<HeartbeatMsg, HeartbeatMsg>* stream) {
+    HeartbeatMsg in;
+    while (stream->Read(&in)) {
+        std::string err;
+        bool ok = state_->update_heartbeat(in.allocation_id(), &err);
+
+        if (!ok) {
+            // Allocation gone (probably reclaimed). Notify and close.
+            HeartbeatMsg out;
+            out.set_allocation_id(in.allocation_id());
+            out.set_timestamp_ns(in.timestamp_ns());
+            auto* notice = out.mutable_notice();
+            notice->set_kind(AdminNotice::LEASE_REVOKED);
+            notice->set_message(err);
+            stream->Write(out);
+            return grpc::Status::OK;
         }
+
+        // Echo with current timestamp (client can estimate skew).
+        HeartbeatMsg out;
+        out.set_allocation_id(in.allocation_id());
+        out.set_timestamp_ns(in.timestamp_ns());
+        stream->Write(out);
     }
-
-    for (uint64_t lease_id : expired) {
-        releaseLease(lease_id);
-    }
-}
-
-void NvmeServiceServer::leaseReaperLoop() {
-    while (running_.load(std::memory_order_acquire)) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
-        releaseExpiredLeases();
-    }
-}
-
-bool NvmeServiceServer::serve(ServiceState& state) {
-    NvmeServiceImpl service(state, *this);
-
-    grpc::ServerBuilder builder;
-    builder.AddListeningPort(grpc_endpoint_, grpc::InsecureServerCredentials());
-    builder.RegisterService(&service);
-    builder.SetMaxReceiveMessageSize(kMaxGrpcMessageBytes);
-    builder.SetMaxSendMessageSize(kMaxGrpcMessageBytes);
-
-    {
-        std::lock_guard<std::mutex> lock(server_mutex_);
-        server_ = builder.BuildAndStart();
-    }
-
-    if (!server_) {
-        return false;
-    }
-
-    state_ = &state;
-    running_.store(true, std::memory_order_release);
-    lease_reaper_ = std::thread([this]() { leaseReaperLoop(); });
-    server_->Wait();
-    running_.store(false, std::memory_order_release);
-    if (lease_reaper_.joinable()) {
-        lease_reaper_.join();
-    }
-
-    std::lock_guard<std::mutex> lock(server_mutex_);
-    server_.reset();
-    state_ = nullptr;
-    return true;
+    return grpc::Status::OK;
 }
 
 } // namespace nvmeservice

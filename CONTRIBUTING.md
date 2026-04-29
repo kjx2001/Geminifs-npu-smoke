@@ -51,6 +51,16 @@ If you are changing architecture, interfaces, deployment flow, or naming, you mu
 - Do not bind core abstractions to the current file-based implementation model
 - Do not introduce new top-level abstractions that permanently hardcode the `GeminiFS` name unless maintainers explicitly choose that path
 
+### Refactoring Strategy
+
+This repository is mid-refactor. All code movement must follow a **zero-risk, additive-first** discipline:
+
+- **Create new, keep old**: When extracting or reorganizing code, always create the new file or header in the target location first. Do not delete or modify the existing file as part of the same step.
+- **Legacy files are backups**: All files under the historical implementation path (`filesystems/ext4/libgeminifs/`) are treated as the authoritative backup during the refactoring period. They must not be deleted during active refactoring.
+- **No forced cutover**: The new layer structure and the legacy path may coexist in the same build until the maintainer explicitly decides the new path is complete and verified.
+- **Deletion only at the end**: Legacy file removal is deferred until the full refactoring is complete and has been validated. Deletion must be a separate, explicit commit after that decision is made by the maintainer.
+- **One step at a time**: Each refactor step should produce at most one new file or one new directory boundary. Do not batch multiple extractions into one commit.
+
 ### Hardware and System Constraints
 
 - Treat deployment, boot ordering, permissions, module readiness, and Linux compatibility as design inputs, not post-hoc operations work

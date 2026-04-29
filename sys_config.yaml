@@ -1,23 +1,33 @@
 grpc:
   endpoint: "127.0.0.1:50051"
-  max_queues_per_process: 64
 
 gpus:
+  - id: 0
+    mount_path: "/mnt/gpu0"      # GPU view directory; daemon
+                                  # creates per-NVMe symlinks here
   - id: 1
-    mount_path: "/mnt/nvme_layer"
+    mount_path: "/mnt/gpu1"
 
 nvmes:
-  - mount_path: "nvme1"
-    pci_addr: "0000:41:00.0"
-    ns_id: 1
-    queueDepth: 1024
-    numQueues: 128
-    gpu_id: 1
-    maxIOsize: 1024
-  - mount_path: "nvme2"
-    pci_addr: "0000:42:00.0"
-    ns_id: 1
-    queueDepth: 1024
-    numQueues: 128
-    gpu_id: 1
-    maxIOsize: 1024
+  - pci_addr: "0000:50:00.0"
+    mount_path: "/mnt/nvme0"     # real NVMe block-device mount
+    namespace_id: 1
+    queue_depth: 1024
+    total_queues: 128            # pool size
+
+
+    # ... or list queue_groups to split queues across multiple GPUs.
+    # Sum of count must be <= total_queues; any leftover queues
+    # stay idle (not bound to a GPU). Mutually exclusive with
+    # gpu_id -- if queue_groups is given, gpu_id is ignored.
+    queue_groups:
+      - { gpu_id: 0, count: 64 }
+      - { gpu_id: 1, count: 64 }
+
+queue_pool:
+  default_per_client: 32
+  max_per_client: 128
+
+lease:
+  heartbeat_interval_sec: 10
+  timeout_sec: 30

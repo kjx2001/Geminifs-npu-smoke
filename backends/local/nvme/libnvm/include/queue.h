@@ -28,6 +28,9 @@
 using error = std::runtime_error;
 using std::string;
 
+// Forward declaration -- full definition in shared_ctrl.h
+struct SharedQueueSpec;
+
 
 struct QueuePair
 {
@@ -54,6 +57,15 @@ struct QueuePair
     BufferPtr           cq_pos_locks;
     BufferPtr             prp_list;
     //BufferPtr           cq_clean_cid;
+
+    // Shared-mode bookkeeping (set when constructed via SharedQueueSpec).
+    // In shared mode sq_mem / cq_mem / prp_mem stay default-empty; the
+    // queue's actual memory comes from IPC imports tracked here so the
+    // destructor can cudaIpcCloseMemHandle them.
+    bool                is_shared      = false;
+    void*               shared_sq_ptr  = nullptr;
+    void*               shared_cq_ptr  = nullptr;
+    void*               shared_prp_ptr = nullptr;
 
 
 
@@ -160,6 +172,40 @@ struct QueuePair
 
 
 
+    }
+
+    // Shared-resource constructor. Defined in libnvm/src/shared_ctrl.cu.
+    // Imports SQ / CQ (+ optional PRP) via cudaIpcOpenMemHandle, derives
+    // this-process's doorbell GPU VAs from bar0_gpu_va, and cudaMalloc's
+    // local tickets/marks/cid/pos_locks (intra-process coordination, not
+    // shared with the daemon).
+    QueuePair(const struct SharedQueueSpec& qspec,
+              uint32_t                      cudaDevice,
+              uint32_t                      dstrd,
+              uint32_t                      nvmNamespace_,
+              uint32_t                      page_size_,
+              uint32_t                      block_size_,
+              uint32_t                      block_size_log_,
+              void*                         bar0_gpu_va);
+
+    // Explicit destructor: closes IPC imports in shared mode. DmaPtr and
+    // BufferPtr members destruct via their own dtors -- in shared mode the
+    // DmaPtr members are default-empty, so those dtors are no-ops.
+    inline ~QueuePair() {
+        if (is_shared) {
+            if (shared_sq_ptr != nullptr) {
+                cudaIpcCloseMemHandle(shared_sq_ptr);
+                shared_sq_ptr = nullptr;
+            }
+            if (shared_cq_ptr != nullptr) {
+                cudaIpcCloseMemHandle(shared_cq_ptr);
+                shared_cq_ptr = nullptr;
+            }
+            if (shared_prp_ptr != nullptr) {
+                cudaIpcCloseMemHandle(shared_prp_ptr);
+                shared_prp_ptr = nullptr;
+            }
+        }
     }
 
 };

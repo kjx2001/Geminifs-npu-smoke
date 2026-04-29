@@ -129,6 +129,7 @@ endif ()
 # Library source files
 set (libnvm_root "${PROJECT_SOURCE_DIR}/backends/local/nvme/libnvm/")
 file (GLOB libnvm_source "${libnvm_root}/src/*.cpp")
+file (GLOB libnvm_cuda_source "${libnvm_root}/src/*.cu")
 file (GLOB libnvm_linux_source "${libnvm_root}/src/linux/*.cpp")
 file (GLOB libnvm_include "${libnvm_root}/include/*.h")
 
@@ -180,8 +181,9 @@ set (CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
 # Create NVME library target
 # add_library(libnvm ${libnvm_source} ${libnvm_linux_source})
 # CUDA_ADD_LIBRARY (libnvm ${libnvm_source} ${libnvm_linux_source}) # TODO: add check for OS
-add_library(libnvm ${libnvm_source} ${libnvm_linux_source})
+add_library(libnvm ${libnvm_source} ${libnvm_cuda_source} ${libnvm_linux_source})
 set_target_properties(libnvm PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+set_target_properties(libnvm PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 target_include_directories (libnvm PRIVATE "${libnvm_root}")
 target_link_libraries(libnvm CUDA::cudart)
 target_link_libraries (libnvm Threads::Threads)
@@ -232,6 +234,21 @@ set_target_properties(libgeminifs PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 set_target_properties(libgeminifs PROPERTIES BUILD_RPATH "$ORIGIN" INSTALL_RPATH "$ORIGIN")
 install (FILES ${libgeminifs_include} DESTINATION "include/geminifs")
 install (TARGETS libgeminifs DESTINATION "lib")
+
+# ---------------------------------------------------------------------------
+# Refactored layers: device_manager + io_engine
+#
+# These are new canonical libraries extracted from libgeminifs during the
+# bottom-up refactor. libgeminifs is kept as-is during the transition and
+# acts as a utility provider (FileManager, host_refine_nvmeofst, debug macros).
+#
+# Layer dependency:
+#   io_engine  ->  device_manager  ->  libnvm
+#                          |
+#                          +--->  libgeminifs (utilities)
+# ---------------------------------------------------------------------------
+add_subdirectory(device_manager)
+add_subdirectory(io_engine)
 
 # NVMeService
 set (nvmeservice_root "${PROJECT_SOURCE_DIR}/backends/local/NVMeService")
@@ -290,6 +307,16 @@ endif ()
 find_package(Protobuf REQUIRED)
 find_package(gRPC REQUIRED)
 
+set(NVMESERVICE_PROTOBUF_LINK_LIBS "")
+if (TARGET protobuf::libprotobuf)
+    list(APPEND NVMESERVICE_PROTOBUF_LINK_LIBS protobuf::libprotobuf)
+endif ()
+if (Protobuf_LIBRARIES)
+    list(APPEND NVMESERVICE_PROTOBUF_LINK_LIBS ${Protobuf_LIBRARIES})
+elseif (Protobuf_LIBRARY)
+    list(APPEND NVMESERVICE_PROTOBUF_LINK_LIBS ${Protobuf_LIBRARY})
+endif ()
+
 set(nvmeservice_proto "${nvmeservice_root}/src/nvmeservice.proto")
 get_target_property(GRPC_CPP_PLUGIN_LOCATION gRPC::grpc_cpp_plugin LOCATION)
 add_custom_command(
@@ -318,11 +345,15 @@ target_include_directories(nvmeservice PUBLIC
     "${Protobuf_INCLUDE_DIRS}"
 )
 target_link_libraries(nvmeservice PRIVATE libnvm CUDA::cudart Threads::Threads)
-target_link_libraries(nvmeservice PUBLIC gRPC::grpc++ protobuf::libprotobuf)
+target_link_libraries(nvmeservice PUBLIC gRPC::grpc++ ${NVMESERVICE_PROTOBUF_LINK_LIBS})
 target_link_libraries(nvmeservice PRIVATE yaml-cpp)
 set_target_properties(nvmeservice PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+set_target_properties(nvmeservice PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 set_target_properties(nvmeservice PROPERTIES OUTPUT_NAME "nvmeservice")
 install (TARGETS nvmeservice DESTINATION "lib")
+
+# NVMeService example executables (daemon + client smoke test)
+add_subdirectory(backends/local/NVMeService/examples)
 
 
 # Macro for creating sample target

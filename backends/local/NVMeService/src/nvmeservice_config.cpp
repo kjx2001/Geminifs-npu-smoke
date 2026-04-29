@@ -1,194 +1,211 @@
 #include "nvmeservice_config.h"
 
-#include <cstdint>
-#include <cstdio>
-#include <filesystem>
-#include <string>
-#include <unordered_map>
-
 #include <yaml-cpp/yaml.h>
+#include <fstream>
+#include <set>
+#include <sstream>
 
 namespace nvmeservice {
 
 namespace {
 
-std::string requireString(const YAML::Node& node, const char* key, std::string* error_message) {
-    if (!node || !node[key]) {
-        if (error_message) {
-            *error_message = std::string("Missing key: ") + key;
-        }
-        return {};
-    }
-    return node[key].as<std::string>();
+template <typename T>
+T get_or(const YAML::Node& n, const std::string& key, T def) {
+    if (!n || !n[key]) return def;
+    return n[key].as<T>();
 }
 
-bool requireUint32(const YAML::Node& node, const char* key, uint32_t& out, std::string* error_message) {
-    if (!node || !node[key]) {
-        if (error_message) {
-            *error_message = std::string("Missing key: ") + key;
-        }
-        return false;
-    }
-    out = node[key].as<uint32_t>();
-    return true;
+void parse_grpc(const YAML::Node& root, GrpcConfig& out) {
+    if (!root["grpc"]) return;
+    const auto& g = root["grpc"];
+    out.endpoint = get_or<std::string>(g, "endpoint", out.endpoint);
 }
 
-bool optionalUint32(const YAML::Node& node, const char* key, uint32_t& out) {
-    if (!node || !node[key]) {
-        return false;
+void parse_gpus(const YAML::Node& root, std::vector<GpuEntry>& out) {
+    if (!root["gpus"]) return;
+    for (const auto& node : root["gpus"]) {
+        GpuEntry e;
+        e.id         = get_or<int>        (node, "id",         -1);
+        e.mount_path = get_or<std::string>(node, "mount_path", "");
+        out.push_back(std::move(e));
     }
-    out = node[key].as<uint32_t>();
-    return true;
 }
 
-bool parseGrpc(const YAML::Node& root, ParsedConfigAll& out, std::string* error_message) {
-    if (!root["grpc"]) {
-        if (error_message) {
-            *error_message = "Missing grpc section";
-        }
-        return false;
+void parse_queue_groups(const YAML::Node& nvme_node,
+                        std::vector<QueueGroup>& out) {
+    if (!nvme_node["queue_groups"]) return;
+    for (const auto& g : nvme_node["queue_groups"]) {
+        QueueGroup qg;
+        qg.gpu_id = get_or<int>(g, "gpu_id", -1);
+        qg.count  = get_or<int>(g, "count",  0);
+        out.push_back(qg);
     }
-
-    const auto grpc = root["grpc"];
-    out.grpc_endpoint = grpc["endpoint"] ? grpc["endpoint"].as<std::string>() : kDefaultGrpcEndpoint;
-    out.max_queues_per_process = grpc["max_queues_per_process"]
-        ? grpc["max_queues_per_process"].as<uint32_t>()
-        : kDefaultMaxQueuesPerProcess;
-    return true;
 }
 
-bool parseGpus(const YAML::Node& root, std::unordered_map<int, std::string>& gpu_mounts, std::string* error_message) {
-    if (!root["gpus"] || !root["gpus"].IsSequence()) {
-        if (error_message) {
-            *error_message = "Missing gpus list";
-        }
-        return false;
+void parse_nvmes(const YAML::Node& root, std::vector<NvmeEntry>& out) {
+    if (!root["nvmes"]) return;
+    for (const auto& node : root["nvmes"]) {
+        NvmeEntry e;
+        e.pci_addr     = get_or<std::string>(node, "pci_addr",     "");
+        e.mount_path   = get_or<std::string>(node, "mount_path",   "");
+        e.namespace_id = get_or<uint32_t>   (node, "namespace_id", 1u);
+        e.queue_depth  = get_or<uint64_t>   (node, "queue_depth",  1024ull);
+        e.total_queues = get_or<uint64_t>   (node, "total_queues", 128ull);
+        parse_queue_groups(node, e.queue_groups);
+        out.push_back(std::move(e));
     }
-
-    for (const auto& gpu : root["gpus"]) {
-        if (!gpu["id"] || !gpu["mount_path"]) {
-            if (error_message) {
-                *error_message = "Each gpu entry requires id and mount_path";
-            }
-            return false;
-        }
-        int id = gpu["id"].as<int>();
-        std::string mount_path = gpu["mount_path"].as<std::string>();
-        if (mount_path.empty()) {
-            if (error_message) {
-                *error_message = "gpu.mount_path cannot be empty";
-            }
-            return false;
-        }
-        gpu_mounts[id] = mount_path;
-    }
-
-    if (gpu_mounts.empty()) {
-        if (error_message) {
-            *error_message = "No GPU sections found";
-        }
-        return false;
-    }
-
-    return true;
 }
 
-bool parseNvmes(const YAML::Node& root,
-               const std::unordered_map<int, std::string>& gpu_mounts,
-               std::vector<CtrlConfig>& out_ctrls,
-               std::string* error_message) {
-    if (!root["nvmes"] || !root["nvmes"].IsSequence()) {
-        if (error_message) {
-            *error_message = "Missing nvmes list";
-        }
-        return false;
-    }
+void parse_pool(const YAML::Node& root, QueuePoolConfig& out) {
+    if (!root["queue_pool"]) return;
+    const auto& q = root["queue_pool"];
+    out.default_per_client = get_or<int>(q, "default_per_client", out.default_per_client);
+    out.max_per_client     = get_or<int>(q, "max_per_client",     out.max_per_client);
+}
 
-    for (const auto& nvme : root["nvmes"]) {
-        CtrlConfig cfg{};
-        std::string mount_path = requireString(nvme, "mount_path", error_message);
-        std::string pci_addr = requireString(nvme, "pci_addr", error_message);
-        uint32_t ns_id = 0;
-        uint32_t queue_depth = 0;
-        uint32_t num_queues = 0;
-        uint32_t cuda_device = 0;
-        uint32_t max_io_kb = 0;
-
-        if (mount_path.empty() || pci_addr.empty()) return false;
-        if (!requireUint32(nvme, "ns_id", ns_id, error_message)) return false;
-        if (!requireUint32(nvme, "queueDepth", queue_depth, error_message)) return false;
-        if (!requireUint32(nvme, "numQueues", num_queues, error_message)) return false;
-        if (!optionalUint32(nvme, "gpu_id", cuda_device)) {
-            if (!requireUint32(nvme, "cudaDevice", cuda_device, error_message)) return false;
-        }
-        if (!requireUint32(nvme, "maxIOsize", max_io_kb, error_message)) return false;
-
-        auto gpu_it = gpu_mounts.find(static_cast<int>(cuda_device));
-        if (gpu_it == gpu_mounts.end()) {
-            if (error_message) {
-                *error_message = "No GPU section found for gpu_id=" + std::to_string(cuda_device);
-            }
-            return false;
-        }
-
-        std::filesystem::path leaf_path(mount_path);
-        std::filesystem::path base_path(gpu_it->second);
-        std::filesystem::path full_path = leaf_path.is_absolute() ? leaf_path : (base_path / leaf_path);
-
-        std::snprintf(cfg.mount_path, sizeof(cfg.mount_path), "%s", full_path.string().c_str());
-        std::snprintf(cfg.pci_addr, sizeof(cfg.pci_addr), "%s", pci_addr.c_str());
-        cfg.ns_id = ns_id;
-        cfg.queue_depth = queue_depth;
-        cfg.num_queues = num_queues;
-        cfg.cuda_device = cuda_device;
-        cfg.max_io_kb = max_io_kb;
-
-        out_ctrls.push_back(cfg);
-    }
-
-    if (out_ctrls.empty()) {
-        if (error_message) {
-            *error_message = "No NVMe controllers found";
-        }
-        return false;
-    }
-
-    return true;
+void parse_lease(const YAML::Node& root, LeaseConfig& out) {
+    if (!root["lease"]) return;
+    const auto& l = root["lease"];
+    out.heartbeat_interval_sec = get_or<uint32_t>(l, "heartbeat_interval_sec", out.heartbeat_interval_sec);
+    out.timeout_sec            = get_or<uint32_t>(l, "timeout_sec",            out.timeout_sec);
 }
 
 } // namespace
 
-bool parseSysConfig(const std::string& path, ParsedConfigAll& out, std::string* error_message) {
-    YAML::Node root;
+std::optional<ServiceConfig> parse_config_file(const std::string& path,
+                                                std::string* error) {
     try {
-        root = YAML::LoadFile(path);
-    } catch (const std::exception& ex) {
-        if (error_message) {
-            *error_message = std::string("Failed to load YAML: ") + ex.what();
+        YAML::Node root = YAML::LoadFile(path);
+        ServiceConfig cfg;
+
+        parse_grpc (root, cfg.grpc);
+        parse_gpus (root, cfg.gpus);
+        parse_nvmes(root, cfg.nvmes);
+        parse_pool (root, cfg.queue_pool);
+        parse_lease(root, cfg.lease);
+
+        if (std::string verr; !validate_config(cfg, &verr)) {
+            if (error) *error = "validation failed: " + verr;
+            return std::nullopt;
         }
+        return cfg;
+    } catch (const YAML::Exception& e) {
+        if (error) *error = std::string("YAML parse error: ") + e.what();
+        return std::nullopt;
+    } catch (const std::exception& e) {
+        if (error) *error = std::string("parse error: ") + e.what();
+        return std::nullopt;
+    }
+}
+
+bool validate_config(const ServiceConfig& cfg, std::string* error) {
+    auto emit = [&](const std::string& msg) {
+        if (error) *error = msg;
         return false;
+    };
+
+    if (cfg.grpc.endpoint.empty()) {
+        return emit("grpc.endpoint is empty");
+    }
+    if (cfg.gpus.empty()) {
+        return emit("gpus list is empty");
+    }
+    if (cfg.nvmes.empty()) {
+        return emit("nvmes list is empty");
     }
 
-    if (!parseGrpc(root, out, error_message)) {
-        return false;
+    std::set<int> gpu_ids;
+    for (const auto& g : cfg.gpus) {
+        if (g.id < 0) {
+            return emit("gpus[].id must be >= 0");
+        }
+        if (!gpu_ids.insert(g.id).second) {
+            std::ostringstream ss;
+            ss << "duplicate gpus[].id: " << g.id;
+            return emit(ss.str());
+        }
+        if (g.mount_path.empty()) {
+            std::ostringstream ss;
+            ss << "gpus[id=" << g.id << "].mount_path is empty";
+            return emit(ss.str());
+        }
     }
 
-    std::unordered_map<int, std::string> gpu_mounts;
-    if (!parseGpus(root, gpu_mounts, error_message)) {
-        return false;
+    std::set<std::string> pci_seen;
+    std::set<std::string> mount_seen;
+    for (const auto& n : cfg.nvmes) {
+        if (n.pci_addr.empty()) {
+            return emit("nvmes[].pci_addr is empty");
+        }
+        if (!pci_seen.insert(n.pci_addr).second) {
+            return emit("duplicate nvmes[].pci_addr: " + n.pci_addr);
+        }
+        if (n.mount_path.empty()) {
+            return emit("nvmes[pci=" + n.pci_addr + "].mount_path is empty");
+        }
+        if (!mount_seen.insert(n.mount_path).second) {
+            return emit("duplicate nvmes[].mount_path: " + n.mount_path);
+        }
+        if (n.total_queues == 0) {
+            std::ostringstream ss;
+            ss << "nvmes[pci=" << n.pci_addr << "].total_queues must be > 0";
+            return emit(ss.str());
+        }
+
+        // queue_groups: required and non-empty. Counts must NOT exceed
+        // total_queues (under-using the pool is allowed -- unbound
+        // queues simply stay idle). Every gpu_id must reference a
+        // known GPU, and no duplicate gpu_id within this nvme.
+        if (n.queue_groups.empty()) {
+            std::ostringstream ss;
+            ss << "nvmes[pci=" << n.pci_addr
+               << "] has no queue_groups";
+            return emit(ss.str());
+        }
+        std::set<int> group_gpu_ids;
+        uint64_t group_count_sum = 0;
+        for (const auto& g : n.queue_groups) {
+            if (g.count <= 0) {
+                std::ostringstream ss;
+                ss << "nvmes[pci=" << n.pci_addr
+                   << "].queue_groups[gpu_id=" << g.gpu_id
+                   << "].count must be > 0 (got " << g.count << ")";
+                return emit(ss.str());
+            }
+            if (gpu_ids.find(g.gpu_id) == gpu_ids.end()) {
+                std::ostringstream ss;
+                ss << "nvmes[pci=" << n.pci_addr
+                   << "].queue_groups[].gpu_id=" << g.gpu_id
+                   << " has no matching entry in gpus[]";
+                return emit(ss.str());
+            }
+            if (!group_gpu_ids.insert(g.gpu_id).second) {
+                std::ostringstream ss;
+                ss << "nvmes[pci=" << n.pci_addr
+                   << "].queue_groups has duplicate gpu_id=" << g.gpu_id;
+                return emit(ss.str());
+            }
+            group_count_sum += static_cast<uint64_t>(g.count);
+        }
+        if (group_count_sum > n.total_queues) {
+            std::ostringstream ss;
+            ss << "nvmes[pci=" << n.pci_addr
+               << "]: sum of queue_groups[].count (" << group_count_sum
+               << ") exceeds total_queues (" << n.total_queues << ")";
+            return emit(ss.str());
+        }
     }
 
-    out.ctrls.clear();
-    if (!parseNvmes(root, gpu_mounts, out.ctrls, error_message)) {
-        return false;
+    if (cfg.queue_pool.default_per_client <= 0 ||
+        cfg.queue_pool.max_per_client     <= 0 ||
+        cfg.queue_pool.default_per_client >  cfg.queue_pool.max_per_client) {
+        return emit("queue_pool: default_per_client must be in (0, max_per_client]");
     }
 
-    if (gpu_mounts.size() == 1) {
-        out.multi_mount = false;
-        out.mount_base_path = gpu_mounts.begin()->second;
-    } else {
-        out.multi_mount = true;
-        out.mount_base_path.clear();
+    if (cfg.lease.heartbeat_interval_sec == 0 ||
+        cfg.lease.timeout_sec            == 0 ||
+        cfg.lease.heartbeat_interval_sec >= cfg.lease.timeout_sec) {
+        return emit("lease: heartbeat_interval_sec must be in (0, timeout_sec)");
     }
 
     return true;

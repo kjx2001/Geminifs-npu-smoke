@@ -1,89 +1,56 @@
-cmake_minimum_required(VERSION 3.18)
+# NVMeService examples: daemon + client smoke test.
+#
+# Both link against the `nvmeservice` library (built by the root CMakeLists).
+# The daemon needs libnvm for Controller construction; the client needs it
+# only for shared_ctrl.h types (the function is inside libnvm too once
+# shared_ctrl.cu is added).
 
-project(nvmeservice_examples LANGUAGES CXX)
+add_executable(nvmeservice_daemon_example
+    nvmeservice_daemon.cpp
+)
 
-message(STATUS "CMAKE_CURRENT_LIST_DIR=${CMAKE_CURRENT_LIST_DIR}")
+target_link_libraries(nvmeservice_daemon_example PRIVATE
+    nvmeservice
+    libnvm
+    yaml-cpp
+    gRPC::grpc++
+    ${NVMESERVICE_PROTOBUF_LINK_LIBS}
+    Threads::Threads
+    CUDA::cudart
+)
 
-set(NVMESERVICE_LIB_DIR "${CMAKE_CURRENT_LIST_DIR}/../../../../build/lib" CACHE PATH "Path to Geminifs build/lib")
-get_filename_component(NVMESERVICE_LIB_DIR "${NVMESERVICE_LIB_DIR}" ABSOLUTE)
-set(NVMESERVICE_BUILD_DIR "${NVMESERVICE_LIB_DIR}/..")
-get_filename_component(NVMESERVICE_BUILD_DIR "${NVMESERVICE_BUILD_DIR}" ABSOLUTE)
-set(NVMESERVICE_LIB "${NVMESERVICE_LIB_DIR}/libnvmeservice.so")
+set_target_properties(nvmeservice_daemon_example PROPERTIES
+    OUTPUT_NAME   "nvmeservice_daemon"
+    BUILD_RPATH   "$ORIGIN:$ORIGIN/../lib"
+    INSTALL_RPATH "$ORIGIN:$ORIGIN/../lib"
+    CUDA_SEPARABLE_COMPILATION ON
+)
 
-if(NOT EXISTS "${NVMESERVICE_LIB}")
-    message(FATAL_ERROR "libnvmeservice.so not found at ${NVMESERVICE_LIB}. Set NVMESERVICE_LIB_DIR to Geminifs/build/lib")
-endif()
+add_executable(nvmeservice_client_example
+    nvmeservice_client.cpp
+)
 
-add_library(nvmeservice SHARED IMPORTED)
-set_target_properties(nvmeservice PROPERTIES IMPORTED_LOCATION "${NVMESERVICE_LIB}")
-target_include_directories(nvmeservice INTERFACE "${CMAKE_CURRENT_LIST_DIR}/../src")
-target_include_directories(nvmeservice INTERFACE "${NVMESERVICE_BUILD_DIR}")
+target_link_libraries(nvmeservice_client_example PRIVATE
+    nvmeservice
+    libnvm
+    gRPC::grpc++
+    ${NVMESERVICE_PROTOBUF_LINK_LIBS}
+    Threads::Threads
+    CUDA::cudart
+)
 
-if (EXISTS "/usr/local/bin/protoc")
-    set(Protobuf_PROTOC_EXECUTABLE "/usr/local/bin/protoc" CACHE FILEPATH "Local protoc" FORCE)
-else ()
-    set(Protobuf_PROTOC_EXECUTABLE "/usr/bin/protoc" CACHE FILEPATH "System protoc" FORCE)
-endif ()
-if (EXISTS "/usr/local/lib/libprotobuf.so")
-    if (EXISTS "/usr/local/include/google/protobuf")
-        set(Protobuf_INCLUDE_DIR "/usr/local/include" CACHE PATH "Local protobuf include" FORCE)
-        set(Protobuf_INCLUDE_DIRS "/usr/local/include" CACHE PATH "Local protobuf includes" FORCE)
-    else ()
-        message(FATAL_ERROR "Found /usr/local/lib/libprotobuf.so but /usr/local/include/google/protobuf is missing. Install protobuf headers in /usr/local to match local gRPC/protoc, or remove /usr/local protobuf libs.")
-    endif ()
-elseif (EXISTS "/usr/include/google/protobuf")
-    set(Protobuf_INCLUDE_DIR "/usr/include" CACHE PATH "System protobuf include" FORCE)
-    set(Protobuf_INCLUDE_DIRS "/usr/include" CACHE PATH "System protobuf includes" FORCE)
-endif ()
-if (EXISTS "/usr/local/lib/libprotobuf.so")
-    set(Protobuf_LIBRARY "/usr/local/lib/libprotobuf.so" CACHE FILEPATH "Local protobuf lib" FORCE)
-    set(Protobuf_LIBRARY_DEBUG "/usr/local/lib/libprotobuf.so" CACHE FILEPATH "Local protobuf lib" FORCE)
-    set(Protobuf_LIBRARY_RELEASE "/usr/local/lib/libprotobuf.so" CACHE FILEPATH "Local protobuf lib" FORCE)
-    set(Protobuf_LITE_LIBRARY_DEBUG "/usr/local/lib/libprotobuf-lite.so" CACHE FILEPATH "Local protobuf lib" FORCE)
-    set(Protobuf_LITE_LIBRARY_RELEASE "/usr/local/lib/libprotobuf-lite.so" CACHE FILEPATH "Local protobuf lib" FORCE)
-    set(Protobuf_PROTOC_LIBRARY_DEBUG "/usr/local/lib/libprotoc.so" CACHE FILEPATH "Local protobuf lib" FORCE)
-    set(Protobuf_PROTOC_LIBRARY_RELEASE "/usr/local/lib/libprotoc.so" CACHE FILEPATH "Local protobuf lib" FORCE)
-elseif (EXISTS "/usr/lib/x86_64-linux-gnu/libprotobuf.so")
-    set(Protobuf_LIBRARY "/usr/lib/x86_64-linux-gnu/libprotobuf.so" CACHE FILEPATH "System protobuf lib" FORCE)
-    set(Protobuf_LIBRARY_DEBUG "/usr/lib/x86_64-linux-gnu/libprotobuf.so" CACHE FILEPATH "System protobuf lib" FORCE)
-    set(Protobuf_LIBRARY_RELEASE "/usr/lib/x86_64-linux-gnu/libprotobuf.so" CACHE FILEPATH "System protobuf lib" FORCE)
-    set(Protobuf_LITE_LIBRARY_DEBUG "/usr/lib/x86_64-linux-gnu/libprotobuf-lite.so" CACHE FILEPATH "System protobuf lib" FORCE)
-    set(Protobuf_LITE_LIBRARY_RELEASE "/usr/lib/x86_64-linux-gnu/libprotobuf-lite.so" CACHE FILEPATH "System protobuf lib" FORCE)
-    set(Protobuf_PROTOC_LIBRARY_DEBUG "/usr/lib/x86_64-linux-gnu/libprotoc.so" CACHE FILEPATH "System protobuf lib" FORCE)
-    set(Protobuf_PROTOC_LIBRARY_RELEASE "/usr/lib/x86_64-linux-gnu/libprotoc.so" CACHE FILEPATH "System protobuf lib" FORCE)
-elseif (EXISTS "/usr/lib64/libprotobuf.so")
-    set(Protobuf_LIBRARY "/usr/lib64/libprotobuf.so" CACHE FILEPATH "System protobuf lib" FORCE)
-    set(Protobuf_LIBRARY_DEBUG "/usr/lib64/libprotobuf.so" CACHE FILEPATH "System protobuf lib" FORCE)
-    set(Protobuf_LIBRARY_RELEASE "/usr/lib64/libprotobuf.so" CACHE FILEPATH "System protobuf lib" FORCE)
-    set(Protobuf_LITE_LIBRARY_DEBUG "/usr/lib64/libprotobuf-lite.so" CACHE FILEPATH "System protobuf lib" FORCE)
-    set(Protobuf_LITE_LIBRARY_RELEASE "/usr/lib64/libprotobuf-lite.so" CACHE FILEPATH "System protobuf lib" FORCE)
-    set(Protobuf_PROTOC_LIBRARY_DEBUG "/usr/lib64/libprotoc.so" CACHE FILEPATH "System protobuf lib" FORCE)
-    set(Protobuf_PROTOC_LIBRARY_RELEASE "/usr/lib64/libprotoc.so" CACHE FILEPATH "System protobuf lib" FORCE)
-elseif (EXISTS "/usr/lib/libprotobuf.so")
-    set(Protobuf_LIBRARY "/usr/lib/libprotobuf.so" CACHE FILEPATH "System protobuf lib" FORCE)
-    set(Protobuf_LIBRARY_DEBUG "/usr/lib/libprotobuf.so" CACHE FILEPATH "System protobuf lib" FORCE)
-    set(Protobuf_LIBRARY_RELEASE "/usr/lib/libprotobuf.so" CACHE FILEPATH "System protobuf lib" FORCE)
-    set(Protobuf_LITE_LIBRARY_DEBUG "/usr/lib/libprotobuf-lite.so" CACHE FILEPATH "System protobuf lib" FORCE)
-    set(Protobuf_LITE_LIBRARY_RELEASE "/usr/lib/libprotobuf-lite.so" CACHE FILEPATH "System protobuf lib" FORCE)
-    set(Protobuf_PROTOC_LIBRARY_DEBUG "/usr/lib/libprotoc.so" CACHE FILEPATH "System protobuf lib" FORCE)
-    set(Protobuf_PROTOC_LIBRARY_RELEASE "/usr/lib/libprotoc.so" CACHE FILEPATH "System protobuf lib" FORCE)
-endif ()
-find_package(Protobuf REQUIRED)
-find_package(gRPC REQUIRED)
-find_package(CUDAToolkit QUIET)
-if (TARGET CUDAToolkit::cudart)
-    set(NVMESERVICE_CUDA_LIB CUDAToolkit::cudart)
-    set(NVMESERVICE_CUDA_INCLUDE_DIRS "${CUDAToolkit_INCLUDE_DIRS}")
-else ()
-    find_package(CUDA REQUIRED)
-    set(NVMESERVICE_CUDA_LIB "${CUDA_CUDART_LIBRARY}")
-    set(NVMESERVICE_CUDA_INCLUDE_DIRS "${CUDA_INCLUDE_DIRS}")
-endif ()
+set_target_properties(nvmeservice_client_example PROPERTIES
+    OUTPUT_NAME   "nvmeservice_client"
+    BUILD_RPATH   "$ORIGIN:$ORIGIN/../lib"
+    INSTALL_RPATH "$ORIGIN:$ORIGIN/../lib"
+    CUDA_SEPARABLE_COMPILATION ON
+)
 
-add_executable(nvmeservice_daemon_example nvmeservice_daemon.cpp)
-target_link_libraries(nvmeservice_daemon_example PRIVATE nvmeservice gRPC::grpc++ protobuf::libprotobuf ${NVMESERVICE_CUDA_LIB})
-target_include_directories(nvmeservice_daemon_example PRIVATE ${NVMESERVICE_CUDA_INCLUDE_DIRS})
+install(TARGETS nvmeservice_daemon_example nvmeservice_client_example
+        DESTINATION "bin")
 
-add_executable(nvmeservice_client_example nvmeservice_client_example.cpp)
-target_link_libraries(nvmeservice_client_example PRIVATE nvmeservice gRPC::grpc++ protobuf::libprotobuf ${NVMESERVICE_CUDA_LIB})
-target_include_directories(nvmeservice_client_example PRIVATE ${NVMESERVICE_CUDA_INCLUDE_DIRS})
+# Copy the example config next to the binaries so users can run them
+# without figuring out a path.
+configure_file("${CMAKE_CURRENT_SOURCE_DIR}/sys_config.yaml"
+               "${CMAKE_BINARY_DIR}/bin/sys_config.yaml"
+               COPYONLY)

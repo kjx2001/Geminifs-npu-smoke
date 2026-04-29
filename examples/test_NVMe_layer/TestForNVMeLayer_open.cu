@@ -65,7 +65,8 @@ int main(int argc, char** argv) {
     setup_backtrace();
     // 在程序开始时自动配置文件描述符限制
     auto_configure_fd_limits(NUM_FILES);
-    ParsedSystemConfig config = parse_system_config("/home/zwh/Geminifs/sys_config.ini");
+    const char* config_path = (argc > 1) ? argv[1] : "sys_config.ini";
+    ParsedSystemConfig config = parse_system_config(config_path);
     std::vector<nvme_ctrl_param> nvme_params;
     if (config.valid) {
         // 转换为nvme_ctrl_param格式

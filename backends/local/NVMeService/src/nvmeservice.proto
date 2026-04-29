@@ -1,89 +1,192 @@
+// nvmeservice.proto -- gRPC contract between NVMeService daemon and GPU clients.
+//
+// Daemon responsibilities:
+//   - Own NVMe controller lifecycle (admin setup, IO queue creation)
+//   - Pre-create a pool of queues; SQ/CQ memory is cudaMalloc'd so it can be
+//     shared via CUDA IPC
+//   - Hand out exclusive queue ID ranges to client processes
+//
+// Client responsibilities (after AllocateQueues returns):
+//   - Open /dev/snvm_* itself and mmap BAR0 in its own process
+//     (multi-process mmap is allowed by SNVMe)
+//   - cudaHostRegister BAR0 + cudaHostGetDevicePointer to derive its own
+//     doorbell GPU VAs (host-mapped memory cannot be IPC'd across processes)
+//   - cudaIpcOpenMemHandle to import each queue's SQ / CQ / PRP memory
+//     (cudaMalloc'd in daemon, so IPC-compatible)
+//   - cudaMalloc its own per-queue internal state (tickets, marks, cid,
+//     pos_locks) -- these coordinate intra-process GPU threads and do not
+//     need to be shared
+//   - Assemble a local QueuePair[] shadow for kernel use
+//
+// Trust model: cooperative processes only. No cryptographic auth.
+// Lease-based reclaim uses heartbeat + PID liveness + /proc/<pid>/stat
+// starttime to defeat PID reuse.
+
 syntax = "proto3";
 
-package nvmeservice.rpc;
+package nvmeservice;
 
-enum Status {
-  STATUS_OK = 0;
-  STATUS_INVALID = 1;
-  STATUS_DENIED = 2;
-  STATUS_ERROR = 3;
-}
-
-message PingReq {}
-
-message PingResp {
-  Status status = 1;
-}
-
-message CtrlConfig {
-  string mount_path = 1;
-  string pci_addr = 2;
-  uint32 ns_id = 3;
-  uint32 queue_depth = 4;
-  uint32 num_queues = 5;
-  uint32 cuda_device = 6;
-  uint32 max_io_kb = 7;
-}
-
-message FsGetInfoReq {}
-
-message FsGetInfoResp {
-  Status status = 1;
-  string mount_base_path = 2;
-  uint32 max_queues_per_process = 3;
-  repeated CtrlConfig ctrls = 4;
-}
-
-message FsAllocQueuesReq {
-  uint32 controller_index = 1;
-  uint32 queue_count = 2;
-  int32 pid = 3;
-  uint64 client_id = 4;
-}
-
-message FsAllocQueuesResp {
-  Status status = 1;
-  uint32 granted = 2;
-  repeated uint32 qids = 3;
-  bytes d_qps_handle = 4;
-  bytes d_ctrl_handle = 5;
-  uint64 lease_id = 6;
-  uint32 ttl_ms = 7;
-}
-
-message FsReleaseQueuesReq {
-  uint32 controller_index = 1;
-  int32 pid = 2;
-  repeated uint32 qids = 3;
-  uint64 lease_id = 4;
-}
-
-message FsReleaseQueuesResp {
-  Status status = 1;
-}
-
-message ShutdownReq {}
-
-message ShutdownResp {
-  Status status = 1;
-}
-
-message LeaseHeartbeatReq {
-  uint64 lease_id = 1;
-  uint64 client_id = 2;
-}
-
-message LeaseHeartbeatResp {
-  Status status = 1;
-  uint64 lease_id = 2;
-  uint32 ttl_ms = 3;
-}
-
+// -----------------------------------------------------------------
+// Service
+// -----------------------------------------------------------------
 service NvmeService {
-  rpc Ping(PingReq) returns (PingResp);
-  rpc FsGetInfo(FsGetInfoReq) returns (FsGetInfoResp);
-  rpc FsAllocQueues(FsAllocQueuesReq) returns (FsAllocQueuesResp);
-  rpc FsReleaseQueues(FsReleaseQueuesReq) returns (FsReleaseQueuesResp);
-  rpc Shutdown(ShutdownReq) returns (ShutdownResp);
-  rpc LeaseHeartbeat(stream LeaseHeartbeatReq) returns (stream LeaseHeartbeatResp);
+    // List NVMe devices the daemon has initialised, with queue pool status.
+    rpc ListDevices    (Empty)               returns (DeviceListResponse);
+
+    // Request an exclusive range of queues on a device.
+    // Returns metadata needed for the client to mmap BAR0 itself and
+    // IPC-import the shared SQ/CQ memory for each queue.
+    rpc AllocateQueues (AllocRequest)        returns (AllocResponse);
+
+    // Explicitly release a previously allocated queue range.
+    rpc ReleaseQueues  (ReleaseRequest)      returns (ReleaseResponse);
+
+    // Bi-directional heartbeat stream. Client must send periodically to
+    // keep the lease alive. Daemon echoes timestamps and can push
+    // administrative notifications (lease expiry warnings, forced revoke).
+    rpc Heartbeat      (stream HeartbeatMsg) returns (stream HeartbeatMsg);
+}
+
+// -----------------------------------------------------------------
+// Common
+// -----------------------------------------------------------------
+
+message Empty {}
+
+// -----------------------------------------------------------------
+// ListDevices
+// -----------------------------------------------------------------
+
+message DeviceListResponse {
+    repeated DeviceInfo devices = 1;
+}
+
+message DeviceInfo {
+    int32   device_id        = 1;   // daemon-local index
+    string  pci_addr         = 2;   // e.g. "0000:50:00.0"
+    string  snvme_dev_path   = 3;   // e.g. "/dev/snvm_nvme0n1"
+    // Legacy single-GPU field. Populated by the daemon with the FIRST
+    // queue group's cuda_device for back-compat with single-group
+    // clients. Multi-GPU-aware clients should read `queue_groups`
+    // instead and use AllocRequest.cuda_device to target a specific
+    // group at allocation time.
+    int32   cuda_device      = 4;
+    uint32  namespace_id     = 5;
+    uint32  page_size        = 6;   // NVMe page size (bytes)
+    uint32  blk_size         = 7;   // logical block size (bytes)
+    uint32  blk_size_log     = 8;   // log2(blk_size)
+    uint32  queue_depth      = 9;   // entries per queue
+    uint32  dstrd            = 10;  // doorbell stride (encoded)
+    uint64  bar0_size        = 11;  // BAR0 region length (for mmap)
+    int32   total_queues     = 12;  // pool size
+    int32   available_queues = 13;  // sum of available across all groups
+    // Per-GPU partition view: one entry per queue group on this NVMe.
+    // Each entry tells the client which cuda_device owns a contiguous
+    // queue range and how many queues are currently free in it.
+    repeated QueueGroupInfo queue_groups = 14;
+}
+
+message QueueGroupInfo {
+    int32 cuda_device     = 1;
+    int32 queue_start_idx = 2;
+    int32 queue_count     = 3;
+    int32 available       = 4;
+}
+
+// -----------------------------------------------------------------
+// AllocateQueues
+// -----------------------------------------------------------------
+
+message AllocRequest {
+    int32   device_id   = 1;   // from ListDevices
+    int32   cuda_device = 2;   // must match the device's bound GPU
+    int32   num_queues  = 3;   // 0 = use daemon default; capped by config
+    uint32  client_pid  = 4;   // for liveness checks on heartbeat timeout
+}
+
+message AllocResponse {
+    string  allocation_id   = 1;   // opaque identifier; use in Release / Heartbeat
+
+    // --- Device info (client needs these to mmap BAR0 itself) ---
+    string  pci_addr        = 2;
+    string  snvme_dev_path  = 3;
+    uint64  bar0_size       = 4;   // mmap length
+    uint32  dstrd           = 5;   // doorbell stride, used in SQ_DBL/CQ_DBL
+
+    // --- Allocated queue range (contiguous) ---
+    int32   queue_start_idx = 10;
+    int32   queue_count     = 11;
+
+    // --- Per-queue shared memory IPC handles ---
+    // Size equals queue_count; queue_shared_mem[i] describes
+    // queue (queue_start_idx + i).
+    repeated QueueSharedMem queue_shared_mem = 12;
+
+    // --- Controller metadata ---
+    uint32  namespace_id    = 20;
+    uint32  page_size       = 21;
+    uint32  blk_size        = 22;
+    uint32  blk_size_log    = 23;
+    uint32  queue_depth     = 24;
+
+    // --- Lease parameters chosen by the daemon ---
+    uint32  heartbeat_interval_sec = 30;
+    uint32  lease_timeout_sec      = 31;
+
+    // --- Error info; empty on success ---
+    string  error_message   = 99;
+}
+
+// Per-queue memory that must be shared across daemon and client.
+// SQ, CQ and PRP buffers are daemon-allocated via cudaMalloc so they are
+// valid sources for cudaIpcGetMemHandle.
+message QueueSharedMem {
+    int32  queue_id         = 1;   // absolute queue ID on the device
+
+    bytes  ipc_handle_sq    = 2;   // cudaIpcMemHandle_t (64 bytes) for SQ ring
+    bytes  ipc_handle_cq    = 3;   // cudaIpcMemHandle_t (64 bytes) for CQ ring
+    bytes  ipc_handle_prp   = 4;   // PRP list memory; empty if client allocates its own
+
+    uint32 sq_entries       = 5;   // number of SQ entries
+    uint32 cq_entries       = 6;   // number of CQ entries
+    uint64 sq_ioaddr        = 7;   // SQ DMA address (for client debugging only)
+    uint64 cq_ioaddr        = 8;   // CQ DMA address (for client debugging only)
+}
+
+// -----------------------------------------------------------------
+// ReleaseQueues
+// -----------------------------------------------------------------
+
+message ReleaseRequest {
+    string allocation_id = 1;
+    uint32 client_pid    = 2;   // sanity check
+}
+
+message ReleaseResponse {
+    bool   success       = 1;
+    string error_message = 2;
+}
+
+// -----------------------------------------------------------------
+// Heartbeat (bidi stream)
+// -----------------------------------------------------------------
+
+message HeartbeatMsg {
+    string allocation_id = 1;
+    uint64 timestamp_ns  = 2;
+
+    // Server -> client only: populated when the daemon wants to notify
+    // the client of a state change.
+    AdminNotice notice = 3;
+}
+
+message AdminNotice {
+    enum Kind {
+        NONE              = 0;
+        LEASE_EXPIRING    = 1;   // warning, seconds_remaining set
+        LEASE_REVOKED     = 2;   // terminal, client should stop using queues
+    }
+    Kind   kind              = 1;
+    uint32 seconds_remaining = 2;
+    string message           = 3;
 }
