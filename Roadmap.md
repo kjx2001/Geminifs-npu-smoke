@@ -1,11 +1,10 @@
-# GeminiFS Unified Storage Runtime Roadmap
+# Tutti Unified Storage Runtime Roadmap
 
 ## Status
 
 - Current active version: `v0.1`
 - This document describes the `v0.1` architecture baseline and the active roadmap.
 - Future version number changes are maintainer-driven and must not be advanced automatically.
-- The project name may change in a future version from `GeminiFS` to a more general runtime-oriented name.
 - Historical roadmap snapshots are archived under [`doc/history/`](doc/history/).
 - Every version roadmap must preserve:
   - a `Feature Snapshot`
@@ -13,13 +12,17 @@
 
 ## v0.1 Positioning
 
-`v0.1` defines GeminiFS as a `Unified Storage Runtime` rather than only a GPU file abstraction.
+`Tutti` (Italian for "all instruments together") is a `CPU/GPU companion
+storage software stack`: a unified storage runtime in which the CPU and GPU
+paths cooperate on top of a shared memory subsystem and a pluggable backend
+SPI. `v0.1` positions the codebase as a `Unified Storage Runtime` rather than
+only a GPU file abstraction.
 
 Naming note:
 
-- `GeminiFS` is currently treated as the repository and legacy implementation name
-- the long-term product name may be replaced by a more general and easier-to-understand runtime name
-- new architecture, API, and directory decisions should avoid unnecessarily hard-coding the `GeminiFS` name
+- `Tutti` is the project name used by the architecture, public APIs, and the
+  `tutti::` C++ namespace.
+- New code, headers, and documents should use the `Tutti` name.
 
 The runtime is intended to provide:
 
@@ -90,8 +93,10 @@ The current codebase does not yet match the `v0.1` target architecture. Main iss
    - Converts framework-specific concepts into runtime-neutral requests
 
 3. `Core Runtime Layer`
-   - Defines runtime object model, request model, error model, lifecycle, and capability queries
+   - In-process request lifecycle: accept `BatchRequest`, lower to SPI batches, drain completions
+   - Owns the runtime-visible *noun* types: `Device`, `Lease`, `IOBuffer`, `BatchRequest`, `StorageTarget`, `CapabilitySet`
    - Must not depend on a concrete backend implementation
+   - Must not contain cross-process daemon logic (that belongs in the Device Manager Layer)
 
 4. `Memory Layer` *(independent — parallel to Device Manager)*
    - Manages host/device allocation, registration, deregistration, and region metadata
@@ -99,27 +104,35 @@ The current codebase does not yet match the `v0.1` target architecture. Main iss
    - Has no dependency on the Device Manager
 
 5. `Device Manager Layer` *(independent — parallel to Memory Layer)*
-   - Device discovery
-   - topology and capability reporting
-   - queue/resource lease management
-   - process attach metadata
-   - health and lifecycle management
+   - Cross-process device fleet management
+   - Owns the *service* interfaces that produce runtime nouns: `IDeviceRegistry` (produces `Device`), `ILeaseManager` (produces `Lease`)
+   - Device discovery, topology, capability advertisement
+   - Queue/resource lease lifecycle (issue, heartbeat, release, reap)
+   - Process attach metadata and daemon/client wire protocols
    - Has no dependency on the Memory Layer
 
-6. `IO Engine Layer` *(depends on both Memory Layer and Device Manager)*
+6. `Filesystem Layer` *(independent — parallel to Backend Implementations)*
+   - Resolves namespaces (file paths, object keys, DFS handles) into `StorageTarget` values that backends can consume
+   - Implementations: ext4 + FIEMAP, custom on-device layout, distributed FS local clients (3FS / JuiceFS / DAOS / ...), object-store clients
+   - Independent of the data-path backend it composes with — the only contract is `StorageTarget`
+   - Has no dependency on a specific backend implementation
+
+7. `IO Engine Layer` *(depends on Memory Layer and Device Manager)*
    - Read/write submission
    - mapping and buffer preparation
    - completion handling
    - batch execution
    - CPU_SUBMIT and GPU_SUBMIT execution paths
 
-7. `Backend SPI Layer`
-   - Formal backend extension interface
+8. `Backend SPI Layer`
+   - Formal backend extension interface (`IBackendProvider`, `IQueueProvider`)
    - Supports pluggable backends without changing upper-layer APIs
 
-8. `Backend Implementations`
-   - `local_nvme` as the first reference backend
-   - future candidates include `gds_nvme`, `rdma`, and hybrid backends
+9. `Backend Implementations`
+   - Data-path implementations grouped by transport, not by filesystem
+   - `local_nvme` as the first reference backend (libnvm + snvme kernel module + NVMeService daemon)
+   - Future candidates: `local_rdma`, `gds`, and hybrid backends
+   - Each backend composes orthogonally with any compatible filesystem from the Filesystem Layer
 
 ### Kernel Module Baseline
 
@@ -284,21 +297,93 @@ API constraints:
 
 This is a design target, not a completed repository state.
 
+The layout separates **two extension axes** so they can grow
+independently:
+
+- *transport / data-path* (how bytes physically move) lives under
+  `backends/`
+- *namespace / metadata* (how a name is resolved to an address) lives
+  under `filesystems/`
+
+The two meet only through the `StorageTarget` value type defined in
+`runtime/`. Adding one new transport does not require touching any
+filesystem code, and vice versa — replacing an n × m combinatorial
+explosion with an n + m matrix.
+
 ```text
-GeminiFS/
-├── api/                # public runtime API definitions
-├── runtime/            # core runtime objects and orchestration
-├── memory/             # allocation, registration, region model
-├── device_manager/      # daemon/client/protocol for device manager
-├── io_engine/         # submission, mapping, completion, batching
-├── backends/           # backend SPI and backend implementations
-├── adapters/           # LMCache, Mooncake, and future integrations
+Tutti/
+├── api/                # public runtime API the application links against
+├── runtime/            # in-process request lifecycle + runtime-visible nouns
+├── memory/             # IMemorySubsystem, MemoryRegion, registration
+├── device_manager/     # cross-process device fleet management & leases
+├── io_engine/          # IBackendProvider SPI + submission/completion/batching
+├── filesystems/        # namespace -> StorageTarget (FS / object / DFS client)
+│   ├── include/        # IFilesystem / INamespaceResolver SPI
+│   ├── ext4_fiemap/    # ext4 + FIEMAP -> (file_id, LBA range)
+│   ├── tutti_layout/   # custom on-device GPU-file layout (legacy libgeminifs)
+│   ├── dfs_client/     # distributed FS local clients (3FS, JuiceFS, DAOS, ...)
+│   └── object_store/   # S3-shape namespaces (future)
+├── backends/           # data-path backends -- implement IBackendProvider
+│   ├── include/        # cross-backend helpers (BufferDescriptor builders, ...)
+│   ├── local_nvme/     # libnvm + snvme kernel module + NVMeService daemon
+│   ├── local_rdma/     # ibverbs + RDMA QP pool + (future) RDMAService daemon
+│   └── gds/            # NVIDIA GDS adapter
+├── adapters/           # LMCache, Mooncake, and other framework integrations
 └── doc/
     ├── architecture/   # architecture descriptions
+    ├── design/         # design contracts (backend SPI, ...)
     ├── rfcs/           # design RFCs
     ├── ai/             # AI-facing subsystem docs
     └── history/        # archived roadmap snapshots
 ```
+
+### Layer Responsibility Split
+
+The boundary between `runtime/` and `device_manager/` is a frequent
+source of confusion; v0.1 fixes it with two rules.
+
+**Rule 1: process scope.**
+
+- `device_manager/` owns everything that crosses processes — daemons,
+  wire protocols, leases, PID-based reaper logic, device discovery
+  that has to query a service.
+- `runtime/` owns everything that stays inside one process — accepting
+  a `BatchRequest`, lowering it to SPI batches, dispatching through
+  `IBackendProvider`, draining `IOCompletion` to `ICompletionSink`.
+
+**Rule 2: noun vs service.**
+
+- *Nouns* (the value types users hold and pass around) live in
+  `runtime/`: `Device`, `Lease`, `IOBuffer`, `BatchRequest`,
+  `StorageTarget`, `CapabilitySet`.
+- *Services* (the lifecycle interfaces those nouns are produced by)
+  live in `device_manager/`: `IDeviceRegistry` (produces `Device`),
+  `ILeaseManager` (produces `Lease`).
+
+Backends *register* into device_manager (publishing devices and
+implementing the lease/registry services) and *implement* the
+io_engine SPI (`IBackendProvider`). The runtime never talks to
+backends directly — it goes through device_manager for fleet info and
+through the SPI for IO.
+
+### Filesystem vs Backend Composition
+
+A `Device` registered into the runtime carries both a backend
+provider (data-path) and an associated filesystem resolver
+(namespace). They are paired at config time, not built in. This makes
+new combinations cheap:
+
+| Use case | filesystems/ | backends/ |
+|---|---|---|
+| Local NVMe + on-device file layout | `tutti_layout/` | `local_nvme/` |
+| Local NVMe + ext4 files | `ext4_fiemap/` | `local_nvme/` |
+| Local RDMA + distributed FS client | `dfs_client/<x>/` | `local_rdma/` |
+| GDS + ext4 files | `ext4_fiemap/` | `gds/` |
+| Local NVMe raw (no FS) | none (passthrough `BLOCK_RANGE`) | `local_nvme/` |
+
+The filesystem layer's only job is to produce a `StorageTarget`; the
+backend's only job is to consume one. Neither layer includes the
+other's private headers.
 
 ## Active Roadmap
 
@@ -427,7 +512,6 @@ Deliverables:
 
 - `Roadmap.md` is always the active roadmap for the current version selected by the maintainer
 - Version changes are not made automatically
-- Project naming changes are also maintainer-driven and should be handled explicitly rather than implicitly during refactors
 - Every active and archived version roadmap must retain a per-version `Feature Snapshot` and `Known Bugs Snapshot`
 - When a new version is opened, the previous active roadmap snapshot should be copied into [`doc/history/`](doc/history/)
 - Archive file naming should follow:

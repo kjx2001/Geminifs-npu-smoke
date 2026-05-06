@@ -1,14 +1,13 @@
 <img src="doc/pics/tardis_logo.png" align="left" width="32" />
 
-## GeminiFS
+## Tutti
 
-GPU-oriented storage codebase under refactor toward a `Unified Storage Runtime`.
+`Tutti` (Italian for "all instruments together") is a `CPU/GPU companion
+storage software stack`: a unified storage runtime where CPU and GPU paths
+cooperate on top of a shared memory subsystem and a pluggable backend SPI.
 
-Note:
-
-- `GeminiFS` is the current repository and legacy implementation name
-- the long-term runtime name may change in a future version
-- the active architecture baseline is tracked in [`Roadmap.md`](Roadmap.md)
+The active architecture baseline is tracked in [`Roadmap.md`](Roadmap.md).
+New abstractions, namespaces (`tutti::`), and headers use the `Tutti` name.
 
 ## Current Status
 
@@ -22,7 +21,7 @@ This repository currently contains:
 The repository is in a transition stage:
 
 - current code layout reflects historical implementation boundaries
-- target architecture is being redefined around `api`, `runtime`, `memory`, `device_manager`, `io_engine`, `backends`, and `adapters`
+- target architecture is organised around `api`, `runtime`, `memory`, `device_manager`, `io_engine`, `backends`, and `adapters`
 - interface and directory changes should be discussed before major code movement
 
 ## Start Here
@@ -154,7 +153,7 @@ When working in this repository:
 - treat [`Todolist.md`](Todolist.md) as the active task board
 - preserve version snapshots in [`doc/history/`](doc/history/) when the maintainer changes versions
 - avoid assuming the current directory layout is the final layout
-- avoid baking the `GeminiFS` name into new abstractions unless the maintainer explicitly wants it
+- use the `Tutti` name (and `tutti::` namespace) in new abstractions and public APIs
 - discuss top-level interface changes and directory reshaping before large code edits
 
 ## Current Known Problem
