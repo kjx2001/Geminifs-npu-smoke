@@ -276,6 +276,15 @@ void ServiceState::install_gpu_symlinks(DeviceState& dev,
             continue;
         }
         dev.created_symlinks.push_back(link_path.string());
+
+        // Surface the symlink path to the matching DeviceQueueGroup so
+        // allocate() can hand it to clients via AllocResponse.mount_path.
+        for (auto& dg : dev.groups) {
+            if (dg.cuda_device == qg.gpu_id) {
+                dg.gpu_view_path = link_path.string();
+                break;
+            }
+        }
     }
 }
 
@@ -538,6 +547,10 @@ ServiceState::AllocResult ServiceState::allocate(int32_t device_id,
     g.device_id              = device_id;
     g.pci_addr               = dev.pci_addr;
     g.snvme_dev_path         = dev.snvme_dev_path;
+    // GPU-view symlink path the daemon installed for this group's GPU.
+    // Empty if symlink install failed -- client falls back to no
+    // mount_path on the local Controller.
+    g.mount_path             = matching_group->gpu_view_path;
     g.bar0_size              = dev.bar0_size;
     g.dstrd                  = dev.dstrd;
     g.queue_start_idx        = start;

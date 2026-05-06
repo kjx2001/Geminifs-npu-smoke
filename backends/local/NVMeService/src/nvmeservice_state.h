@@ -85,6 +85,10 @@ struct AllocationGrant {
     int32_t                   device_id              = -1;
     std::string               pci_addr;
     std::string               snvme_dev_path;
+    // GPU-view filesystem path for this allocation: the symlink under
+    // the consuming GPU's mount_path that points at the per-GPU
+    // subdirectory on the NVMe. Empty if symlink install failed.
+    std::string               mount_path;
     uint64_t                  bar0_size              = 0;
     uint32_t                  dstrd                  = 0;
     int32_t                   queue_start_idx        = 0;
@@ -126,6 +130,11 @@ struct DeviceQueueGroup {
     int32_t           queue_start_idx = 0;     // absolute queue index (offset into queue_handles)
     int32_t           count           = 0;
     std::vector<bool> queue_allocated;          // size == count
+    // GPU-view symlink path that the daemon installed for this group's
+    // GPU, e.g. "/mnt/gpu0/snvm_nvme0n1" -> "/mnt/nvme0/GPU0". Empty
+    // if symlink installation failed; allocate() copies it into the
+    // grant so the client can see the right mount path.
+    std::string       gpu_view_path;
 };
 
 struct DeviceState {

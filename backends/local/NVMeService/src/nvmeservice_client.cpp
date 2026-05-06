@@ -149,7 +149,11 @@ NvmeServiceClient::allocate(int32_t device_id, int32_t cuda_device, int32_t num_
     spec.namespace_id   = resp.namespace_id();
     spec.cuda_device    = req.cuda_device();
     spec.queue_depth    = resp.queue_depth();
-    // mount_path: callers know their own; leave empty here (daemon-bound path)
+    // GPU-view symlink path the daemon installed for this client's GPU.
+    // Becomes Controller.dev_mount_path on the local shared Controller,
+    // so file paths resolve through the per-GPU subdirectory on the
+    // NVMe (e.g. /mnt/gpu0/snvm_nvme0n1/foo -> /mnt/nvme0/GPU0/foo).
+    spec.mount_path     = resp.mount_path();
 
     spec.queues.reserve(resp.queue_shared_mem_size());
     for (const auto& q : resp.queue_shared_mem()) {

@@ -133,6 +133,14 @@ message AllocResponse {
     uint32  heartbeat_interval_sec = 30;
     uint32  lease_timeout_sec      = 31;
 
+    // --- GPU-view filesystem path for this allocation ---
+    // Daemon-installed symlink under the consuming GPU's mount_path,
+    // e.g. "/mnt/gpu0/snvm_nvme0n1", pointing at "/mnt/nvme0/GPU0".
+    // The client uses this as Controller.dev_mount_path so file paths
+    // resolve through the GPU-isolated subdirectory on the NVMe.
+    // Empty string if symlink installation failed at init time.
+    string  mount_path      = 32;
+
     // --- Error info; empty on success ---
     string  error_message   = 99;
 }

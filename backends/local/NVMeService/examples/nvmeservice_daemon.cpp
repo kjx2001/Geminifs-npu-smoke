@@ -89,61 +89,69 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // state->start_reaper();
+    state->start_reaper();
 
     // // --- gRPC server ---
-    // nvmeservice::NvmeServiceImpl svc(state);
+    nvmeservice::NvmeServiceImpl svc(state);
 
-    // grpc::ServerBuilder builder;
-    // int bound_port = 0;
-    // builder.AddListeningPort(cfg.grpc.endpoint,
-    //                           grpc::InsecureServerCredentials(),
-    //                           &bound_port);
-    // builder.RegisterService(&svc);
+    grpc::ServerBuilder builder;
+    int bound_port = 0;
+    builder.AddListeningPort(cfg.grpc.endpoint,
+                              grpc::InsecureServerCredentials(),
+                              &bound_port);
+    builder.RegisterService(&svc);
 
-    // std::unique_ptr<grpc::Server> server = builder.BuildAndStart();
-    // if (!server) {
-    //     std::fprintf(stderr, "Failed to start gRPC server on %s\n",
-    //                  cfg.grpc.endpoint.c_str());
-    //     state->stop_reaper();
-    //     return 1;
-    // }
-    // g_server.store(server.get());
+    std::unique_ptr<grpc::Server> server = builder.BuildAndStart();
+    if (!server) {
+        std::fprintf(stderr, "Failed to start gRPC server on %s\n",
+                     cfg.grpc.endpoint.c_str());
+        state->stop_reaper();
+        return 1;
+    }
+    g_server.store(server.get());
 
-    // std::signal(SIGINT,  on_signal);
-    // std::signal(SIGTERM, on_signal);
-    // std::signal(SIGPIPE, SIG_IGN);
+    std::signal(SIGINT,  on_signal);
+    std::signal(SIGTERM, on_signal);
+    std::signal(SIGPIPE, SIG_IGN);
 
-    // std::cout << "NVMeService daemon listening on "
-    //           << cfg.grpc.endpoint << " (port " << bound_port << ")\n";
-    // std::cout << "Registered devices:\n";
-    // for (const auto& d : state->list_devices()) {
-    //     std::cout << "  device_id=" << d.device_id
-    //               << " pci=" << d.pci_addr
-    //               << " snvme=" << d.snvme_dev_path
-    //               << " gpu=" << d.cuda_device
-    //               << " ns=" << d.namespace_id
-    //               << " page=" << d.page_size
-    //               << " blk=" << d.blk_size
-    //               << " qdepth=" << d.queue_depth
-    //               << " dstrd=" << d.dstrd
-    //               << " bar0=" << d.bar0_size
-    //               << " queues=" << d.available_queues
-    //               << "/" << d.total_queues
-    //               << "\n";
-    // }
-    // std::cout << "lease: heartbeat=" << cfg.lease.heartbeat_interval_sec
-    //           << "s timeout=" << cfg.lease.timeout_sec << "s\n";
-    // std::cout << "queue_pool: default=" << cfg.queue_pool.default_per_client
-    //           << " max=" << cfg.queue_pool.max_per_client << "\n";
-    // std::cout.flush();
+    std::cout << "NVMeService daemon listening on "
+              << cfg.grpc.endpoint << " (port " << bound_port << ")\n";
+    std::cout << "Registered devices:\n";
+    for (const auto& d : state->list_devices()) {
+        std::cout << "  device_id=" << d.device_id
+                  << " pci=" << d.pci_addr
+                  << " snvme=" << d.snvme_dev_path
+                  << " gpu=" << d.cuda_device
+                  << " ns=" << d.namespace_id
+                  << " page=" << d.page_size
+                  << " blk=" << d.blk_size
+                  << " qdepth=" << d.queue_depth
+                  << " dstrd=" << d.dstrd
+                  << " bar0=" << d.bar0_size
+                  << " queues=" << d.available_queues
+                  << "/" << d.total_queues
+                  << "\n";
+        for (const auto& g : d.groups) {
+            std::cout << "      group: cuda_device=" << g.cuda_device
+                      << " range=[" << g.queue_start_idx
+                      << ", " << (g.queue_start_idx + g.queue_count) << ")"
+                      << " avail=" << g.available
+                      << "/" << g.queue_count
+                      << "\n";
+        }
+    }
+    std::cout << "lease: heartbeat=" << cfg.lease.heartbeat_interval_sec
+              << "s timeout=" << cfg.lease.timeout_sec << "s\n";
+    std::cout << "queue_pool: default=" << cfg.queue_pool.default_per_client
+              << " max=" << cfg.queue_pool.max_per_client << "\n";
+    std::cout.flush();
 
-    // // Block until signal -> server->Shutdown()
-    // server->Wait();
+    // Block until signal -> server->Shutdown()
+    server->Wait();
 
-    // std::cout << "Shutting down...\n";
-    // state->stop_reaper();
-    // g_server.store(nullptr);
-    // std::cout << "Daemon exited cleanly.\n";
+    std::cout << "Shutting down...\n";
+    state->stop_reaper();
+    g_server.store(nullptr);
+    std::cout << "Daemon exited cleanly.\n";
     return 0;
 }

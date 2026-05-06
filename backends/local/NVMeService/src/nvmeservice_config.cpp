@@ -172,7 +172,10 @@ bool validate_config(const ServiceConfig& cfg, std::string* error) {
                    << "].count must be > 0 (got " << g.count << ")";
                 return emit(ss.str());
             }
-            if (gpu_ids.find(g.gpu_id) == gpu_ids.end()) {
+            // gpu_id < 0 is the host/CPU placeholder (API + YAML reserved
+            // for future CPU-resident queues; libnvm rejects with ENOTSUP
+            // at init time). Skip the gpus[] cross-check for it.
+            if (g.gpu_id >= 0 && gpu_ids.find(g.gpu_id) == gpu_ids.end()) {
                 std::ostringstream ss;
                 ss << "nvmes[pci=" << n.pci_addr
                    << "].queue_groups[].gpu_id=" << g.gpu_id

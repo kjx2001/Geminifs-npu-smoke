@@ -23,7 +23,16 @@
  *       # Required: split this NVMe pool across one or more GPUs.
  *       # Each entry binds a contiguous range of queues to one GPU.
  *       # Sum of count must be <= total_queues; any leftover queues
- *       # stay idle (not bound to any GPU).
+ *       # stay idle (not bound to any GPU). gpu_id == -1 reserves the
+ *       # range for host/CPU memory (API + YAML placeholder; libnvm
+ *       # currently rejects with ENOTSUP at init).
+ *       #
+ *       # CONTRACT: queue_group order determines absolute queue numbers.
+ *       # The first group occupies queues [0, count_0); the second
+ *       # occupies [count_0, count_0 + count_1); and so on. Reordering
+ *       # queue_groups in YAML therefore reshuffles which queue ID
+ *       # belongs to which GPU -- treat the order as part of the
+ *       # configuration's ABI for any client that pins queue IDs.
  *       queue_groups:
  *         - { gpu_id: 0, count: 64 }
  *         - { gpu_id: 1, count: 64 }

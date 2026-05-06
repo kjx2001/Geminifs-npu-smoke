@@ -71,6 +71,7 @@ grpc::Status NvmeServiceImpl::AllocateQueues(grpc::ServerContext* /*ctx*/,
     response->set_allocation_id(g.allocation_id);
     response->set_pci_addr(g.pci_addr);
     response->set_snvme_dev_path(g.snvme_dev_path);
+    response->set_mount_path(g.mount_path);
     response->set_bar0_size(g.bar0_size);
     response->set_dstrd(g.dstrd);
     response->set_queue_start_idx(g.queue_start_idx);
