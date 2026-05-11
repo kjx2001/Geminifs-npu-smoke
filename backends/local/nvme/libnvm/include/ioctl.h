@@ -47,10 +47,6 @@ struct pci_device_addr{ // Removed redundant definition
     int func;
 };
 
-struct pci_device_addr_pair {
-    struct pci_device_addr pairs[2];
-};
-
 /* Supported operations */
 enum nvm_ioctl_type{
     NVM_MAP_HOST_MEMORY             = _IOW(NVM_IOCTL_TYPE, 1, struct nvm_ioctl_map),
@@ -66,12 +62,15 @@ enum nvm_ioctl_type{
 };
 
 // snvm_ctrl_ioctl_type
+//
+// Note: opcode 5 (formerly SNVM_CACULATE_PCIDISTANCE) was removed. Do NOT
+// reuse it for a new command for at least one release cycle, otherwise old
+// userspace binaries will silently get a different result.
 enum snvm_ctrl_ioctl_type{
     SNVM_DEVICE_BIND                = _IOW(NVM_CTRL_IOCTL_TYOE, 1, struct pci_device_addr),
     SNVM_DEVICE_UNBIND              = _IOW(NVM_CTRL_IOCTL_TYOE, 2, struct pci_device_addr),
     SNVM_CHRDEV_CREATE              = _IOWR(NVM_CTRL_IOCTL_TYOE, 3, struct pci_device_addr),
     SNVM_CHRDEV_REMOVE              = _IOW(NVM_CTRL_IOCTL_TYOE, 4, struct pci_device_addr),
-    SNVM_CACULATE_PCIDISTANCE       = _IOW(NVM_CTRL_IOCTL_TYOE, 5, struct pci_device_addr_pair),
 };
 
 

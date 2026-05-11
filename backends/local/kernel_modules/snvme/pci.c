@@ -4213,51 +4213,17 @@ static int snvm_chrdev_helper(struct pci_device_addr* dev_addr, int create){
 	return ret;
 }
 
-static int snvm_caculate_pci_distance(struct pci_device_addr_pair *dev_addr_pair){
-	struct pci_device_addr first, second;
-	struct pci_dev *pdev_first, *pdev_second;
-	struct device *dev;
-
-	int distance = -1;
-
-	first = dev_addr_pair->pairs[0];
-	second = dev_addr_pair->pairs[1];
-	
-	pdev_first = TO_PCI_DEV(first);
-	if (!pdev_first){
-		printk("(%s): pci_get_domain_bus_and_slot failed\n", __func__);
-		return -EFAULT;
-	}
-	pdev_second = TO_PCI_DEV(second);
-	if (!pdev_second){
-		printk("(%s): pci_get_domain_bus_and_slot failed\n", __func__);
-		pci_dev_put(pdev_first);
-		return -EFAULT;
-	}
-	dev = &pdev_second->dev;
-	distance = pci_p2pdma_distance_many(pdev_first, &dev, 1, false);
-	return distance;
-}
-
 static long snvm_ioctl(struct file *file, unsigned int cmd,
 			      unsigned long arg)
 {
 	struct pci_device_addr dev_addr;
-	struct pci_device_addr_pair dev_addr_pair;
 	void __user *argp = (void __user *)arg;
 	int ret;
-	if (cmd != SNVM_CACULATE_PCIDISTANCE) {
-		if (copy_from_user(&dev_addr, argp, sizeof(dev_addr))){
-			printk("(%s): copy from user error\n", __func__);
-			return -EFAULT;
-		}
-	} else {
-		if (copy_from_user(&dev_addr_pair, argp, sizeof(dev_addr_pair))){
-			printk("(%s): copy from user error\n", __func__);
-			return -EFAULT;
-		}
-	}
 
+	if (copy_from_user(&dev_addr, argp, sizeof(dev_addr))){
+		printk("(%s): copy from user error\n", __func__);
+		return -EFAULT;
+	}
 
 	switch (cmd){
 		case SNVM_DEVICE_BIND:
@@ -4272,8 +4238,6 @@ static long snvm_ioctl(struct file *file, unsigned int cmd,
 			return ret;
 		case SNVM_CHRDEV_REMOVE:
 			return snvm_chrdev_helper(&dev_addr, 0);
-		case SNVM_CACULATE_PCIDISTANCE:
-			return snvm_caculate_pci_distance(&dev_addr_pair);
 		default:
 			return -ENOTTY;
 	}
