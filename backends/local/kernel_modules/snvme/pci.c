@@ -2449,7 +2449,7 @@ static unsigned int nvme_max_io_queues(struct nvme_dev *dev)
 	return num_possible_cpus() + dev->nr_write_queues + dev->nr_poll_queues;
 }
 
-static int nvme_setup_io_queues(struct nvme_dev *dev)
+static int s_nvme_setup_io_queues(struct nvme_dev *dev)
 {
 	struct nvme_queue *adminq = &dev->queues[0];
 	struct pci_dev *pdev = to_pci_dev(dev->dev);
@@ -3038,7 +3038,7 @@ static void nvme_reset_work(struct work_struct *work)
 			goto out;
 	}
 
-	result = nvme_setup_io_queues(dev);
+	result = s_nvme_setup_io_queues(dev);
 	if (result)
 		goto out;
 
@@ -3208,12 +3208,38 @@ static int nvme_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	struct ctrl *ctrl;
 	unsigned long quirks = id->driver_data;
 	size_t alloc_size;
-	ctrl = ctrl_find_by_pci_dev(&ctrl_list,pdev);
-	if (ctrl!=NULL)	{
-		printk("ctrl exist, ioq_num is %u, cq_num is %u, map num is %u\n",ctrl->ioq_num,ctrl->cq_num,ctrl->ioq_map_num);
-	} else{
-		printk("ctrl not found \n");
+
+	/*
+	 * Opt-in probe gate.
+	 *
+	 * Because pci_register_driver() triggers .probe() for every matching
+	 * PCI device on the bus (including NVMes the caller never asked about),
+	 * SNVMe would otherwise hijack *all* NVMes on the host the moment the
+	 * first SNVM_DEVICE_BIND ioctl is issued. That is not what users want:
+	 * snvm_rebind_driver() only detaches the single target BDF, so the
+	 * other NVMes would be ripped away from the in-tree nvme driver with
+	 * no recovery path short of rmmod snvme + manual rebind.
+	 *
+	 * Require an explicit per-BDF opt-in: the controller must have been
+	 * registered via SNVM_CHRDEV_CREATE (which is how the user declares
+	 * intent) before probe() does anything. If no ctrl record exists,
+	 * return -ENODEV -- the PCI core will then fall through to the next
+	 * matching driver (typically in-tree nvme), leaving the device alone.
+	 *
+	 * NOTE for porters: this is a single-point check; keep it AT THE TOP
+	 * of probe(). If later kernels reshuffle probe entry, preserve this
+	 * invariant or SNVMe will again grab unrelated NVMes.
+	 */
+	ctrl = ctrl_find_by_pci_dev(&ctrl_list, pdev);
+	if (ctrl == NULL) {
+		dev_info(&pdev->dev,
+		         "snvme: no ctrl registered for this BDF, skipping probe "
+		         "(user must call SNVM_CHRDEV_CREATE first)\n");
+		return -ENODEV;
 	}
+	printk("ctrl exist, ioq_num is %u, cq_num is %u, map num is %u\n",
+	       ctrl->ioq_num, ctrl->cq_num, ctrl->ioq_map_num);
+
 	node = dev_to_node(&pdev->dev);
 	if (node == NUMA_NO_NODE)
 		set_dev_node(&pdev->dev, first_memory_node);
@@ -3646,7 +3672,7 @@ MODULE_DEVICE_TABLE(pci, nvme_id_table);
 
 static long snvm_dev_map_ioctl(struct file* file, unsigned int cmd, unsigned long arg)
 {
-	int ret;
+	int ret = 0;
     struct ctrl* ctrl = NULL;
     struct nvm_ioctl_map request;
     struct map* map = NULL;
@@ -3670,37 +3696,47 @@ static long snvm_dev_map_ioctl(struct file* file, unsigned int cmd, unsigned lon
             }
 
             map = map_userspace(&host_list, ctrl, request.vaddr_start, request.n_pages);
-
-			if(request.ioq_idx>=0)
-			{
-				ctrl->ioq_map_num +=1;
-				if(ctrl->ioq_map_num > ctrl->ioq_num)
-				{
-					printk("NVM_MAP_HOST_MEMORY ctrl->ioq_map_num is %d,ctrl->ioq_num is %d\n",ctrl->ioq_map_num, ctrl->ioq_num);
-					unmap_and_release(map);
-					return -EFAULT;
-				}
-				map->ioq_idx = request.ioq_idx;
-				map->is_cq = request.is_cq;
-				
-
-				if(map->is_cq)
-					ctrl->cq_num++;
-				// printk("map_userspace map map->ioq_idx is %d, map->is_cq is %d",map->ioq_idx,map->is_cq);
-			}
-            if (!IS_ERR_OR_NULL(map))
+            /*
+             * Guard against ERR_PTR / NULL *before* any deref. Previously
+             * the ioq_map_num accounting and map->ioq_idx write happened
+             * first, which would oops if map_userspace() failed (e.g.
+             * get_user_pages_fast returned -EFAULT). See PORTING.md §7.3.
+             */
+            if (IS_ERR_OR_NULL(map))
             {
-                if (copy_to_user((void __user*) request.ioaddrs, map->addrs, map->n_addrs * sizeof(uint64_t)))
+                return IS_ERR(map) ? PTR_ERR(map) : -ENOMEM;
+            }
+
+            if (request.ioq_idx >= 0)
+            {
+                /* Reject overflow *before* bumping the counter so we
+                 * don't leave ioq_map_num in a poisoned state. */
+                if (ctrl->ioq_map_num + 1 > ctrl->ioq_num)
                 {
+                    printk("NVM_MAP_HOST_MEMORY ctrl->ioq_map_num is %d,ctrl->ioq_num is %d\n",
+                           ctrl->ioq_map_num, ctrl->ioq_num);
+                    unmap_and_release(map);
                     return -EFAULT;
                 }
-                ret = 0;
+                map->ioq_idx = request.ioq_idx;
+                map->is_cq   = request.is_cq;
+                ctrl->ioq_map_num += 1;
+                if (map->is_cq)
+                    ctrl->cq_num++;
             }
-            else 
+
+            if (copy_to_user((void __user*) request.ioaddrs, map->addrs,
+                             map->n_addrs * sizeof(uint64_t)))
             {
-                ret = PTR_ERR(map);
+                /* Roll back: we already mutated ctrl state above. */
+                if (request.ioq_idx >= 0) {
+                    if (map->is_cq) ctrl->cq_num--;
+                    ctrl->ioq_map_num -= 1;
+                }
+                unmap_and_release(map);
+                return -EFAULT;
             }
-			
+            ret = 0;
             break;
 		} 
 
@@ -3712,18 +3748,18 @@ static long snvm_dev_map_ioctl(struct file* file, unsigned int cmd, unsigned lon
 			}
 
 			map = map_device_memory(&device_list, ctrl, request.vaddr_start, request.n_pages, &ctrl_list);
-			if (!IS_ERR_OR_NULL(map))
+			if (IS_ERR_OR_NULL(map))
 			{
-				if (copy_to_user((void __user*) request.ioaddrs, map->addrs, map->n_addrs * sizeof(uint64_t)))
-				{
-					return -EFAULT;
-				}
-				ret = 0;
+				return IS_ERR(map) ? PTR_ERR(map) : -ENOMEM;
 			}
-			else 
+
+			if (copy_to_user((void __user*) request.ioaddrs, map->addrs,
+			                 map->n_addrs * sizeof(uint64_t)))
 			{
-				ret = PTR_ERR(map);
+				unmap_and_release(map);
+				return -EFAULT;
 			}
+			ret = 0;
 			break;
 		}
 		case NVM_MAP_DEVICE_QUEUE_MEMORY: // 将用户态cuda malloc 分配的地址pin住并得到dma地址返回用户态
@@ -3733,43 +3769,43 @@ static long snvm_dev_map_ioctl(struct file* file, unsigned int cmd, unsigned lon
 				return -EFAULT;
 			}
 
-			map = map_device_ioqueue_memory(&device_queue_list, ctrl, request.vaddr_start, request.n_pages);
-			if(request.ioq_idx>=0)
+			/* Queue-ring mappings MUST carry a queue index. Fail fast
+			 * so we don't waste an nvidia_p2p_get_pages() call. */
+			if (request.ioq_idx < 0)
 			{
-				ctrl->ioq_map_num +=1;
-				if(ctrl->ioq_map_num > ctrl->ioq_num)
-				{
-					printk("NVM_MAP_HOST_MEMORY ctrl->ioq_map_num is %d,ctrl->ioq_num is %d\n",ctrl->ioq_map_num, ctrl->ioq_num);
-					unmap_and_release(map);
-					return -EFAULT;
-				}
-				map->ioq_idx = request.ioq_idx;
-				map->is_cq = request.is_cq;
-				
-
-				if(map->is_cq)
-					ctrl->cq_num++;
-				// printk("map_userspace map map->ioq_idx is %d, map->is_cq is %d",map->ioq_idx,map->is_cq);
-			}
-			else
-			{
-
 				printk("map_device_ioqueue_memory ioq_idx not set yet\n");
 				return -EFAULT;
 			}
 
-			if (!IS_ERR_OR_NULL(map))
+			map = map_device_ioqueue_memory(&device_queue_list, ctrl,
+			                                request.vaddr_start, request.n_pages);
+			if (IS_ERR_OR_NULL(map))
 			{
-				if (copy_to_user((void __user*) request.ioaddrs, map->addrs, map->n_addrs * sizeof(uint64_t)))
-				{
-					return -EFAULT;
-				}
-				ret = 0;
+				return IS_ERR(map) ? PTR_ERR(map) : -ENOMEM;
 			}
-			else 
+
+			if (ctrl->ioq_map_num + 1 > ctrl->ioq_num)
 			{
-				ret = PTR_ERR(map);
+				printk("NVM_MAP_DEVICE_QUEUE_MEMORY ctrl->ioq_map_num is %d,ctrl->ioq_num is %d\n",
+				       ctrl->ioq_map_num, ctrl->ioq_num);
+				unmap_and_release(map);
+				return -EFAULT;
 			}
+			map->ioq_idx = request.ioq_idx;
+			map->is_cq   = request.is_cq;
+			ctrl->ioq_map_num += 1;
+			if (map->is_cq)
+				ctrl->cq_num++;
+
+			if (copy_to_user((void __user*) request.ioaddrs, map->addrs,
+			                 map->n_addrs * sizeof(uint64_t)))
+			{
+				if (map->is_cq) ctrl->cq_num--;
+				ctrl->ioq_map_num -= 1;
+				unmap_and_release(map);
+				return -EFAULT;
+			}
+			ret = 0;
 			break;
 		}
         case NVM_UNMAP_HOST_MEMORY:
@@ -3791,6 +3827,7 @@ static long snvm_dev_map_ioctl(struct file* file, unsigned int cmd, unsigned lon
 					ctrl->ioq_map_num--;
 				}
                 unmap_and_release(map);
+                ret = 0;
                 break;
             }
             ret = -EINVAL;
@@ -3877,6 +3914,7 @@ static long snvm_dev_map_ioctl(struct file* file, unsigned int cmd, unsigned lon
             }
 			ctrl->use_sreg = request.ioq_idx;
 			printk("NVM_SET_SHARE_REG ctrl->use_sreg %d",ctrl->use_sreg);
+			ret = 0;
 			break;
 		}
 		case NVM_GET_DEV_INFO:
@@ -3917,6 +3955,7 @@ static long snvm_dev_map_ioctl(struct file* file, unsigned int cmd, unsigned lon
 			ctrl->ioq_map_num = 0;
 			ctrl->cq_num      = 0;
 			printk("NVM_CLEAR_IOQ_NUM \n");
+			ret = 0;
 			break;
 		}
         default:
@@ -3932,7 +3971,7 @@ static int svm_mmap_registers(struct file* file, struct vm_area_struct* vma)
 {
 	struct ctrl* ctrl = NULL;
     ctrl = ctrl_find_by_inode(&ctrl_list, file->f_inode);
-    if (ctrl == NULL && ctrl->pdev == NULL)
+    if (ctrl == NULL || ctrl->pdev == NULL)
     {
         printk(KERN_CRIT "Unknown controller reference svm_mmap_registers\n");
         return -EBADF;
@@ -3973,8 +4012,11 @@ static int snvm_chrdev_create(struct pci_dev *pdev, unsigned int class){
 	}
 	err = ctrl_chrdev_create(ctrl, dev_first, &snvm_dev_fops);
 	if (err != 0){
-		ida_simple_remove(&snvm_chrdev_minor_ida, minor);
+		/* Same tear-down ordering rule as snvm_chrdev_helper(!create):
+		 * release the ctrl (which unwinds whatever ctrl_chrdev_create
+		 * partially built) before returning the minor to the IDA pool. */
 		ctrl_put(ctrl);
+		ida_simple_remove(&snvm_chrdev_minor_ida, minor);
 		return err;
 	}
 
@@ -4204,8 +4246,17 @@ static int snvm_chrdev_helper(struct pci_device_addr* dev_addr, int create){
 			dev_addr->domain = ctrl->number;
 		}
 	}else if(!create && ctrl){ // remove and chrdev has not been removed
-		ida_simple_remove(&snvm_chrdev_minor_ida, ctrl->number);
+		/*
+		 * Tear down order matters: ctrl_put() calls ctrl_chrdev_remove()
+		 * which device_destroy()/cdev_del() uses ctrl->number to build
+		 * MKDEV(). If we return the minor to the IDA pool *first*, a
+		 * concurrent SNVM_CHRDEV_CREATE could pick up the same minor
+		 * and race device_create() against our still-live cdev. Put
+		 * first, then free the minor.
+		 */
+		int released_minor = ctrl->number;
 		ctrl_put(ctrl);
+		ida_simple_remove(&snvm_chrdev_minor_ida, released_minor);
 		ret = 0;
 	}
 
