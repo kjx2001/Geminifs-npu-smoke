@@ -527,7 +527,7 @@ Current (Historical Boundaries)          Target (v0.1 Direction)
 GeminiFS/                                GeminiFS/
 ├── backends/local/                      ├── api/                    ← New
 │   ├── nvme/libnvm/        ✅           ├── runtime/               ← New
-│   ├── kernel_modules/snvme/ ✅         ├── memory/                ← Extract from libgeminifs
+│   ├── kernel_modules/snvme-5.15.0/ ✅   ├── memory/                ← Extract from libgeminifs
 │   └── NVMeService/        ✅           ├── device_manager/         ← New
 ├── filesystems/ext4/                    ├── io_engine/            ← New
 │   └── libgeminifs/        ⚠️ Monolith  ├── backends/

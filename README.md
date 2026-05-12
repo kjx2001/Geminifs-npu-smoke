@@ -122,8 +122,10 @@ This is the current repository structure as it exists today.
 - [`backends/local/nvme/libnvm`](backends/local/nvme/libnvm)
   User-space NVMe support library used by the local backend path.
 
-- [`backends/local/kernel_modules/snvme`](backends/local/kernel_modules/snvme)
+- [`backends/local/kernel_modules/snvme-5.15.0`](backends/local/kernel_modules/snvme-5.15.0)
   Modified Linux NVMe kernel-module lineage used to support CPU/GPU access to NVMe queue resources.
+  Additional kernel baselines live alongside this one (see
+  [Supported Linux Kernels](#supported-linux-kernels)).
 
 - [`backends/local/NVMeService`](backends/local/NVMeService)
   Local device-manager prototype for controller initialization, queue leasing, and process attach flow.
@@ -180,3 +182,79 @@ Relevant build/runtime entry points:
 Important operational constraint:
 
 - the modified NVMe kernel module is part of the local backend baseline and must be considered in deployment, Linux-version compatibility, and startup sequencing
+
+## Supported Linux Kernels
+
+The modified NVMe kernel module (`snvme`) is maintained as one directory
+per supported Linux kernel baseline under
+[`backends/local/kernel_modules/`](backends/local/kernel_modules). The
+baseline is selected at CMake configure time via
+`-DSNVME_KERNEL_VERSION=<version>` (default: `5.15.0`).
+
+| Baseline directory | Kernel version | Status | Upstream source |
+|---|---|---|---|
+| [`snvme-5.15.0`](backends/local/kernel_modules/snvme-5.15.0) | Linux 5.15.0 (mainline) | Active — full snvme baseline | [torvalds/linux](https://github.com/torvalds/linux) |
+| [`snvme-5.4`](backends/local/kernel_modules/snvme-5.4) | Linux 5.4 (OpenCloudOS LTS 5.4.241-30.0017) | WIP — `snvme-core.ko` ported (rename pass + helpers); `snvme.ko` (pci.c) port in progress | [OpenCloudOS-Kernel `linux-5.4/lts/5.4.241-30.0017`](https://gitee.com/OpenCloudOS/OpenCloudOS-Kernel/tree/linux-5.4%2Flts%2F5.4.241-30.0017/) |
+
+Notes:
+
+- `snvme-5.15.0` is the active baseline and contains the full modified
+  NVMe driver sources, including the CPU/GPU IO-queue sharing hooks in
+  `pci.c` and the `/dev/snvm_control` + `/dev/ssnvme*` ioctl surface
+  that libnvm consumes.
+- `snvme-5.4` currently contains a **minimal** port of the snvme
+  modifications onto the upstream nvme-5.4.241 host driver. "Minimal"
+  here means: only the changes required to let `snvme-core.ko` and
+  `snvme.ko` coexist with the in-tree `nvme-core.ko` / `nvme.ko` are
+  applied -- no 5.15 features are back-ported into the 5.4 source.
+  Concretely:
+  - the upstream nvme-5.4.241 host driver (`core.c`, `fabrics.c`,
+    `multipath.c`, `nvme.h`, `pci.c`, `rdma.c`, `tcp.c`) is included
+    with the snvme symbol-rename pass applied (see
+    `snvme-5.4/snvme-rename.sed`). The rename set is derived from the
+    actual 5.4 `EXPORT_SYMBOL_GPL` surface, not blindly copied from
+    5.15 -- e.g. it includes the 5.4-only `nvme_init_identify` rename
+    and intentionally omits the 5.15-only `nvme_alloc_request_qid`,
+    `nvme_init_ctrl_finish`, `__nvme_check_ready`, and
+    `nvme_fail_nonready_command` renames.
+  - for exported helpers that snvme does not call across module
+    boundaries (e.g. `nvme_reset_ctrl_sync`, `nvme_delete_ctrl`,
+    `nvme_cancel_tagset`, `nvme_cancel_admin_tagset`,
+    `nvme_stop_keep_alive`, `nvme_sync_io_queues`), the upstream name
+    is kept and the `EXPORT_SYMBOL_GPL` line is commented out -- the
+    same approach used in `snvme-5.15.0`.
+  - `admin_timeout` is renamed to `s_admin_timeout` only at its
+    definition / `module_param` / `EXPORT_SYMBOL_GPL` site.
+  - the kernel-version-agnostic snvme helpers are copied verbatim
+    from `snvme-5.15.0/`: `ctrl.{c,h}`, `list.{c,h}`, `map.{c,h}`,
+    `nvfs-core.h`, `nvfs-p2p.{c,h}`, `nvfs-pci.{c,h}`.
+  - 5.15-only features deliberately **not** ported into 5.4: the
+    `struct nvme_gpu_map` / `struct GPU_io_queue_info` declarations
+    in `nvme.h` (dead code in 5.15 too -- only declared, never used),
+    `ioctl.c` as a separate translation unit (5.4 keeps the ioctl
+    handlers inside `core.c`), `zns.c`, `hwmon.c`, and any 5.15-only
+    `nvme_*` helpers.
+  - `Makefile.in` is configured to build only `snvme-core.ko`. The
+    `snvme.ko` (PCI driver carrying the libnvm ioctl surface) target
+    is staged in the Makefile but disabled until `pci.c` carries the
+    snvme-5.15 increment, since the 5.4 `struct nvme_queue` layout
+    differs enough from 5.15 that the queue-sharing hooks need to be
+    re-expressed by hand.
+  - `snvme-5.4/snvme-pci-5.15-incremental.diff` -- the unified diff
+    between upstream `nvme-5.15.0/host/pci.c` and `snvme-5.15.0/pci.c`,
+    i.e. exactly the snvme increment that still needs re-expression
+    against the 5.4 `struct nvme_dev` / `struct nvme_queue` layout.
+  - The userspace contract from
+    [`backends/local/nvme/libnvm/include/ioctl.h`](backends/local/nvme/libnvm/include/ioctl.h)
+    (the `NVM_*` and `SNVM_*` ioctl numbers, `nvm_ioctl_map`,
+    `nvm_ioctl_dev`, `pci_device_addr` structs, the
+    `/dev/snvm_control` + `/dev/ssnvme<domain>` device-node names) is
+    treated as the cross-baseline ABI: any `snvme-<version>` baseline
+    must implement exactly those numbers and structs unchanged so
+    `libnvm` works against either kernel without recompilation.
+- New baselines must follow the `snvme-<kernel-version>` naming convention
+  so the build can locate them via `SNVME_KERNEL_VERSION`.
+- Kernel-API adaptation points must be isolated inside each baseline
+  directory; upper-layer APIs and the `local_nvme` backend contract must
+  not depend on the selected kernel version (see
+  [`Roadmap.md`](Roadmap.md) → "Kernel Module Baseline").

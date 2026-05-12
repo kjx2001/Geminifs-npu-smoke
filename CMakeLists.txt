@@ -135,7 +135,24 @@ file (GLOB libnvm_include "${libnvm_root}/include/*.h")
 
 
 # # Module source files
-set (module_root "${PROJECT_SOURCE_DIR}/backends/local/kernel_modules/snvme")
+#
+# The snvme kernel module is maintained per Linux kernel baseline.  Each
+# supported baseline lives in its own directory under
+# backends/local/kernel_modules/, named snvme-<kernel-version>.  Select the
+# baseline with -DSNVME_KERNEL_VERSION=<x.y[.z]> at CMake configure time.
+#
+# Supported baselines (see README.md "Supported Linux Kernels"):
+#   - 5.15.0  (default; upstream: https://github.com/torvalds/linux, tag v5.15)
+#   - 5.4     (upstream: https://gitee.com/OpenCloudOS/OpenCloudOS-Kernel/tree/linux-5.4/lts/5.4.241-30.0017/)
+set (SNVME_KERNEL_VERSION "5.15.0" CACHE STRING "snvme kernel-module baseline (e.g. 5.15.0, 5.4)")
+set (module_root "${PROJECT_SOURCE_DIR}/backends/local/kernel_modules/snvme-${SNVME_KERNEL_VERSION}")
+if (NOT EXISTS "${module_root}/Makefile.in")
+    message (FATAL_ERROR
+        "snvme baseline '${SNVME_KERNEL_VERSION}' not found at ${module_root} "
+        "(missing Makefile.in). Pick a populated baseline via "
+        "-DSNVME_KERNEL_VERSION=<version>.")
+endif ()
+message (STATUS "Using snvme kernel baseline: ${SNVME_KERNEL_VERSION} (${module_root})")
 set (module_output "${CMAKE_BINARY_DIR}/module")
 # for Makefile.in, do not delete
 set (module_ccflags "-I${PROJECT_SOURCE_DIR}/backends/local/nvme/libnvm/include -I${driver_include}")

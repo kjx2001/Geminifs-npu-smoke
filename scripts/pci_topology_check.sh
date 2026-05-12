@@ -6,9 +6,11 @@
 #               distance between each pair, prints a matrix to the console,
 #               and saves the results to a JSON file.
 #
-# Version:      1.7
-# Changes:      - Added JSON output to /mnt/sys_GPU_NVMe_topology.json for
-#                 machine-readable results.
+# Version:      1.8
+# Changes:      - Reworked console output as a true 2D matrix:
+#                 X-axis = GPUs, Y-axis = NVMe devices, cell = distance.
+#               - Color-coded cells by distance (green/yellow/red).
+#               - Devices are sorted (GPU by index, NVMe by BDF) for stable layout.
 #
 # Distance Metric:
 #   - 0: Same Primary Bus (likely under the same PCIe Switch/Root Complex).
@@ -87,9 +89,6 @@ done < <(lspci -D | grep -i 'Non-Volatile memory controller' | tr '[:upper:]' '[
 
 # --- Step 3: Calculate Distances and Prepare Outputs ---
 echo ""
-echo -e "${YELLOW}--- Topological Distance Matrix (GPU <-> NVMe) ---${NC}"
-printf "%-25s %-32s %s\n" "GPU" "NVMe" "Distance"
-echo "---------------------------------------------------------------------"
 
 if [ ${#gpus[@]} -eq 0 ] || [ ${#nvmes[@]} -eq 0 ]; then
     echo -e "${RED}Could not find both GPU and NVMe devices to compare.${NC}"
@@ -97,28 +96,33 @@ if [ ${#gpus[@]} -eq 0 ] || [ ${#nvmes[@]} -eq 0 ]; then
     exit 0
 fi
 
-# Initialize JSON file
-echo "[" > "$JSON_OUTPUT_FILE"
-is_first_json_entry=true
+# --- Step 3a: Sort devices for stable matrix layout ---
+# GPUs: sorted by gpu_index (numeric)
+mapfile -t sorted_gpu_bdfs < <(
+    for bdf in "${!gpus[@]}"; do
+        idx=$(echo "${gpus[$bdf]}" | cut -d'|' -f3)
+        printf "%s\t%s\n" "$idx" "$bdf"
+    done | sort -k1,1n | cut -f2
+)
+# NVMes: sorted by BDF string
+mapfile -t sorted_nvme_bdfs < <(printf "%s\n" "${!nvmes[@]}" | sort)
 
-# Iterate through each GPU and NVMe pair
-for gpu_bdf in "${!gpus[@]}"; do
+# --- Step 3b: Compute the full distance matrix into an associative array ---
+declare -A dist_matrix   # key: "${gpu_bdf}|${nvme_bdf}" -> distance
+
+for gpu_bdf in "${sorted_gpu_bdfs[@]}"; do
     gpu_info=${gpus[$gpu_bdf]}
     gpu_numa=$(echo "$gpu_info" | cut -d'|' -f1)
     gpu_upstream_bdf=$(echo "$gpu_info" | cut -d'|' -f2)
-    gpu_index=$(echo "$gpu_info" | cut -d'|' -f3)
     gpu_primary_bus=$(echo "$gpu_upstream_bdf" | cut -d':' -f1-2)
-    gpu_display_str="${gpu_bdf} (GPU ${gpu_index})"
 
-    for nvme_bdf in "${!nvmes[@]}"; do
+    for nvme_bdf in "${sorted_nvme_bdfs[@]}"; do
         nvme_info=${nvmes[$nvme_bdf]}
         nvme_numa=$(echo "$nvme_info" | cut -d'|' -f1)
         nvme_upstream_bdf=$(echo "$nvme_info" | cut -d'|' -f2)
-        nvme_name=$(echo "$nvme_info" | cut -d'|' -f3)
         nvme_primary_bus=$(echo "$nvme_upstream_bdf" | cut -d':' -f1-2)
-        nvme_display_str="${nvme_bdf} (${nvme_name})"
-        
-        distance=-1 # Default to -1 for "undetermined"
+
+        distance=-1
         if [[ "$gpu_primary_bus" == "$nvme_primary_bus" ]]; then
             distance=0
         elif [[ "$gpu_numa" == "$nvme_numa" && "$gpu_numa" != "-1" && "$gpu_numa" != "N/A" ]]; then
@@ -126,22 +130,82 @@ for gpu_bdf in "${!gpus[@]}"; do
         else
             distance=2
         fi
-        
-        # Print to console
-        printf "%-25s %-32s ${GREEN}%s${NC}\n" "$gpu_display_str" "$nvme_display_str" "$distance"
+        dist_matrix["${gpu_bdf}|${nvme_bdf}"]=$distance
+    done
+done
 
-        # --- Append entry to JSON file ---
+# --- Step 3c: Pretty-print the matrix (X-axis = GPUs, Y-axis = NVMes) ---
+echo -e "${YELLOW}--- Topological Distance Matrix (rows: NVMe, cols: GPU) ---${NC}"
+echo "  Legend: 0 = same PCIe switch/root complex   1 = same NUMA node   2 = cross-NUMA"
+echo ""
+
+# Column width for the NVMe row-header (left side)
+row_header_width=32
+# Column width for each GPU column
+col_width=10
+
+# Header row 1: GPU index
+printf "%-${row_header_width}s" "NVMe \\ GPU"
+for gpu_bdf in "${sorted_gpu_bdfs[@]}"; do
+    gpu_index=$(echo "${gpus[$gpu_bdf]}" | cut -d'|' -f3)
+    printf "${CYAN}%-${col_width}s${NC}" "GPU${gpu_index}"
+done
+echo ""
+
+# Header row 2: GPU BDF (short form: bus:dev.func)
+printf "%-${row_header_width}s" ""
+for gpu_bdf in "${sorted_gpu_bdfs[@]}"; do
+    short_bdf=${gpu_bdf#0000:}
+    printf "%-${col_width}s" "$short_bdf"
+done
+echo ""
+
+# Separator line
+total_width=$(( row_header_width + col_width * ${#sorted_gpu_bdfs[@]} ))
+printf '%*s\n' "$total_width" '' | tr ' ' '-'
+
+# Data rows: one per NVMe device
+for nvme_bdf in "${sorted_nvme_bdfs[@]}"; do
+    nvme_info=${nvmes[$nvme_bdf]}
+    nvme_name=$(echo "$nvme_info" | cut -d'|' -f3)
+    short_nvme_bdf=${nvme_bdf#0000:}
+    # Row label: "<device_name> (<short_bdf>)"
+    row_label="${nvme_name} (${short_nvme_bdf})"
+    printf "%-${row_header_width}s" "$row_label"
+
+    for gpu_bdf in "${sorted_gpu_bdfs[@]}"; do
+        d=${dist_matrix["${gpu_bdf}|${nvme_bdf}"]}
+        # Color the cell based on distance
+        case "$d" in
+            0) color="$GREEN"  ;;
+            1) color="$YELLOW" ;;
+            2) color="$RED"    ;;
+            *) color="$NC"     ;;
+        esac
+        printf "${color}%-${col_width}s${NC}" "$d"
+    done
+    echo ""
+done
+echo ""
+
+# --- Step 3d: Write JSON file ---
+echo "[" > "$JSON_OUTPUT_FILE"
+is_first_json_entry=true
+
+for gpu_bdf in "${sorted_gpu_bdfs[@]}"; do
+    gpu_index=$(echo "${gpus[$gpu_bdf]}" | cut -d'|' -f3)
+    for nvme_bdf in "${sorted_nvme_bdfs[@]}"; do
+        nvme_name=$(echo "${nvmes[$nvme_bdf]}" | cut -d'|' -f3)
+        distance=${dist_matrix["${gpu_bdf}|${nvme_bdf}"]}
+
         if [ "$is_first_json_entry" = true ]; then
             is_first_json_entry=false
         else
-            # Add a comma for all subsequent entries
             echo "," >> "$JSON_OUTPUT_FILE"
         fi
-        
-        # Use printf to create a formatted, readable JSON object
-        printf '  {\n    "gpu_index": %s,\n    "gpu_bdf": "%s",\n    "nvme_device": "%s",\n    "nvme_bdf": "%s",\n    "distance": %s\n  }' \
-        "$gpu_index" "$gpu_bdf" "$nvme_name" "$nvme_bdf" "$distance" >> "$JSON_OUTPUT_FILE"
 
+        printf '  {\n    "gpu_index": %s,\n    "gpu_bdf": "%s",\n    "nvme_device": "%s",\n    "nvme_bdf": "%s",\n    "distance": %s\n  }' \
+            "$gpu_index" "$gpu_bdf" "$nvme_name" "$nvme_bdf" "$distance" >> "$JSON_OUTPUT_FILE"
     done
 done
 
