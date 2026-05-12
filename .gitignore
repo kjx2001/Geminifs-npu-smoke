@@ -6,6 +6,11 @@ build/*
 third_pkgs/
 third_pkgs/*
 
+# Reference / scratch upstream sources (e.g. linux kernel + nvme drivers
+# used as a baseline for snvme port work).  These are large, redistributed
+# upstream trees -- do not commit.
+temp/
+
 .venv/
 
 # IDE specific files
@@ -17,3 +22,5 @@ third_pkgs/*
 .clangd
 .cache
 db/
+temp/
+temp/*
