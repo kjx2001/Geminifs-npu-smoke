@@ -75,9 +75,9 @@ struct system_overview {
 };
 
 std::vector<std::string> split(const std::string& s, char delimiter);
-system_overview parseSystemOverview(const std::string& filepath);
-void printSystemOverview(const system_overview& sys);
-int calculate_pci_distance(const PCI_BDF& bdf1, const PCI_BDF& bdf2);
+
+
+
 
 // File descriptor limit management functions
 bool increase_fd_limit(rlim_t desired_limit);
