@@ -21,7 +21,27 @@ set (CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -gencode arch=compute_90,code=sm_90")
 find_package (Threads REQUIRED)
 find_package(CUDAToolkit 12.6 REQUIRED)
 find_package(PkgConfig)
+
+# Imported-target configuration fallback：
+#   部分发行版（如 TencentOS/RHEL 自带的 yaml-cpp、libtorch 内嵌依赖等）
+#   仅为 Release / Debug 提供 IMPORTED_LOCATION，不含 RelWithDebInfo / MinSizeRel。
+#   不设置该映射时，CMake 会对每个链接到此 target 的目标都警告一次（CMP0111）。
+#   下面让这两种构建类型自动回退到 Release，消除刷屏告警。
+set(CMAKE_MAP_IMPORTED_CONFIG_RELWITHDEBINFO RelWithDebInfo Release "")
+set(CMAKE_MAP_IMPORTED_CONFIG_MINSIZEREL     MinSizeRel     Release "")
+
 find_package(yaml-cpp REQUIRED)
+# 兼容不同 yaml-cpp 包的 target 命名：
+#   vcpkg / 新版 upstream : yaml-cpp::yaml-cpp
+#   老的系统包（0.5.x）   : yaml-cpp (裸名 target) 或仅提供 ${YAML_CPP_LIBRARIES}
+if (TARGET yaml-cpp::yaml-cpp)
+    set(GEMINIFS_YAML_CPP_TARGET yaml-cpp::yaml-cpp)
+elseif (TARGET yaml-cpp)
+    set(GEMINIFS_YAML_CPP_TARGET yaml-cpp)
+else ()
+    set(GEMINIFS_YAML_CPP_TARGET ${YAML_CPP_LIBRARIES})
+endif ()
+message(STATUS "yaml-cpp target: ${GEMINIFS_YAML_CPP_TARGET}")
 
 pkg_check_modules(UNWIND REQUIRED libunwind)
 
@@ -44,6 +64,19 @@ set(LIBTORCH_LOCAL_PATH "${CMAKE_SOURCE_DIR}/third_pkgs/libtorch")
 list(APPEND CMAKE_PREFIX_PATH "${LIBTORCH_LOCAL_PATH}")
 message(STATUS "Project-local LibTorch path added: ${LIBTORCH_LOCAL_PATH}")
 message(STATUS "Current CMAKE_PREFIX_PATH: ${CMAKE_PREFIX_PATH}")
+
+# 提前加载 Protobuf（如果可用）。
+# 原因：libtorch 的 TorchConfig 会顺手创建一个 imported target
+#   protobuf::libprotobuf 指向其内嵌的 protobuf，但**不会**创建 sibling
+#   target（protoc / libprotoc 等）。等到后续 find_package(gRPC) 内部
+#   find_dependency(Protobuf) 时，vcpkg 的 protobuf-targets.cmake 检测到
+#   "部分 target 已定义、部分未定义" 就会报错中止。
+# 解决：在 Torch 之前先让 vcpkg/系统 protobuf 把全套 target 一次性导入。
+#       这样 Torch 后续遇到的就是完整 cache，不会再重复创建。
+find_package(Protobuf CONFIG QUIET)
+if (NOT Protobuf_FOUND)
+    find_package(Protobuf MODULE QUIET)
+endif ()
 
 find_package(Torch REQUIRED)
 message(STATUS "Found Torch: ${Torch_VERSION}")
@@ -136,21 +169,70 @@ file (GLOB libnvm_include "${libnvm_root}/include/*.h")
 
 # # Module source files
 #
-# The snvme kernel module is maintained per Linux kernel baseline.  Each
-# supported baseline lives in its own directory under
-# backends/local/kernel_modules/, named snvme-<kernel-version>.  Select the
-# baseline with -DSNVME_KERNEL_VERSION=<x.y[.z]> at CMake configure time.
+# snvme 内核模块按 kernel baseline 分目录维护：
+#   backends/local/kernel_modules/snvme-<tag>/
 #
-# Supported baselines (see README.md "Supported Linux Kernels"):
-#   - 5.15.0  (default; upstream: https://github.com/torvalds/linux, tag v5.15)
-#   - 5.4     (upstream: https://gitee.com/OpenCloudOS/OpenCloudOS-Kernel/tree/linux-5.4/lts/5.4.241-30.0017/)
-set (SNVME_KERNEL_VERSION "5.15.0" CACHE STRING "snvme kernel-module baseline (e.g. 5.15.0, 5.4)")
-set (module_root "${PROJECT_SOURCE_DIR}/backends/local/kernel_modules/snvme-${SNVME_KERNEL_VERSION}")
+# 命名规范：<tag> 必须是该 baseline 对应 `uname -r` 的前缀，例如：
+#   snvme-5.15.0-public           -> 上游 5.15.0
+#   snvme-5.4.241-1-tlinux4-0017  -> TencentOS 5.4.241-1-tlinux4-0017.x
+#
+# 选择优先级：
+#   1) -DSNVME_KERNEL_VERSION=<tag>  用户显式指定
+#   2) 否则按 `uname -r` 做最长前缀匹配自动选
+set (SNVME_KERNEL_VERSION "" CACHE STRING
+    "snvme baseline tag (= dir suffix). Leave empty to auto-detect from `uname -r`.")
+
+set (snvme_root_dir "${PROJECT_SOURCE_DIR}/backends/local/kernel_modules")
+
+# 收集所有合法 baseline tag（必须含 Makefile.in）
+file (GLOB _snvme_cands RELATIVE "${snvme_root_dir}" "${snvme_root_dir}/snvme-*")
+set (_snvme_tags "")
+foreach (_c IN LISTS _snvme_cands)
+    if (IS_DIRECTORY "${snvme_root_dir}/${_c}" AND EXISTS "${snvme_root_dir}/${_c}/Makefile.in")
+        string (REGEX REPLACE "^snvme-" "" _tag "${_c}")
+        list (APPEND _snvme_tags "${_tag}")
+    endif ()
+endforeach ()
+
+if (NOT _snvme_tags)
+    message (FATAL_ERROR "在 ${snvme_root_dir} 下未找到任何带 Makefile.in 的 snvme-* baseline 目录。")
+endif ()
+
+# 没显式指定则按 uname -r 前缀匹配
+if (NOT SNVME_KERNEL_VERSION)
+    execute_process (COMMAND uname -r
+        OUTPUT_VARIABLE _uname_r OUTPUT_STRIP_TRAILING_WHITESPACE)
+    message (STATUS "Detected running kernel: ${_uname_r}")
+    set (_best_tag "")
+    set (_best_len 0)
+    foreach (_tag IN LISTS _snvme_tags)
+        string (LENGTH "${_tag}" _tlen)
+        string (LENGTH "${_uname_r}" _ulen)
+        # 取 uname-r 中长度等于 _tlen 的前缀来比较
+        if (_tlen LESS_EQUAL _ulen)
+            string (SUBSTRING "${_uname_r}" 0 ${_tlen} _u_prefix)
+            if ("${_u_prefix}" STREQUAL "${_tag}" AND _tlen GREATER _best_len)
+                set (_best_tag "${_tag}")
+                set (_best_len "${_tlen}")
+            endif ()
+        endif ()
+    endforeach ()
+    if (_best_tag)
+        set (SNVME_KERNEL_VERSION "${_best_tag}")
+        message (STATUS "Auto-selected snvme baseline by uname -r match: ${SNVME_KERNEL_VERSION}")
+    else ()
+        message (FATAL_ERROR
+            "无法为当前 kernel '${_uname_r}' 自动匹配 snvme baseline。\n"
+            "可用 baseline: ${_snvme_tags}\n"
+            "请显式指定: -DSNVME_KERNEL_VERSION=<tag>")
+    endif ()
+endif ()
+
+set (module_root "${snvme_root_dir}/snvme-${SNVME_KERNEL_VERSION}")
 if (NOT EXISTS "${module_root}/Makefile.in")
     message (FATAL_ERROR
         "snvme baseline '${SNVME_KERNEL_VERSION}' not found at ${module_root} "
-        "(missing Makefile.in). Pick a populated baseline via "
-        "-DSNVME_KERNEL_VERSION=<version>.")
+        "(missing Makefile.in). Available baselines: ${_snvme_tags}")
 endif ()
 message (STATUS "Using snvme kernel baseline: ${SNVME_KERNEL_VERSION} (${module_root})")
 set (module_output "${CMAKE_BINARY_DIR}/module")
@@ -271,67 +353,38 @@ add_subdirectory(io_engine)
 set (nvmeservice_root "${PROJECT_SOURCE_DIR}/backends/local/NVMeService")
 file (GLOB nvmeservice_sources "${nvmeservice_root}/src/*.cpp" "${nvmeservice_root}/src/*.cu")
 
-if (EXISTS "/usr/local/bin/protoc")
-    set(Protobuf_PROTOC_EXECUTABLE "/usr/local/bin/protoc" CACHE FILEPATH "Local protoc" FORCE)
-else ()
-    set(Protobuf_PROTOC_EXECUTABLE "/usr/bin/protoc" CACHE FILEPATH "System protoc" FORCE)
-endif ()
-if (EXISTS "/usr/local/lib/libprotobuf.so")
-    if (EXISTS "/usr/local/include/google/protobuf")
-        set(Protobuf_INCLUDE_DIR "/usr/local/include" CACHE PATH "Local protobuf include" FORCE)
-        set(Protobuf_INCLUDE_DIRS "/usr/local/include" CACHE PATH "Local protobuf includes" FORCE)
-    else ()
-        message(FATAL_ERROR "Found /usr/local/lib/libprotobuf.so but /usr/local/include/google/protobuf is missing. Install protobuf headers in /usr/local to match local gRPC/protoc, or remove /usr/local protobuf libs.")
-    endif ()
-elseif (EXISTS "/usr/include/google/protobuf")
-    set(Protobuf_INCLUDE_DIR "/usr/include" CACHE PATH "System protobuf include" FORCE)
-    set(Protobuf_INCLUDE_DIRS "/usr/include" CACHE PATH "System protobuf includes" FORCE)
-endif ()
-if (EXISTS "/usr/local/lib/libprotobuf.so")
-    set(Protobuf_LIBRARY "/usr/local/lib/libprotobuf.so" CACHE FILEPATH "Local protobuf lib" FORCE)
-    set(Protobuf_LIBRARY_DEBUG "/usr/local/lib/libprotobuf.so" CACHE FILEPATH "Local protobuf lib" FORCE)
-    set(Protobuf_LIBRARY_RELEASE "/usr/local/lib/libprotobuf.so" CACHE FILEPATH "Local protobuf lib" FORCE)
-    set(Protobuf_LITE_LIBRARY_DEBUG "/usr/local/lib/libprotobuf-lite.so" CACHE FILEPATH "Local protobuf lib" FORCE)
-    set(Protobuf_LITE_LIBRARY_RELEASE "/usr/local/lib/libprotobuf-lite.so" CACHE FILEPATH "Local protobuf lib" FORCE)
-    set(Protobuf_PROTOC_LIBRARY_DEBUG "/usr/local/lib/libprotoc.so" CACHE FILEPATH "Local protobuf lib" FORCE)
-    set(Protobuf_PROTOC_LIBRARY_RELEASE "/usr/local/lib/libprotoc.so" CACHE FILEPATH "Local protobuf lib" FORCE)
-elseif (EXISTS "/usr/lib/x86_64-linux-gnu/libprotobuf.so")
-    set(Protobuf_LIBRARY "/usr/lib/x86_64-linux-gnu/libprotobuf.so" CACHE FILEPATH "System protobuf lib" FORCE)
-    set(Protobuf_LIBRARY_DEBUG "/usr/lib/x86_64-linux-gnu/libprotobuf.so" CACHE FILEPATH "System protobuf lib" FORCE)
-    set(Protobuf_LIBRARY_RELEASE "/usr/lib/x86_64-linux-gnu/libprotobuf.so" CACHE FILEPATH "System protobuf lib" FORCE)
-    set(Protobuf_LITE_LIBRARY_DEBUG "/usr/lib/x86_64-linux-gnu/libprotobuf-lite.so" CACHE FILEPATH "System protobuf lib" FORCE)
-    set(Protobuf_LITE_LIBRARY_RELEASE "/usr/lib/x86_64-linux-gnu/libprotobuf-lite.so" CACHE FILEPATH "System protobuf lib" FORCE)
-    set(Protobuf_PROTOC_LIBRARY_DEBUG "/usr/lib/x86_64-linux-gnu/libprotoc.so" CACHE FILEPATH "System protobuf lib" FORCE)
-    set(Protobuf_PROTOC_LIBRARY_RELEASE "/usr/lib/x86_64-linux-gnu/libprotoc.so" CACHE FILEPATH "System protobuf lib" FORCE)
-elseif (EXISTS "/usr/lib64/libprotobuf.so")
-    set(Protobuf_LIBRARY "/usr/lib64/libprotobuf.so" CACHE FILEPATH "System protobuf lib" FORCE)
-    set(Protobuf_LIBRARY_DEBUG "/usr/lib64/libprotobuf.so" CACHE FILEPATH "System protobuf lib" FORCE)
-    set(Protobuf_LIBRARY_RELEASE "/usr/lib64/libprotobuf.so" CACHE FILEPATH "System protobuf lib" FORCE)
-    set(Protobuf_LITE_LIBRARY_DEBUG "/usr/lib64/libprotobuf-lite.so" CACHE FILEPATH "System protobuf lib" FORCE)
-    set(Protobuf_LITE_LIBRARY_RELEASE "/usr/lib64/libprotobuf-lite.so" CACHE FILEPATH "System protobuf lib" FORCE)
-    set(Protobuf_PROTOC_LIBRARY_DEBUG "/usr/lib64/libprotoc.so" CACHE FILEPATH "System protobuf lib" FORCE)
-    set(Protobuf_PROTOC_LIBRARY_RELEASE "/usr/lib64/libprotoc.so" CACHE FILEPATH "System protobuf lib" FORCE)
-elseif (EXISTS "/usr/lib/libprotobuf.so")
-    set(Protobuf_LIBRARY "/usr/lib/libprotobuf.so" CACHE FILEPATH "System protobuf lib" FORCE)
-    set(Protobuf_LIBRARY_DEBUG "/usr/lib/libprotobuf.so" CACHE FILEPATH "System protobuf lib" FORCE)
-    set(Protobuf_LIBRARY_RELEASE "/usr/lib/libprotobuf.so" CACHE FILEPATH "System protobuf lib" FORCE)
-    set(Protobuf_LITE_LIBRARY_DEBUG "/usr/lib/libprotobuf-lite.so" CACHE FILEPATH "System protobuf lib" FORCE)
-    set(Protobuf_LITE_LIBRARY_RELEASE "/usr/lib/libprotobuf-lite.so" CACHE FILEPATH "System protobuf lib" FORCE)
-    set(Protobuf_PROTOC_LIBRARY_DEBUG "/usr/lib/libprotoc.so" CACHE FILEPATH "System protobuf lib" FORCE)
-    set(Protobuf_PROTOC_LIBRARY_RELEASE "/usr/lib/libprotoc.so" CACHE FILEPATH "System protobuf lib" FORCE)
-endif ()
+# ---------------------------------------------------------------------------
+# gRPC discovery
+#
+# Protobuf 已在 Torch 之前提前加载（见上方 find_package(Protobuf CONFIG QUIET)），
+# 这里只需查找 gRPC。其内部 find_dependency(Protobuf) 会复用已 cache 的结果，
+# 不会触发 vcpkg protobuf-targets 的"部分 target 已定义"保护错误。
+#
+# 推荐通过以下任一方式提供 Protobuf / gRPC：
+#   1) vcpkg toolchain（跨发行版统一版本，推荐）
+#        cmake --preset default
+#      或
+#        cmake -S . -B build -DCMAKE_TOOLCHAIN_FILE=<vcpkg>/scripts/buildsystems/vcpkg.cmake
+#   2) 系统包（apt/dnf 等）：安装后 CMake 会自动从默认路径找到
+#   3) 自定义安装位置：通过 -DCMAKE_PREFIX_PATH=<your-prefix> 提示 CMake
+# ---------------------------------------------------------------------------
+find_package(gRPC CONFIG REQUIRED)
 
-find_package(Protobuf REQUIRED)
-find_package(gRPC REQUIRED)
-
-set(NVMESERVICE_PROTOBUF_LINK_LIBS "")
+if (DEFINED Protobuf_VERSION)
+    message(STATUS "Using Protobuf: version=${Protobuf_VERSION}")
+endif ()
 if (TARGET protobuf::libprotobuf)
-    list(APPEND NVMESERVICE_PROTOBUF_LINK_LIBS protobuf::libprotobuf)
+    message(STATUS "  - target: protobuf::libprotobuf available")
 endif ()
-if (Protobuf_LIBRARIES)
-    list(APPEND NVMESERVICE_PROTOBUF_LINK_LIBS ${Protobuf_LIBRARIES})
-elseif (Protobuf_LIBRARY)
-    list(APPEND NVMESERVICE_PROTOBUF_LINK_LIBS ${Protobuf_LIBRARY})
+message(STATUS "Found gRPC: target gRPC::grpc++ ready")
+
+# protoc 可执行文件：优先使用 imported target（modern protobuf-config 提供）
+if (TARGET protobuf::protoc)
+    set(GEMINIFS_PROTOC_EXECUTABLE "$<TARGET_FILE:protobuf::protoc>")
+elseif (Protobuf_PROTOC_EXECUTABLE)
+    set(GEMINIFS_PROTOC_EXECUTABLE "${Protobuf_PROTOC_EXECUTABLE}")
+else ()
+    message(FATAL_ERROR "protoc not found. Please ensure protobuf is properly installed.")
 endif ()
 
 set(nvmeservice_proto "${nvmeservice_root}/src/nvmeservice.proto")
@@ -341,7 +394,7 @@ add_custom_command(
            "${CMAKE_CURRENT_BINARY_DIR}/nvmeservice.pb.h"
            "${CMAKE_CURRENT_BINARY_DIR}/nvmeservice.grpc.pb.cc"
            "${CMAKE_CURRENT_BINARY_DIR}/nvmeservice.grpc.pb.h"
-    COMMAND "${Protobuf_PROTOC_EXECUTABLE}"
+    COMMAND "${GEMINIFS_PROTOC_EXECUTABLE}"
     ARGS --cpp_out "${CMAKE_CURRENT_BINARY_DIR}"
          --grpc_out "${CMAKE_CURRENT_BINARY_DIR}"
          -I "${nvmeservice_root}/src"
@@ -359,11 +412,17 @@ add_library(nvmeservice ${nvmeservice_sources} ${NVMESERVICE_PROTO_SRCS} ${NVMES
 target_include_directories(nvmeservice PUBLIC
     "${nvmeservice_root}/src"
     "${CMAKE_CURRENT_BINARY_DIR}"
-    "${Protobuf_INCLUDE_DIRS}"
 )
 target_link_libraries(nvmeservice PRIVATE libnvm CUDA::cudart Threads::Threads)
-target_link_libraries(nvmeservice PUBLIC gRPC::grpc++ ${NVMESERVICE_PROTOBUF_LINK_LIBS})
-target_link_libraries(nvmeservice PRIVATE yaml-cpp)
+# 现代写法：通过 imported target 链接 protobuf + grpc，include 路径自动传播
+if (TARGET protobuf::libprotobuf)
+    target_link_libraries(nvmeservice PUBLIC gRPC::grpc++ protobuf::libprotobuf)
+else ()
+    # 极老的 FindProtobuf.cmake 兜底
+    target_link_libraries(nvmeservice PUBLIC gRPC::grpc++ ${Protobuf_LIBRARIES})
+    target_include_directories(nvmeservice PUBLIC ${Protobuf_INCLUDE_DIRS})
+endif ()
+target_link_libraries(nvmeservice PRIVATE ${GEMINIFS_YAML_CPP_TARGET})
 set_target_properties(nvmeservice PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 set_target_properties(nvmeservice PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 set_target_properties(nvmeservice PROPERTIES OUTPUT_NAME "nvmeservice")

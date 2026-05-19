@@ -12,9 +12,9 @@ add_executable(nvmeservice_daemon_example
 target_link_libraries(nvmeservice_daemon_example PRIVATE
     nvmeservice
     libnvm
-    yaml-cpp
+    ${GEMINIFS_YAML_CPP_TARGET}
     gRPC::grpc++
-    ${NVMESERVICE_PROTOBUF_LINK_LIBS}
+    protobuf::libprotobuf
     Threads::Threads
     CUDA::cudart
 )
@@ -34,7 +34,7 @@ target_link_libraries(nvmeservice_client_example PRIVATE
     nvmeservice
     libnvm
     gRPC::grpc++
-    ${NVMESERVICE_PROTOBUF_LINK_LIBS}
+    protobuf::libprotobuf
     Threads::Threads
     CUDA::cudart
 )
