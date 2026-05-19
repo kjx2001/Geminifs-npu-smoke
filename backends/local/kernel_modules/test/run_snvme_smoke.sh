@@ -167,9 +167,9 @@ if [[ "$rc" -ne 0 && -n "$GPU_MODE" ]] && command -v nvidia-smi >/dev/null 2>&1;
                 echo "             Inspect with:"                                       >&2
                 echo "               nvidia-smi -q | grep -A2 Fabric"                  >&2
                 echo "               cat /sys/module/nvidia/refcnt"                    >&2
-                echo "             Recovery: see PORTING.md section 8.1, or follow"    >&2
-                echo "             doc/tencentos-cuda-manual-install.md section 9"     >&2
-                echo "             ('emergency reinstall')."                            >&2
+                echo "             Recovery: see PORTING.md section 8.1 (or, in"       >&2
+                echo "             extreme cases, reinstall the NVIDIA driver after"   >&2
+                echo "             killing every CUDA process and rmmod-ing nvidia*)." >&2
             else
                 echo "      [ ok ] Fabric State = Completed on all ${fab_total} GPU(s)" >&2
             fi
