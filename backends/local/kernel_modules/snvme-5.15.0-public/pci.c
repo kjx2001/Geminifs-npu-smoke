@@ -1211,7 +1211,7 @@ static int adapter_alloc_cq(struct nvme_dev *dev, u16 qid,
 	c.create_cq.qsize = cpu_to_le16(nvmeq->q_depth - 1);
 	c.create_cq.cq_flags = cpu_to_le16(flags);
 	c.create_cq.irq_vector = cpu_to_le16(vector);
-	// printk("adapter_alloc_cq qid is %u\n",c.create_cq.cq_flags);
+
 	return snvme_submit_sync_cmd(dev->ctrl.admin_q, &c, NULL, 0);
 }
 
