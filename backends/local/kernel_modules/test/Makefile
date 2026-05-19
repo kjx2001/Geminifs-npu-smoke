@@ -17,6 +17,17 @@
 #
 # Override knobs:
 #   CC, CFLAGS, NVCC, NVCCFLAGS, CUDA_ARCH
+#
+# GPU arch selection (CUDA_ARCH):
+#   - default: auto-detect via `nvidia-smi --query-gpu=compute_cap`
+#     so the build follows the host GPU (e.g. H20 -> sm_90,
+#     A100 -> sm_80, V100 -> sm_70).
+#   - fallback: sm_80 (Ampere A100), still accepted by every
+#     CUDA toolkit from 11.0 through 13.x.
+#   - override: `make CUDA_ARCH=sm_90` to force one explicitly.
+#   The previous baseline hard-coded sm_70, which CUDA 13 has
+#   dropped -- nvcc reports "Unsupported gpu architecture 'sm_70'"
+#   on any toolkit >= 13.0 (e.g. /usr/local/cuda-13.0/).
 
 TARGET      := snvme_smoke
 TARGET_GPU  := snvme_smoke_gpu
@@ -27,7 +38,25 @@ CFLAGS    ?= -O2 -Wall -Wextra -Wno-unused-parameter -std=c11 -I$(UAPI_INC)
 LDFLAGS   ?=
 
 NVCC       ?= nvcc
-CUDA_ARCH  ?= sm_70
+
+# Probe the host's primary GPU compute capability and translate
+# "X.Y" (e.g. "9.0") into "sm_XY" (e.g. "sm_90").  Empty if
+# nvidia-smi is missing, returns no GPUs, or returns a malformed
+# value -- in which case CUDA_ARCH falls through to the static
+# default below.
+DETECTED_CC := $(shell nvidia-smi --query-gpu=compute_cap \
+                       --format=csv,noheader 2>/dev/null \
+                   | head -n1 \
+                   | sed -e 's/[[:space:]]//g' -e 's/\.//' )
+ifneq ($(DETECTED_CC),)
+CUDA_ARCH  ?= sm_$(DETECTED_CC)
+else
+# Static fallback if auto-detect fails.  sm_80 is the lowest arch
+# that every CUDA toolkit from 11.0 through 13.x accepts AND that
+# covers the GPU families we actually ship on (A100, H100/H20).
+CUDA_ARCH  ?= sm_80
+endif
+
 NVCCFLAGS  ?= -O2 -std=c++17 -arch=$(CUDA_ARCH) -I$(UAPI_INC) \
               -Xcompiler=-Wall,-Wextra,-Wno-unused-parameter
 
@@ -51,6 +80,7 @@ $(TARGET): $(SRC)
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
 
 $(TARGET_GPU): $(SRC_GPU)
+	@echo "[+] nvcc: CUDA_ARCH=$(CUDA_ARCH) (override with 'make CUDA_ARCH=sm_XX')"
 	$(NVCC) $(NVCCFLAGS) -o $@ $<
 
 clean:
