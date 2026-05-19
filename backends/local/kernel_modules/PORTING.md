@@ -97,6 +97,71 @@ When porting:
 3. Stay strict on `EXPORT_SYMBOL_GPL` selection. If the in-tree
    `nvme-core.ko` has already exported a name SNVMe needs, do **not**
    re-export it from `snvme-core.ko`; rename the SNVMe one instead.
+4. **`snvme-rename.sed` only rewrites C identifiers; it cannot touch
+   `printf`-style format strings.** Every site that constructs a
+   device, IRQ, workqueue, sysfs class or chrdev region name from a
+   literal must be renamed by hand. The complete list — re-audit
+   after every uplift:
+
+   `core.c` (in `nvme_core_init` and friends):
+   - `alloc_workqueue("snvme-wq", ...)`,
+     `alloc_workqueue("snvme-reset-wq", ...)`,
+     `alloc_workqueue("snvme-delete-wq", ...)`
+     — workqueues are exposed under
+     `/sys/devices/virtual/workqueue/` because of `WQ_SYSFS`; a
+     duplicate name makes `alloc_workqueue()` fail with
+     `kobject_add_internal failed for nvme-wq with -EEXIST` and
+     `insmod` aborts in `nvme_core_init`.  This is the **first**
+     symptom of a baseline that forgot the §2 string-literal
+     audit.
+   - `alloc_chrdev_region(..., "snvme")`
+     — owner tag in `/proc/devices`; does not fail on duplicates,
+     but the two modules end up sharing one line and udev rules
+     that match on the chrdev name break.
+   - `class_create(THIS_MODULE, "snvme")` and
+     `class_create(THIS_MODULE, "snvme-subsystem")`
+     — sysfs class names under `/sys/class/`; behavior on
+     duplicates is kernel-version dependent (silent shared-pointer
+     on some, `EEXIST` on others — never rely on either).
+   - `dev_set_name(ctrl->device, "snvme%d", ...)` — per-controller
+     sysfs name.
+   - `dev_set_name(&subsys->dev, "snvme-subsys%d", ...)` — per-
+     subsystem sysfs name (the class is already separate, so this
+     is for grep-friendliness and uniform "snvme..." output, not
+     a hard collision).
+
+   `multipath.c`:
+   - `sprintf(disk_name, "snvme%dn%d", ...)` (non-multipath fallback
+     and multipath head),
+     `sprintf(disk_name, "snvme%dc%dn%d", ...)` (hidden multipath
+     leg).
+     A leftover `"nvme%dn%d"` collides with the in-tree
+     `/dev/nvme0n1`; `device_add_disk()` then fails and probe
+     unwinds.
+
+   `nvme.h`:
+   - the non-multipath inline fallback for `nvme_set_disk_name()`:
+     `sprintf(disk_name, "snvme%dn%d", ...)`.  Same hazard as
+     above, only on kernels built without `CONFIG_NVME_MULTIPATH`.
+
+   `pci.c`:
+   - `pci_request_irq(..., "snvme%dq%d", ...)` — IRQ description
+     string in `/proc/interrupts`; duplicates merely confuse
+     debugging, no hard failure.
+   - `pci_request_mem_regions(pdev, "snvme")` — `/proc/iomem`
+     owner tag; same effect.
+
+   **Do NOT** rename the NVMe wwid prefix used by the `wwid_show`
+   sysfs attribute (`"nvme.%04x-..."` in `core.c`).  That prefix is
+   part of the NVMe userspace contract (udev / multipath-tools
+   matches on it); keep it byte-for-byte identical to upstream.
+
+   Missing any one of the renamable sites above silently
+   re-introduces a `/dev`, `/proc/interrupts` or workqueue-sysfs
+   collision with the in-tree `nvme.ko`.  This regressed on the
+   `snvme-5.4.241-1-tlinux4-0017` baseline initial port (the
+   upstream-5.4 literals were carried verbatim) and was only
+   caught by trying to `insmod` while `nvme.ko` was already loaded.
 
 ---
 
@@ -374,6 +439,51 @@ sudo rmmod snvme_core
 Any process that still holds `/dev/ssnvme<N>` open will see further
 ioctls fail with `-EBADF` because `ctrl_find_by_inode()` returns NULL.
 
+### 6.1 Module signing on locked-down kernels
+
+Deployment kernels that ship with `CONFIG_MODULE_SIG_FORCE=y` (e.g.
+TencentOS Server 5.4.241-1-tlinux4-0017) reject every unsigned
+module with `Loading of unsigned module is rejected` and
+`insmod: ... Required key not available`.  Three observations
+matter for porting:
+
+1. `CONFIG_MODULE_SIG_FORCE=y` is a **compile-time** enforcement.
+   It cannot be cleared at runtime via `sysctl
+   kernel.modules_sig_enforce`, kernel cmdline `module.sig_enforce=0`,
+   `insmod --force`, or a Secure Boot toggle — those knobs only
+   apply to `CONFIG_MODULE_SIG_FORCE=n` kernels.  Confirm with:
+
+   ```bash
+   grep CONFIG_MODULE_SIG_FORCE /boot/config-$(uname -r)
+   ```
+
+2. Self-signing requires either
+   `CONFIG_SECONDARY_TRUSTED_KEYRING=y` plus a writable secondary
+   keyring (Secure Boot + MOK, or `keyctl add asymmetric` if
+   integrity policy allows), OR access to the CA whose public
+   half is baked into `.builtin_trusted_keys`.  On the TencentOS
+   image above neither holds, so the only production path is the
+   central signing service (kmod upload → signed kmod download
+   → `insmod`).
+3. For **active porting work** (editing snvme baselines, running
+   the §7.4 verification gate), prefer a development host whose
+   running kernel does not set `CONFIG_MODULE_SIG_FORCE=y` (any
+   stock mainline kernel, the upstream `temp/kernel-5.4.241-1.0017.7`
+   rebuilt with `CONFIG_MODULE_SIG_FORCE=n`, etc.).  The signing
+   workflow is a deployment concern, not a porting concern, and
+   trying to iterate on snvme with a "edit → build → upload →
+   wait → download → insmod → dmesg" loop is impractical.
+
+The same `scripts/sign-file` helper that ships with the kernel
+build tree is used in all signing workflows:
+
+```bash
+/usr/src/kernels/$(uname -r)/scripts/sign-file \
+    sha256 <priv_key.pem> <pub_key.x509> snvme-core.ko
+/usr/src/kernels/$(uname -r)/scripts/sign-file \
+    sha256 <priv_key.pem> <pub_key.x509> snvme.ko
+```
+
 ---
 
 ## 7. Porting to a new kernel version
@@ -507,7 +617,19 @@ ioctls fail with `-EBADF` because `ctrl_find_by_inode()` returns NULL.
 This is a list of bugs that have been found and fixed in SNVMe in the
 past — they are easy to reintroduce during a 3-way merge because the
 surrounding code changes but the **bug pattern** is invisible to diff.
-Re-audit each one after §7.1:
+Re-audit each one after §7.1.
+
+> **Per-baseline status note.** Where a trap was specifically verified
+> against a baseline different from `snvme-5.15.0-public`, the affected
+> file calls it out at the patch site with a `PORTING.md §7.3.1` cross
+> reference. The `snvme-5.4.241-1-tlinux4-0017` baseline was audited
+> in full against this list and additionally fixes traps #4, the
+> `NVM_MAP_DEVICE_MEMORY` `copy_to_user` leak, and the
+> **`snvm_dev_fops` missing `.release`** hook (all three of which are
+> still latent in `snvme-5.15.0-public`); see that directory's `pci.c`
+> banner for the full bug-fix list. When uplifting to a new kernel,
+> diff against `snvme-5.4.241-1-tlinux4-0017/pci.c` for the cleanest
+> version of these fixes.
 
 - **`svm_mmap_registers` null-check must be `||`, not `&&`.**
   (`snvme/pci.c`.) `ctrl_find_by_inode()` can legitimately return
@@ -533,7 +655,14 @@ Re-audit each one after §7.1:
   (`snvme/pci.c` `NVM_MAP_*` + `copy_to_user` error branches.)
   Failing to roll back poisons the `use_sreg` gate: subsequent
   `SNVM_DEVICE_BIND` sees `ioq_map_num > ioq_num` and silently falls
-  back to `dma_alloc_coherent` (the exact Phase-3-class bug).
+  back to `dma_alloc_coherent` (the exact Phase-3-class bug). The
+  rollback set is: `ctrl->ioq_map_num--`, `ctrl->cq_num--` if
+  `map->is_cq`, then `unmap_and_release(map)`. This applies to both
+  the budget-overflow path (just after `ioq_map_num += 1`) AND the
+  final `copy_to_user(request.ioaddrs, ...)` path. Fixed in
+  `snvme-5.4.241-1-tlinux4-0017/pci.c` (`NVM_MAP_HOST_MEMORY` and
+  `NVM_MAP_DEVICE_QUEUE_MEMORY` cases); still latent in
+  `snvme-5.15.0-public/pci.c`.
 - **`snvm_chrdev_helper(remove)` teardown order:
   `ctrl_put()` FIRST, `ida_simple_remove()` SECOND.** (`snvme/pci.c`.)
   `ctrl_put()` uses `ctrl->number` internally (`device_destroy()` /
@@ -548,7 +677,9 @@ Re-audit each one after §7.1:
 - **`NVM_MAP_DEVICE_MEMORY` (data path) must `unmap_and_release()`
   on `copy_to_user` failure.** Otherwise a crash in userspace between
   `ioctl()` and receiving the IO addresses leaks pinned GPU pages
-  for the lifetime of the module.
+  for the lifetime of the module. Fixed in
+  `snvme-5.4.241-1-tlinux4-0017/pci.c`; still latent in
+  `snvme-5.15.0-public/pci.c`.
 - **`nvme_probe()` must gate on `ctrl_find_by_pci_dev(&ctrl_list, pdev) != NULL`
   at the very top, returning `-ENODEV` otherwise.** (`snvme/pci.c`.)
   `pci_register_driver(&snvme_driver)` inside `snvm_rebind_driver()`
@@ -586,6 +717,144 @@ Re-audit each one after §7.1:
   but are independent. Same applies to `NVM_MAP_HOST_MEMORY` /
   `NVM_MAP_DEVICE_QUEUE_MEMORY` — pick the ioctl that matches your
   `on_host` decision.
+- **`snvm_dev_fops` MUST have `.open` + `.release` hooks so that an
+  abnormal userspace exit cannot leak host pins, GPU p2p references,
+  or per-ctrl IO-queue accounting counters.** Upstream snvme-5.15.0
+  and the original 5.4 port ship `snvm_dev_fops` with only `.owner +
+  .unlocked_ioctl + .mmap` — there is no automatic cleanup if the
+  process holding `/dev/ssnvme*` open dies between `NVM_MAP_*` and the
+  matching `NVM_UNMAP_*`. Symptoms on TencentOS 5.4.241 (reproducible
+  in `/var/log/messages`):
+
+    1. Next `SNVM_DEVICE_BIND` after a test crash logs
+       `snvme: ctrl exist, ioq_num=N cq_num=M map_num=K` — the
+       controller is reused **dirty**, with counters carried over
+       from the dead process.
+    2. `nvidia.ko` refcount accumulates because nobody calls
+       `nvidia_p2p_put_pages()`; eventually `rmmod snvme` says
+       "module in use" forever and the box requires a reboot.
+
+  Note: the `snvme: snvme_find_get_ns(nsid=1) failed` 3x log line
+  often appears nearby in `/var/log/messages` but is a **separate**
+  bug (the `NVM_GET_DEV_INFO` vs `nvme_scan_work` race documented in
+  the next trap entry). The two are independently reproducible and
+  must be fixed independently — the dirty-rebind path makes the
+  scan race **more likely** by short-circuiting the probe-side
+  delays, but the scan race exists on a fresh module load too.
+
+  Fix (recorded at `snvme-5.4.241-1-tlinux4-0017/pci.c` ~lines
+  4749-4920 and `map.c` `map_purge_by_owner`):
+
+  - `.open` allocates a `struct snvm_dev_owner { ctrl, owner }` and
+    stashes it in `file->private_data`. Capturing the owner at open
+    time (not at release time) is critical — by the time
+    `__fput()` runs, `current` may be a different thread group
+    member or a forked child, while `map->owner` was set to the
+    process that issued the `NVM_MAP_*` ioctl.
+  - `.release` walks `host_list / device_queue_list` once to compute
+    the rollback deltas for `ctrl->ioq_map_num` and `ctrl->cq_num`,
+    then calls `map_purge_by_owner(list, owner)` against all three
+    map lists. Use **checked subtraction** for the counter rollback
+    (a buggy userspace path can leave counters in a state where
+    `rb_*` exceeds the current value; clamp to zero rather than
+    underflow into UINT_MAX, which would then disable the `use_sreg`
+    branch on the next bind).
+  - The split `pass-1 count / pass-2 free` is mandatory because
+    `unmap_and_release()` does `list_remove()` on the descriptor;
+    saving a `next` pointer across the call would dereference a
+    freed node. `map_purge_by_owner` re-fetches `list_next(&head)`
+    after every free for the same reason.
+
+  Re-audit rule: any uplift that touches `snvm_dev_fops`,
+  `struct map`, or the `ioq_map_num` / `cq_num` accounting MUST
+  re-verify that these two hooks still fire — a single
+  `kill -9 <pid>` against the smoke test, immediately followed by
+  `cat /sys/module/snvme/refcnt` and `lsof /dev/ssnvme0`, is the
+  fastest manual probe.
+
+- **`NVM_GET_DEV_INFO` MUST wait for `nvme_scan_work` to finish
+  before returning `snvme_find_get_ns(nsid=1) failed`.** `pci.c`
+  `snvme_start_ctrl()` -> `nvme_queue_scan()` -> `queue_work(s_nvme_wq,
+  &ctrl->scan_work)` is asynchronous: the worker is the only code
+  path that calls `nvme_alloc_ns()` and `list_add_tail(&ns->list,
+  &ctrl->namespaces)`. `snvm_rebind_driver` finishes (and userspace
+  gets back from `SNVM_DEVICE_BIND` -> `ioctl()`) at the moment
+  `device_attach` returns, which is **before** `scan_work` has even
+  started in many cases. Userspace then immediately issues
+  `NVM_GET_DEV_INFO` and `snvme_find_get_ns` walks an empty
+  `namespaces` list, returning NULL.
+
+  Symptom (TencentOS 5.4.241, `/var/log/messages` 2026-05-18
+  16:11:12 and 19:21:46): every BIND logs **exactly three**
+  consecutive `snvme: snvme_find_get_ns(nsid=1) failed` lines —
+  the "three" comes from libnvm's caller-side retry loop in
+  `device.cpp`. The 3x retries finish well within the
+  `scan_work` window, so all three observe an empty list.
+
+  Fix (`snvme-5.4.241-1-tlinux4-0017/pci.c` `NVM_GET_DEV_INFO`
+  case): on first lookup failure, call `flush_work(&ndev->ctrl.scan_work)`
+  (no-op if the work was never queued — `flush_work` documents this)
+  and retry; then if still NULL, poll with `msleep(50)` +
+  `flush_work` for up to 5 s before returning `-EFAULT`. The bound
+  preserves caller EFAULT semantics if the controller is actually
+  broken (admin queue dead, state never reached `NVME_CTRL_LIVE`,
+  etc.).
+
+  Pitfall to avoid: do NOT "fix" this in userspace by adding more
+  retry layers in libnvm. The kernel side has the synchronisation
+  primitive (`flush_work`) and the access to `ctrl->scan_work`;
+  userspace can only sleep blindly and hope, which is what created
+  the 3-retries-but-all-too-fast pattern visible in the logs.
+
+- **`snvm_rebind_driver` MUST use `driver_attach(&snvme_driver.driver)`,
+  NOT `device_attach(&pdev->dev)`.** This is a 5.4-specific landmine.
+  `device_driver_attach()` (used by snvme-5.15.0) does not exist on
+  5.4, and the obvious substitute `device_attach()` has subtly wrong
+  semantics for our use case: `device_attach` walks the device's bus
+  callback `__device_attach`, which iterates *all matching drivers*
+  and picks the **first** registered one. On a TencentOS host the
+  in-tree `nvme.ko` is loaded at boot, so it is always the first
+  match, and `device_attach()` silently rebinds the BDF to the
+  in-tree driver. dmesg signature (with the old code):
+
+  ```
+  snvme: binding nvme device to snvme: pci 0:8:0.0
+  nvme nvme0: pci function 0000:08:00.0          <-- nvme, not snvme!
+  nvme nvme0: 135/0/0 default/read/poll queues   <-- 3-tuple
+  ```
+
+  Note the absence of the `snvme: ctrl exist, ioq_num=...` line that
+  a successful snvme bind emits, and the absence of the
+  `snvme: device driver name: snvme` confirmation line. The follow-up
+  `SNVM_DEVICE_UNBIND` then trips the "device's driver is not snvme"
+  branch (-EFAULT on the old code; now -EINVAL after a separate
+  errno-cleanup fix).
+
+  The reproducer that catches this every time:
+
+  ```
+  ./run_snvme_smoke.sh 0000:08:00.0 --gpu              # leaves BDF "loose"
+  ./run_snvme_smoke.sh 0000:08:00.0 --gpu --bind       # fails at step 15
+  ```
+
+  Fix: replace `device_attach` with a bounded retry loop calling
+  `driver_attach(&snvme_driver.driver)`. `driver_attach` walks the
+  bus's device list and invokes the SPECIFIC driver's probe on every
+  unbound matching device. The `nvme_probe()` per-BDF gate
+  (`ctrl_find_by_pci_dev(&ctrl_list, pdev) != NULL`) ensures the
+  effect is scoped to the BDF the user already CHRDEV_CREATEd; every
+  other NVMe on the bus short-circuits to `-ENODEV` at the top of
+  probe. The retry is needed because, between `device_release_driver`
+  and `driver_attach`, udev's drivers_autoprobe rule may rebind the
+  device to the in-tree nvme — three attempts is enough in practice;
+  if udev wins three times in a row the host has a misconfigured
+  autoprobe rule and `-EBUSY` is the honest answer.
+
+  Verification: after a successful BIND the dmesg block should
+  contain `snvme: device driver name: snvme` and `snvme snvme0: pci
+  function ...` (note the doubled `s` in the device name); the
+  follow-up `default/read/poll/user queues` line MUST be the
+  4-tuple variant (`135/0/0/0`), not 3-tuple.
 
 None of these are detected by the smoke tests as written — the
 smoke tests run the happy path. They are detected by (a) reading
@@ -671,3 +940,18 @@ cleanly. Any failure prints `[FAIL] step=<N> ... errno=<E>` and stops.
 > it passes should you try `snvme_smoke_gpu` — a failure there usually
 > means the NVIDIA driver / `nvfs_nvidia_p2p_*` glue is broken
 > (kernel-side issue lives in `snvme/nvfs-p2p.c`), not the SNVMe core.
+
+### 8.1 Build/run troubleshooting cheat sheet
+
+| Symptom (where it surfaces) | Root cause | Fix |
+|---|---|---|
+| `nvcc fatal : Unsupported gpu architecture 'sm_XX'` at `make` time | The Makefile auto-detects CUDA_ARCH from the running GPU's compute capability via `nvidia-smi --query-gpu=compute_cap`.  Auto-detect fails (no GPU visible / driver not loaded) or the toolkit is too old/new for the detected arch (e.g. CUDA 13 dropped `sm_70`). | Pass `CUDA_ARCH` explicitly: `make CUDA_ARCH=sm_80` (A100, accepted by CUDA 11.0–13.x) or `make CUDA_ARCH=sm_90` (H100/H200/H20). |
+| `[FAIL] step=1  cudaGetDeviceCount -> system not yet initialized` at runtime, with `nvidia-smi -L` listing GPUs just fine | NVSwitch-equipped multi-GPU host (HGX H100/H200/H20 boards expose `/dev/nvidia-nvswitch*`).  CUDA runtime refuses `cuInit()` until `nvidia-fabricmanager` finishes the NVLink topology bring-up.  `nvidia-smi -L` does NOT need fabricmanager and so does not catch this. | `sudo systemctl enable --now nvidia-fabricmanager`.  If the service is missing, install the package matching your driver exactly: `sudo dnf install nvidia-fabric-manager-$(nvidia-smi --query-gpu=driver_version --format=csv,noheader \| head -n1)`. |
+| `[FAIL] step=1 cudaGetDeviceCount -> system not yet initialized` even after fabricmanager is active | NVLink Inband mode (H20 / H100 8-GPU NVL3 hosts): the GPU half of the NVLink handshake hasn't completed.  **Authoritative success signal** (verified on HGX H20 / driver 580.65.06): every GPU's "Fabric" block in `nvidia-smi -q` shows `State : Completed` and `Status : Success`.  Notes: (1) `GPU Fabric GUID : N/A` is **not** a failure indicator on this hardware -- some firmware/driver combos legitimately leave the GUID field N/A even on a healthy fabric.  (2) `Persistence-Mode = Disabled` is **also not** a failure indicator on a freshly rebooted host -- verified 2026-05-19 on HGX H20: PM Disabled across all 8 GPUs, Fabric all Completed, CUDA programs run fine.  PM only matters as a **recovery knob** when nvidia-uvm has been poisoned by a previous failed-cuInit / killed-CUDA-process refcount leak; in that case `nvidia-smi -pm 1` keeps the driver context resident long enough for fabricmanager's retry to complete.  Detect with: `nvidia-smi -q \| awk '/^    Fabric$/,/^$/' \| grep State` (every line should read "Completed"); `nvidia-smi --query-gpu=persistence_mode --format=csv,noheader` is informational only. | If Fabric is incomplete: `sudo nvidia-smi -pm 1 && sudo systemctl restart nvidia-fabricmanager`.  If that fails too: see doc/tencentos-cuda-manual-install.md section 9 ("emergency reinstall").  To make PM persistent across reboot (only useful as a defensive measure on hosts that are known to crash CUDA processes), install an `nvidia-persistenced.service` systemd unit -- the driver `.run` does not install one on TencentOS by default. |
+| **Misleading symptom note**: `strings /lib64/libcuda.so.1 \| grep -E '^[0-9]+\\.[0-9]+\\.[0-9]+$'` is NOT a valid way to verify libcuda's own version on driver >= 575.x.  The integers it returns are the *compatibility table* (what older client drivers this libcuda accepts), not the library's own version.  A 580.65.06 libcuda legitimately shows `575.57.07` as its highest match.  Use the file's hash against the matching `.run` payload, or trust `nvidia-smi --query-gpu=driver_version`, which queries the kernel module directly. | -- | -- |
+| `insmod: Required key not available` / `Loading of unsigned module is rejected` | Deployment kernel built with `CONFIG_MODULE_SIG_FORCE=y` (TencentOS 5.4.241-1-tlinux4-0017).  See section 6.1 above. | Sign through the deployment signing service, or develop on a kernel without `CONFIG_MODULE_SIG_FORCE=y`. |
+| `kobject_add_internal failed for nvme-wq with -EEXIST` at `insmod snvme-core.ko` time | Leftover `"nvme-wq"` / `"nvme-reset-wq"` / `"nvme-delete-wq"` string literal not renamed to `"snvme-*"`; collides with in-tree `nvme-core.ko`.  Section 2 string-literal rename rule missed.  Re-audit using the checklist in section 2 item 4. | Apply the rename to every workqueue / chrdev region / class literal listed in section 2 item 4.  Re-`insmod`. |
+| `map_find_by_pci_dev_and_idx cq error!` in dmesg during probe | Two distinct off-by-one bugs share this dmesg line: (a) user `ioq_idx` starts at 1 instead of 0 (section 7.3.1 trap #8); (b) userspace called `NVM_MAP_HOST_MEMORY` but passed `is_cq != 1` to `NVM_SET_IOQ_NUM` so the kernel searches the wrong queue list (trap #9). | Re-read PORTING.md section 7.3.1 traps #8 and #9; verify libnvm / smoke-test caller matches the on_host vs device_queue split. |
+| `snvme: snvme_find_get_ns(nsid=1) failed` (exactly 3x per BIND) | `NVM_GET_DEV_INFO` ioctl races `nvme_scan_work`. Userspace gets back from `SNVM_DEVICE_BIND` at the moment `device_attach` returns, but `nvme_alloc_ns()` (the only path that puts `nsid=1` on `ctrl->namespaces`) runs asynchronously on `s_nvme_wq` after `snvme_start_ctrl()`. libnvm's 3-retry loop in `device.cpp` finishes inside the race window. **Independent of** any dirty-rebind / `.release` issue — reproduces on a fresh module load. Often *correlated* with a `snvme: ctrl exist, ioq_num=N cq_num=M map_num=K` line just above it (which is the separate dirty-rebind symptom of the `.release` bug). | The fix is on the **kernel side**, not userspace: `NVM_GET_DEV_INFO` must `flush_work(&ndev->ctrl.scan_work)` + bounded poll before declaring failure. See §7.3.1 trap "`NVM_GET_DEV_INFO` MUST wait for `nvme_scan_work`". Verify by grepping the BIND-time dmesg block for `NVM_GET_DEV_INFO: nsid=1 ready after N ms scan wait` (info log emitted on slow-path success). |
+| `rmmod snvme` says `module is in use` long after every `/dev/ssnvme*` user has exited, with `lsmod` showing `Used by 0` but the refcount in `/sys/module/snvme/refcnt` non-zero | A process died holding pinned p2p / host pages, the original `snvm_dev_fops` had no `.release` hook, so the refs leaked into `nvidia.ko`. See §7.3.1 trap "`snvm_dev_fops` MUST have `.open` + `.release` hooks". | Reboot is the only safe recovery on a host without the `.release` fix applied. With the fix in place this should be impossible — open a bug if it recurs. |
+| `[FAIL] step=15 SNVM_DEVICE_UNBIND ... errno=14 (Bad address)` (or with the errno fix: `errno=22 (Invalid argument)`), dmesg shows `snvme: device's driver is '...nvme', not 'snvme'` and the BIND-time block contains `nvme nvme0: pci function ...` (in-tree, not snvme) | `snvm_rebind_driver` called the 5.4 helper `device_attach()` which picks the **first** registered matching driver. Since in-tree `nvme.ko` is loaded at boot it always wins, and the BIND silently rebinds to nvme.ko — the next UNBIND then refuses because the driver isn't snvme. Reproducible by running `--gpu` (no bind) immediately followed by `--gpu --bind` on the same BDF. See §7.3.1 trap "`snvm_rebind_driver` MUST use `driver_attach`". | Confirm `snvm_rebind_driver` uses `driver_attach(&snvme_driver.driver)` + bounded retry, not `device_attach(&pdev->dev)`. After the fix the BIND-time dmesg block must contain `snvme: device driver name: snvme` and the queue-summary line must be the 4-tuple `135/0/0/0 default/read/poll/user` variant. |
