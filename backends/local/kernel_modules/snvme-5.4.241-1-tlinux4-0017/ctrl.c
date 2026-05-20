@@ -33,6 +33,13 @@ struct ctrl* ctrl_get(struct list* list, struct class* cls, struct pci_dev* pdev
     ctrl->ioq_map_num = 0;
     ctrl->cq_num = 0;
     /*
+     * Zero the queue-setup snapshot up front so that the segment 6a
+     * probe-time copy in pci.c reads setup.valid == 0 ("ioctl not
+     * called yet, use upstream defaults") for a freshly created
+     * ctrl, rather than uninitialised kmalloc poison.
+     */
+    memset(&ctrl->setup, 0, sizeof(ctrl->setup));
+    /*
      * cdev name: deliberately "ssnvme" (double-s), NOT a typo of
      * "snvme".  Rationale:
      *   - block-device gendisks are named "snvme%d[c%d]n%d" (see

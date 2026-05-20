@@ -388,6 +388,21 @@ struct nvme_dev {
 	unsigned int nr_user_use_sq;
 	unsigned int use_user_allocated;
 	unsigned int queue_on_host;
+	/*
+	 * Optional caller-imposed cap on the kernel-side IO-queue count
+	 * requested from the controller, populated at SNVM_DEVICE_BIND
+	 * time from ctrl->setup.cap_kernel_ioq (which itself is set by
+	 * the userspace NVM_SET_IOQ_NUM ioctl).
+	 *
+	 * Zero means "no override, fall back to num_possible_cpus()" --
+	 * upstream nvme's behaviour.  A non-zero value lets the user
+	 * shrink the kernel's IOQ ask so the controller's Set-Features
+	 * grant has room left for the user-allocated share without
+	 * triggering the fallback-to-dma_alloc_coherent branch in
+	 * s_nvme_setup_io_queues(): typical use case is a NVMe whose
+	 * MSI-X count is smaller than num_possible_cpus() on the host.
+	 */
+	unsigned int cap_kernel_ioq;
 };
 
 static int io_queue_depth_set(const char *val, const struct kernel_param *kp)
@@ -2698,26 +2713,50 @@ static int s_nvme_setup_io_queues(struct nvme_dev *dev)
 	struct nvme_queue *adminq = &dev->queues[0];
 	struct pci_dev *pdev = to_pci_dev(dev->dev);
 	unsigned int nr_io_queues;
+	unsigned int kernel_target;
 	unsigned int expect_num = 0;
 	unsigned long size;
 	int result;
 
 	/*
 	 * Sample the module parameters once at reset time so that we have
-	 * stable values to work with.
+	 * stable values to work with.  The per-BDF NVM_SET_IOQ_NUM
+	 * overrides (if any) were already folded into dev->nr_write_queues
+	 * / dev->nr_poll_queues during segment 6a's probe-time copy from
+	 * struct ctrl, so just re-sample the upstream parameters when no
+	 * override is in effect.
 	 */
-	dev->nr_write_queues = write_queues;
-	dev->nr_poll_queues = poll_queues;
+	if (!dev->cap_kernel_ioq) {
+		dev->nr_write_queues = write_queues;
+		dev->nr_poll_queues = poll_queues;
+	}
 
 	/*
 	 * If tags are shared with admin queue (Apple bug), then
 	 * make sure we only use one IO queue.
 	 */
-	if (dev->ctrl.quirks & NVME_QUIRK_SHARED_TAGS)
+	if (dev->ctrl.quirks & NVME_QUIRK_SHARED_TAGS) {
 		nr_io_queues = 1;
-	else
-		nr_io_queues = min(nvme_max_io_queues(dev),
-				   dev->nr_allocated_queues - 1);
+	} else {
+		/*
+		 * Kernel-side IOQ target = min(upstream default,
+		 * caller-supplied cap).  cap_kernel_ioq == 0 means "no
+		 * cap, use upstream's num_possible_cpus()-based math".
+		 * cap_kernel_ioq > 0 lets the user shrink the kernel's
+		 * Set-Features ask so the controller's MSI-X grant has
+		 * room left for the user share -- critical when the
+		 * NVMe's MSI-X vector count is smaller than the host's
+		 * num_possible_cpus() (e.g. Intel DC SSD: MSI-X=136 on
+		 * a 192-vCPU host) and we'd otherwise trip the
+		 * fallback-to-dma_alloc_coherent branch below.
+		 */
+		kernel_target = min(nvme_max_io_queues(dev),
+				    dev->nr_allocated_queues - 1);
+		if (dev->cap_kernel_ioq && dev->cap_kernel_ioq < kernel_target)
+			kernel_target = dev->cap_kernel_ioq;
+
+		nr_io_queues = kernel_target;
+	}
 
 	/*
 	 * snvme hook 6b-1: if userspace pre-registered IO queues, bias
@@ -2735,41 +2774,63 @@ static int s_nvme_setup_io_queues(struct nvme_dev *dev)
 	/*
 	 * snvme hook 6b-2: reconcile what the controller actually
 	 * granted (in nr_io_queues) against what userspace asked for
-	 * (in expect_num / nr_user_allocated_cq).  Three cases:
+	 * (in expect_num / nr_user_allocated_cq).  Four cases now
+	 * (the old "case A = fall back to dma_alloc_coherent" path
+	 * has been split into A1 / A2 so the user share survives a
+	 * partial grant):
 	 *
-	 *   A. Controller granted fewer than even the kernel needs
-	 *      (nr_io_queues < nr_allocated_queues - 1): user queues
-	 *      can't fit, fall back to upstream behavior.
+	 *   A1. Controller granted strictly fewer than the user share
+	 *       itself + 1 kernel queue (nr_user_allocated_cq + 1):
+	 *       there is literally no way to honor the user ask AND
+	 *       keep an admin path alive.  Fall back to upstream.
 	 *
-	 *   B. Controller granted exactly between kernel-only and
-	 *      kernel+user (kernel-only..expect_num): split the grant
-	 *      so kernel keeps nr_allocated_queues - nr_user_allocated_cq
-	 *      and user gets the rest.  If user's CQ count itself
-	 *      exceeds the granted max-1, we cannot honor the request
-	 *      and fall back.
+	 *   A2. (NEW) Controller granted between user_cq + 1 and
+	 *       kernel_target (i.e. less than the kernel wanted, but
+	 *       at least enough for user share + one kernel IOQ):
+	 *       SQUEEZE.  Give the user everything it asked for and
+	 *       let the kernel have what is left.  blk-mq is fine
+	 *       running with fewer HCTXs than there are CPUs -- some
+	 *       CPUs simply share an IOQ via the standard PCI MSI-X
+	 *       affinity mapping.  This is the common case on Intel
+	 *       DC SSDs + 192-vCPU TencentOS hosts.
 	 *
-	 *   C. Controller granted MORE than expect_num: keep the kernel
-	 *      cap at its original size and let the user use the full
-	 *      nr_user_allocated_cq.  (Bug-fix vs snvme-5.15: that
-	 *      branch left nr_user_use_cq=0, which silently broke the
-	 *      whole share path under high-spec controllers.  See the
-	 *      "default modify" decision in the segment-6b porting log.)
+	 *   B. Controller granted exactly between kernel_target and
+	 *      expect_num: split the grant so kernel keeps
+	 *      kernel_target and user gets the rest.  Same as
+	 *      pre-fix behaviour; no change.
+	 *
+	 *   C. Controller granted MORE than expect_num: keep the
+	 *      kernel cap at its original size and let the user use
+	 *      the full nr_user_allocated_cq.
 	 */
 	if (dev->use_user_allocated) {
-		if (nr_io_queues < dev->nr_allocated_queues - 1) {
+		unsigned int user_cq = dev->nr_user_allocated_cq;
+
+		if (nr_io_queues < user_cq + 1) {
 			dev->use_user_allocated = 0;
-			pr_warn("snvme: snvme_set_queue_count granted %u < kernel-min %u; falling back to dma_alloc_coherent\n",
-				nr_io_queues, dev->nr_allocated_queues - 1);
+			pr_warn("snvme: snvme_set_queue_count granted %u < user_cq+1 (%u); falling back to dma_alloc_coherent\n",
+				nr_io_queues, user_cq + 1);
+		} else if (nr_io_queues < kernel_target) {
+			/* Case A2: squeeze.  Keep the user share intact and
+			 * shrink the kernel side; nr_allocated_queues is
+			 * updated to match so blk-mq sees the new ceiling. */
+			dev->nr_allocated_queues = nr_io_queues - user_cq;
+			nr_io_queues             = dev->nr_allocated_queues - 1;
+			dev->nr_user_use_cq      = user_cq;
+			dev->nr_user_use_sq      = dev->nr_user_allocated_sq;
+			pr_info("snvme: queue squeeze: kernel=%u user=%u (controller granted %u, below ideal %u; user path preserved)\n",
+				nr_io_queues, dev->nr_user_use_cq,
+				nr_io_queues + dev->nr_user_use_cq,
+				kernel_target);
 		} else if (nr_io_queues <= expect_num) {
-			if (dev->nr_user_allocated_cq > nr_io_queues - 1) {
+			if (user_cq > nr_io_queues - 1) {
 				dev->use_user_allocated = 0;
 				pr_warn("snvme: too many user CQs (%u > %u); falling back\n",
-					dev->nr_user_allocated_cq,
-					nr_io_queues - 1);
+					user_cq, nr_io_queues - 1);
 			} else {
-				dev->nr_allocated_queues = nr_io_queues - dev->nr_user_allocated_cq;
+				dev->nr_allocated_queues = nr_io_queues - user_cq;
 				nr_io_queues             = dev->nr_allocated_queues - 1;
-				dev->nr_user_use_cq      = dev->nr_user_allocated_cq;
+				dev->nr_user_use_cq      = user_cq;
 				dev->nr_user_use_sq      = dev->nr_user_allocated_sq;
 				pr_info("snvme: queue split: kernel=%u user=%u (controller cap reached, expected %u)\n",
 					nr_io_queues, dev->nr_user_use_cq, expect_num);
@@ -3744,14 +3805,36 @@ static int nvme_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		dev->nr_user_allocated_sq     = ctrl->ioq_num - ctrl->cq_num;
 		dev->use_user_allocated       = 1;
 		dev->queue_on_host            = ctrl->on_host;
-		if (pdev->vendor == 0x8086 && pdev->device == 0x4140)
-			pr_info("snvme: detected Intel Optane P5800x\n");
 	} else {
 		dev->use_user_allocated = 0;
 	}
 
-	dev->nr_write_queues = write_queues;
-	dev->nr_poll_queues = poll_queues;
+	/*
+	 * Apply caller-supplied tunables from NVM_SET_IOQ_NUM.  These
+	 * override the module-parameter defaults (write_queues /
+	 * poll_queues) on a per-controller basis, and let the user pin
+	 * the kernel-side IO-queue request below num_possible_cpus()
+	 * when the controller cannot grant that many MSI-X vectors.
+	 *
+	 * setup.valid is the "ioctl was actually called" sentinel;
+	 * unconditionally reading these fields when setup.valid == 0
+	 * is harmless because the struct is kmalloc-zeroed inside
+	 * ctrl_get(), but the explicit gate documents intent and
+	 * prevents a future zero-meaning change from silently
+	 * clamping cap_kernel_ioq to 0 = "no override".
+	 */
+	if (ctrl && ctrl->setup.valid) {
+		if (ctrl->setup.nr_write)
+			dev->nr_write_queues = ctrl->setup.nr_write;
+		if (ctrl->setup.nr_poll)
+			dev->nr_poll_queues  = ctrl->setup.nr_poll;
+		dev->cap_kernel_ioq = ctrl->setup.cap_kernel_ioq;
+	} else {
+		dev->nr_write_queues = write_queues;
+		dev->nr_poll_queues  = poll_queues;
+		dev->cap_kernel_ioq  = 0;
+	}
+
 	dev->nr_allocated_queues = nvme_max_io_queues(dev) + 1;
 	dev->queues = kcalloc_node(dev->nr_allocated_queues,
 			sizeof(struct nvme_queue), GFP_KERNEL, node);
@@ -4551,11 +4634,13 @@ static long snvm_dev_map_ioctl(struct file *file, unsigned int cmd,
 	struct map *map = NULL;
 	struct nvm_ioctl_map request;
 	struct nvm_ioctl_dev drequest;
+	struct nvm_ioctl_setup setup;
 	struct nvme_dev *ndev;
 	struct nvme_ns *ns;
 	void __user *argp = (void __user *)arg;
 	u64 addr;
 	int ret = 0;
+	unsigned int i;
 
 	ctrl = ctrl_find_by_inode(&ctrl_list, file->f_inode);
 	if (!ctrl) {
@@ -4745,32 +4830,95 @@ static long snvm_dev_map_ioctl(struct file *file, unsigned int cmd,
 		break;
 
 	case NVM_SET_IOQ_NUM:
-		/* Userspace declares how many user-owned IOQs it
-		 * intends to register.  Stored on ctrl; the segment-6
-		 * probe-path hook reads ioq_num to gate queue-share.
+		/*
+		 * Userspace declares its full queue-budget setup in
+		 * one shot: total user IOQ count, on-host vs GPU
+		 * residency, kernel-side IOQ cap, write/poll override,
+		 * and an optional per-owner partition of the user share
+		 * (groups[]).
 		 *
-		 * Validation kept verbatim from snvme-5.15:
-		 *   - request.ioq_idx must be > 0
-		 *   - if a previous call already set ctrl->ioq_num,
-		 *     the new request must not exceed it (one-shot
-		 *     downward-only updates).
+		 * ABI rev note: this used to carry struct nvm_ioctl_map
+		 * (packed into .ioq_idx / .is_cq) on snvme-5.15-public.
+		 * Geminifs replaced that with the explicit
+		 * nvm_ioctl_setup struct because (a) the legacy layout
+		 * had no room for cap_kernel_ioq / groups, and
+		 * (b) _IOC_SIZE differed from the declared ioctl
+		 * number's size class, which the new layout fixes.
+		 * Old binaries get -ENOTTY at ioctl entry rather than
+		 * silent misparse.
+		 *
+		 * Validation:
+		 *   - ioq_num must be > 0
+		 *   - downward-only updates: if a previous call set
+		 *     ctrl->ioq_num, the new ioq_num must not exceed it
+		 *   - reserved fields must be zero
+		 *   - nr_groups <= SNVM_MAX_QUEUE_GROUPS
+		 *   - sum(groups[].count) must equal ioq_num when
+		 *     nr_groups > 0
 		 */
-		if (copy_from_user(&request, argp, sizeof(request)))
+		if (copy_from_user(&setup, argp, sizeof(setup)))
 			return -EFAULT;
 
-		if (request.ioq_idx <= 0) {
-			pr_err("snvme: NVM_SET_IOQ_NUM bad request: declared=%u, requested=%d\n",
-			       ctrl->ioq_num, request.ioq_idx);
-			return -EFAULT;
+		if (setup.ioq_num == 0) {
+			pr_err("snvme: NVM_SET_IOQ_NUM bad request: ioq_num=0 (declared=%u)\n",
+			       ctrl->ioq_num);
+			return -EINVAL;
 		}
-		if (ctrl->ioq_num && request.ioq_idx > ctrl->ioq_num) {
-			pr_err("snvme: NVM_SET_IOQ_NUM grow attempt: declared=%u, requested=%d\n",
-			       ctrl->ioq_num, request.ioq_idx);
-			return -EFAULT;
+		if (ctrl->ioq_num && setup.ioq_num > ctrl->ioq_num) {
+			pr_err("snvme: NVM_SET_IOQ_NUM grow attempt: declared=%u, requested=%u\n",
+			       ctrl->ioq_num, setup.ioq_num);
+			return -EINVAL;
+		}
+		if (setup.reserved[0] || setup.reserved[1]) {
+			pr_err("snvme: NVM_SET_IOQ_NUM: reserved fields must be zero\n");
+			return -EINVAL;
+		}
+		if (setup.nr_groups > SNVM_MAX_QUEUE_GROUPS) {
+			pr_err("snvme: NVM_SET_IOQ_NUM: nr_groups=%u > max %u\n",
+			       setup.nr_groups, SNVM_MAX_QUEUE_GROUPS);
+			return -EINVAL;
+		}
+		if (setup.nr_groups) {
+			unsigned int sum = 0;
+			for (i = 0; i < setup.nr_groups; i++) {
+				if (setup.groups[i].reserved) {
+					pr_err("snvme: NVM_SET_IOQ_NUM: group[%u].reserved must be zero\n", i);
+					return -EINVAL;
+				}
+				sum += setup.groups[i].count;
+			}
+			if (sum != setup.ioq_num) {
+				pr_err("snvme: NVM_SET_IOQ_NUM: sum(groups[].count)=%u != ioq_num=%u\n",
+				       sum, setup.ioq_num);
+				return -EINVAL;
+			}
 		}
 
-		ctrl->ioq_num = request.ioq_idx;
-		ctrl->on_host = request.is_cq;
+		/*
+		 * Commit to ctrl.  The legacy on_host / ioq_num scalars
+		 * are kept in sync with the new setup snapshot because
+		 * existing in-kernel code (probe segment 6a, queue
+		 * accounting in NVM_MAP_* handlers) still reads those
+		 * specific fields by name.
+		 */
+		ctrl->ioq_num            = setup.ioq_num;
+		ctrl->on_host            = !!(setup.flags & NVM_QUEUE_SETUP_F_ON_HOST);
+		ctrl->setup.valid        = 1;
+		ctrl->setup.ioq_num      = setup.ioq_num;
+		ctrl->setup.flags        = setup.flags;
+		ctrl->setup.cap_kernel_ioq = setup.cap_kernel_ioq;
+		ctrl->setup.nr_write     = setup.nr_write;
+		ctrl->setup.nr_poll      = setup.nr_poll;
+		ctrl->setup.nr_groups    = setup.nr_groups;
+		for (i = 0; i < setup.nr_groups; i++) {
+			ctrl->setup.groups[i].owner_id  = setup.groups[i].owner_id;
+			ctrl->setup.groups[i].count     = setup.groups[i].count;
+			ctrl->setup.groups[i].numa_node = setup.groups[i].numa_node;
+			ctrl->setup.groups[i].reserved  = 0;
+		}
+		pr_info("snvme: NVM_SET_IOQ_NUM: ioq_num=%u on_host=%u cap_kernel=%u groups=%u\n",
+			setup.ioq_num, ctrl->on_host,
+			setup.cap_kernel_ioq, setup.nr_groups);
 		ret = 0;
 		break;
 
@@ -4874,8 +5022,17 @@ static long snvm_dev_map_ioctl(struct file *file, unsigned int cmd,
 		break;
 
 	case NVM_CLEAR_IOQ_NUM:
+		/*
+		 * Reset accounting counters.  Also clear the setup
+		 * snapshot so that a re-bring-up that does NOT call
+		 * NVM_SET_IOQ_NUM again gets the upstream defaults
+		 * (write_queues/poll_queues from module parameters,
+		 * cap_kernel_ioq=0) instead of inheriting the previous
+		 * run's per-BDF tunables.
+		 */
 		ctrl->ioq_map_num = 0;
 		ctrl->cq_num      = 0;
+		memset(&ctrl->setup, 0, sizeof(ctrl->setup));
 		ret = 0;
 		break;
 

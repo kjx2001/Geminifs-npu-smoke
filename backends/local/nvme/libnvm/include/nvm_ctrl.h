@@ -57,6 +57,18 @@ void nvm_ctrl_free(nvm_ctrl_t* ctrl);
 
 
 int nvm_queue_set(nvm_ctrl_t* ctrl, int q_num);
+/*
+ * Full-fidelity queue-budget configuration entry point.  Wraps the
+ * NVM_SET_IOQ_NUM ioctl with a struct nvm_ioctl_setup payload that
+ * lets the caller pin both the kernel-side IOQ cap (cap_kernel_ioq)
+ * and the per-owner partition of the user share (groups[]).
+ *
+ * struct nvm_ioctl_setup is declared in <ioctl.h>; callers that
+ * only need the legacy single-arg behaviour should keep using
+ * nvm_queue_set() above, which is a thin wrapper around this.
+ */
+struct nvm_ioctl_setup;
+int nvm_queue_setup(nvm_ctrl_t* ctrl, struct nvm_ioctl_setup* setup);
 int nvm_queue_clear(nvm_ctrl_t* ctrl);
 int nvm_queue_share(nvm_ctrl_t *ctrl);
 int nvm_device_bind(nvm_ctrl_t* ctrl);

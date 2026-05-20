@@ -289,25 +289,31 @@ int main(int argc, char** argv) {
         step_ok("BAR0 CAP=0x%016" PRIx64, cap);
 
     /* ------------------------------------------------------------------ */
-    /* [6] NVM_SET_IOQ_NUM(2)                                              */
+    /* [6] NVM_SET_IOQ_NUM(2), on_host=0                                   */
     /*                                                                    */
-    /* Field semantics (NB: the names are misleading on this ioctl):      */
-    /*   request.ioq_idx -> total queue count                              */
-    /*   request.is_cq   -> on_host flag                                   */
-    /*                       0 = queues live on a CUDA device              */
-    /*                       1 = queues live in host memory                */
-    /* See snvme_smoke.c [6] for the trap; this binary is the GPU path,   */
-    /* so on_host=0 (= request.is_cq = 0) is correct here.                 */
+    /* Geminifs ABI: NVM_SET_IOQ_NUM now takes struct nvm_ioctl_setup.    */
+    /*   .ioq_num = 2            total user IOQ count (1 SQ + 1 CQ).      */
+    /*   .flags                  ON_HOST flag CLEARED -> queue ring pages */
+    /*                           live on the GPU (we map them via         */
+    /*                           NVM_MAP_DEVICE_QUEUE_MEMORY below).      */
+    /*   .cap_kernel_ioq = 32                                             */
+    /*       Hard-coded smoke-test default; same rationale as             */
+    /*       snvme_smoke.c [6]: small enough to reliably exercise the     */
+    /*       "queue squeeze" Case A2 branch in s_nvme_setup_io_queues,    */
+    /*       large enough to keep blk-mq responsive on a 192-vCPU host.   */
+    /*       Production callers read this from sys_config.yaml's          */
+    /*       queue_setup section via the NVMeService daemon.              */
     /* ------------------------------------------------------------------ */
     {
-        struct nvm_ioctl_map req;
-        memset(&req, 0, sizeof(req));
-        req.ioq_idx = 2;
-        req.is_cq   = 0;     /* on_host=0 -> device_queue_list */
-        if (do_ioctl(fd_dev, NVM_SET_IOQ_NUM, &req, "NVM_SET_IOQ_NUM") < 0)
+        struct nvm_ioctl_setup setup;
+        memset(&setup, 0, sizeof(setup));
+        setup.ioq_num        = 2;
+        setup.flags          = 0;       /* ON_HOST clear -> device_queue_list */
+        setup.cap_kernel_ioq = 32;
+        if (do_ioctl(fd_dev, NVM_SET_IOQ_NUM, &setup, "NVM_SET_IOQ_NUM") < 0)
             step_fail(errno, "NVM_SET_IOQ_NUM nr=2");
     }
-    step_ok("NVM_SET_IOQ_NUM nr=2 on_host=0");
+    step_ok("NVM_SET_IOQ_NUM nr=2 on_host=0 cap_kernel=32");
 
     /* ------------------------------------------------------------------ */
     /* [7] cudaMalloc + NVM_MAP_DEVICE_QUEUE_MEMORY (SQ ring)              */

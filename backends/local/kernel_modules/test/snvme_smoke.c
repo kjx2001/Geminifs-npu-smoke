@@ -266,33 +266,45 @@ int main(int argc, char** argv) {
     /* ------------------------------------------------------------------ */
     /* [6] NVM_SET_IOQ_NUM                                                */
     /*                                                                    */
-    /* Two field-name landmines in this ioctl:                            */
+    /* Geminifs ABI: NVM_SET_IOQ_NUM now takes a struct nvm_ioctl_setup   */
+    /* (NOT the legacy nvm_ioctl_map packing).  Fields used here:         */
     /*                                                                    */
-    /*   request.ioq_idx -> total queue count to declare (NOT an index!) */
-    /*   request.is_cq   -> on_host flag                                  */
-    /*                       0 = queues live on a CUDA device             */
-    /*                       1 = queues live in host memory               */
+    /*   .ioq_num = 2                                                     */
+    /*       Total user-side IOQ count = 1 SQ + 1 CQ.  The kernel uses    */
+    /*       this to size the user share at probe time.                   */
     /*                                                                    */
-    /* The kernel later steers map_find_by_pci_dev_and_idx() to either    */
-    /*   &host_list           (if ctrl->on_host == 1)                     */
-    /*   &device_queue_list   (if ctrl->on_host == 0)                     */
-    /* (see pci.c:nvme_create_user_queue around line 1755).               */
+    /*   .flags  |= NVM_QUEUE_SETUP_F_ON_HOST                             */
+    /*       Queue ring pages will live in host memory (we map them via   */
+    /*       NVM_MAP_HOST_MEMORY below).  Clearing this flag tells the    */
+    /*       probe path to look in device_queue_list instead -- see       */
+    /*       PORTING.md §7.3.1 trap #9.                                   */
     /*                                                                    */
-    /* Since this smoke uses NVM_MAP_HOST_MEMORY for the SQ/CQ rings,     */
-    /* we MUST pass is_cq=1 here. is_cq=0 would make the kernel look in   */
-    /* device_queue_list during probe and emit:                           */
-    /*   "map_find_by_pci_dev_and_idx cq error!"                          */
-    /* (this exact failure used to hit reviewers; see PORTING.md §7.3.1). */
+    /*   .cap_kernel_ioq = 32                                             */
+    /*       Hard-coded smoke-test default.  Picked because:               */
+    /*         (a) it is small enough that the controller-grant path      */
+    /*             reliably exercises the new "queue squeeze" Case A2     */
+    /*             branch in s_nvme_setup_io_queues even on NVMes with    */
+    /*             generous MSI-X vector counts;                          */
+    /*         (b) it is large enough that blk-mq has at least one IOQ   */
+    /*             per ~6 CPUs on a 192-vCPU host, keeping the smoke     */
+    /*             test's pread() responsive;                             */
+    /*         (c) production callers should NOT hard-code this -- they  */
+    /*             read it from sys_config.yaml's queue_setup section    */
+    /*             via the NVMeService daemon.                            */
+    /*                                                                    */
+    /*   .nr_groups = 0                                                   */
+    /*       No per-owner partitioning -- single-queue smoke test.       */
     /* ------------------------------------------------------------------ */
     {
-        struct nvm_ioctl_map req;
-        memset(&req, 0, sizeof(req));
-        req.ioq_idx = 2;     /* total user queues = 1 SQ + 1 CQ */
-        req.is_cq   = 1;     /* on_host = 1 (we use NVM_MAP_HOST_MEMORY below) */
-        if (do_ioctl(fd_dev, NVM_SET_IOQ_NUM, &req, "NVM_SET_IOQ_NUM") < 0)
+        struct nvm_ioctl_setup setup;
+        memset(&setup, 0, sizeof(setup));
+        setup.ioq_num        = 2;
+        setup.flags          = NVM_QUEUE_SETUP_F_ON_HOST;
+        setup.cap_kernel_ioq = 32;
+        if (do_ioctl(fd_dev, NVM_SET_IOQ_NUM, &setup, "NVM_SET_IOQ_NUM") < 0)
             step_fail(errno, "NVM_SET_IOQ_NUM nr=2");
     }
-    step_ok("NVM_SET_IOQ_NUM nr=2 on_host=1");
+    step_ok("NVM_SET_IOQ_NUM nr=2 on_host=1 cap_kernel=32");
 
     /* ------------------------------------------------------------------ */
     /* [7] Allocate one page, map as SQ ring of queue #0                   */
