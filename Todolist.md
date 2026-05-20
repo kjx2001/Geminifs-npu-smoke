@@ -71,6 +71,64 @@ runnable end-to-end:
 - [ ] End-to-end smoke: daemon + one client, run a trivial read/write via
       `BlockDeviceManager` built on the shared `Controller`
 
+## SNVMe Queue-Budget Tuning — Phase 2 / 3 (kernel ABI landed; upper layers pending)
+
+Phase 1 (kernel ABI + libnvm wrappers + smoke verification) is in.
+`NVM_SET_IOQ_NUM` now carries a `struct nvm_ioctl_setup` whose
+`cap_kernel_ioq` and `groups[]` fields let userspace tell snvme how to
+slice an MSI-X-limited NVMe between kernel-IOQs and GPU-direct user
+IOQs.  Verified on HGX H20 + Intel DC SSD (MSI-X=136 vs 192 vCPUs):
+smoke now reports `nr_user_q=1` and dmesg shows `queue split: kernel=31
+user=1` instead of the silent fallback to `dma_alloc_coherent`.
+
+The two upper layers were intentionally left for a follow-up so that
+Phase 1 could land cleanly:
+
+- [ ] **Phase 2 — NVMeService daemon: parse `queue_setup` from
+      `sys_config.yaml` and feed it to snvme.**
+      Add a `queue_setup` block to the per-NVMe schema in
+      `backends/local/NVMeService/src/nvmeservice_config.{h,cpp}` with
+      these fields (one-to-one mapping to `struct nvm_ioctl_setup`):
+        `kernel_ioq_cap` (uint, required)
+        `user_ioq_total` (uint, required, must equal sum of group counts)
+        `on_host`        (bool, default false)
+        `nr_write`       (uint, default 0 = use module param)
+        `nr_poll`        (uint, default 0 = use module param)
+        `queue_groups: [{ owner_id|gpu_id: uint, count: uint }]`
+                         (size <= 8; sum(count) must equal `user_ioq_total`)
+      Validate at daemon-startup time:
+        - `kernel_ioq_cap + user_ioq_total <= total_queues`
+        - `sum(groups[].count) == user_ioq_total`
+        - `groups.size() <= NVM_MAX_QUEUE_GROUPS`
+      Then in `nvmeservice_state.cu` (or whichever class owns the
+      per-NVMe `Controller`), call `nvm_queue_setup(ctrl, &setup)`
+      from libnvm BEFORE the existing `NVM_MAP_*`/`NVM_SET_SHARE_REG`
+      sequence.  Existing daemon callers that don't set `queue_setup`
+      should keep working (kernel falls back to `cap_kernel_ioq=0` =
+      `num_possible_cpus()` default).
+
+- [ ] **Phase 3 — Operator documentation.**
+      a. `sys_config.yaml`: add a worked example of `queue_setup` under
+         the `nvmes:` section, with comments explaining when to set
+         `kernel_ioq_cap` (= "the controller's MSI-X count is below
+         host CPU count" rule of thumb) and the per-GPU split.
+      b. `backends/local/kernel_modules/PORTING.md` §8.1: add a row
+         to the troubleshooting cheat sheet for the dmesg signature
+         `queue squeeze: kernel=N user=M (controller granted ...)`,
+         pointing operators at `cap_kernel_ioq` as the tunable.
+      c. `README.md`: add a short "Queue budget tuning" subsection
+         under the existing kernel-module notes that links to the
+         sys_config.yaml example and the PORTING.md cheat-sheet row.
+
+- [ ] **(Optional) snvme_smoke_gpu `--cap-kernel N` flag.**
+      Currently the smoke binaries hard-code `cap_kernel_ioq = 32`,
+      which forces case B (split) on a generous controller.  A
+      `--cap-kernel N` CLI flag would let regression runs explicitly
+      exercise either case A2 (squeeze, `N` >> controller MSI-X) or
+      case A1 (full fallback, `N=0` AND user_cq > grant) without
+      recompiling.  Low priority — case B coverage is what production
+      cares about, A1/A2 are review gates.
+
 ## Discussion Required Before Major Refactor
 
 - [x] Decide the future runtime/product name — `Tutti`, recorded in
