@@ -40,6 +40,15 @@ struct ctrl* ctrl_get(struct list* list, struct class* cls, struct pci_dev* pdev
      */
     memset(&ctrl->setup, 0, sizeof(ctrl->setup));
     /*
+     * B3 user-QID pool: lazy-init.  Bitmap is allocated by
+     * NVM_ADD_USER_QUEUE on first use because we don't know
+     * dev->online_queues / nr_allocated_queues until probe finishes.
+     */
+    ctrl->user_qid_bitmap = NULL;
+    ctrl->user_qid_first  = 0;
+    ctrl->user_qid_last   = 0;
+    mutex_init(&ctrl->user_qid_lock);
+    /*
      * cdev name: deliberately "ssnvme" (double-s), NOT a typo of
      * "snvme".  Rationale:
      *   - block-device gendisks are named "snvme%d[c%d]n%d" (see
@@ -69,6 +78,15 @@ void ctrl_put(struct ctrl* ctrl)
     {
         list_remove(&ctrl->list);
         ctrl_chrdev_remove(ctrl);
+        /*
+         * B3 user-QID bitmap: kfree handles NULL.  By the time
+         * ctrl_put runs, every fd that could allocate from this
+         * pool has been closed (chrdev is being torn down), so
+         * no concurrent access -- no need to take user_qid_lock.
+         */
+        kfree(ctrl->user_qid_bitmap);
+        ctrl->user_qid_bitmap = NULL;
+        mutex_destroy(&ctrl->user_qid_lock);
         kfree(ctrl);
     }
 }

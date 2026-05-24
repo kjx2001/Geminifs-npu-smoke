@@ -3,6 +3,7 @@
 
 #include "list.h"
 #include <linux/types.h>
+#include <linux/list.h>           /* struct list_head for group_link  */
 #include <linux/mm_types.h>
 
 
@@ -19,7 +20,7 @@ typedef void (*release)(struct map*);
  */
 struct map
 {
-    struct list_node    list;           /* Linked list header */
+    struct list_node    list;           /* Linked list header (global) */
     struct task_struct* owner;          /* Owner of mapping */
     u64                 vaddr;          /* Starting virtual address */
     struct list*        ctrl_list;
@@ -30,6 +31,24 @@ struct map
     unsigned long       page_size;      /* Logical page size */
     void*               data;           /* Custom data */
     release             release;        /* Custom callback for unmapping and releasing memory */
+    /*
+     * Per-fd queue-group attachment (B2).
+     *
+     *   group_id == 0          legacy map; group_link is left as
+     *                          an empty list head and the map is
+     *                          reachable only via the global
+     *                          host_list / device_list / etc.
+     *   group_id != 0          map belongs to the per-fd group
+     *                          identified by group_id; group_link
+     *                          is threaded into that group's
+     *                          snvm_qgroup::maps list.
+     *
+     * group_link is initialised in create_descriptor (LIST_HEAD-init),
+     * so it is safe to list_del() / list_empty() unconditionally
+     * regardless of mode.
+     */
+    struct list_head    group_link;
+    uint32_t            group_id;
     unsigned long       n_addrs;        /* Number of mapped pages */
     uint64_t            addrs[1];       /* Bus addresses */
 };

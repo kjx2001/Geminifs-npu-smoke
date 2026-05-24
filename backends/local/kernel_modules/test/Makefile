@@ -1,19 +1,32 @@
 # Build the standalone SNVMe sanity tests.
 #
-# Two binaries:
-#   snvme_smoke       -- UAPI smoke, libc-only. Always built.
-#   snvme_smoke_gpu   -- adds the NVM_MAP_DEVICE_*  GPU paths via CUDA.
-#                        Built automatically if `nvcc` is on PATH.
+# Five binaries:
+#   snvme_smoke           -- UAPI smoke, libc-only. Always built.
+#   snvme_smoke_gpu       -- adds the NVM_MAP_DEVICE_*  GPU paths via CUDA.
+#                            Built automatically if `nvcc` is on PATH.
+#   snvme_smoke_recycle   -- exercises NVM_RAW_ADMIN_CMD pass-through.
+#                            Always built; bind required, but no user IOQ.
+#   snvme_smoke_qgroup    -- exercises NVM_CREATE_QUEUE_GROUP /
+#                            NVM_DESTROY_QUEUE_GROUP container lifecycle.
+#                            Always built; does NOT bind (safe to run on
+#                            mounted devices).
+#   snvme_smoke_addq      -- B3: exercises NVM_ADD_USER_QUEUE end-to-end
+#                            (Create I/O CQ + Create I/O SQ + cascade
+#                            destroy through NVM_DESTROY_QUEUE_GROUP).
+#                            Always built; BINDS the controller (destructive).
 #
-# Both depend on nothing but the SNVMe UAPI header
+# All binaries depend on nothing but the SNVMe UAPI header
 #   ../../nvme/libnvm/include/ioctl.h
 #
 # Usage:
 #   make
-#   sudo ./snvme_smoke 0000:50:00.0              # UAPI-smoke (safe, no GPU)
-#   sudo ./snvme_smoke --bind 0000:50:00.0       # full bring-up (destructive)
-#   sudo ./snvme_smoke_gpu 0000:50:00.0          # UAPI + GPU map paths (safe)
-#   sudo ./snvme_smoke_gpu --bind 0000:50:00.0   # + run probe with GPU queues (destructive)
+#   sudo ./snvme_smoke 0000:50:00.0                # UAPI-smoke (safe, no GPU)
+#   sudo ./snvme_smoke --bind 0000:50:00.0         # full bring-up (destructive)
+#   sudo ./snvme_smoke_gpu 0000:50:00.0            # UAPI + GPU map paths (safe)
+#   sudo ./snvme_smoke_gpu --bind 0000:50:00.0     # + run probe with GPU queues (destructive)
+#   sudo ./snvme_smoke_recycle 0000:50:00.0        # NVM_RAW_ADMIN_CMD (destructive: binds)
+#   sudo ./snvme_smoke_qgroup 0000:50:00.0         # queue-group lifecycle (safe, no bind)
+#   sudo ./snvme_smoke_addq 0000:50:00.0           # B3 ADD_USER_QUEUE (destructive: binds)
 #
 # Override knobs:
 #   CC, CFLAGS, NVCC, NVCCFLAGS, CUDA_ARCH
@@ -29,8 +42,11 @@
 #   dropped -- nvcc reports "Unsupported gpu architecture 'sm_70'"
 #   on any toolkit >= 13.0 (e.g. /usr/local/cuda-13.0/).
 
-TARGET      := snvme_smoke
-TARGET_GPU  := snvme_smoke_gpu
+TARGET          := snvme_smoke
+TARGET_GPU      := snvme_smoke_gpu
+TARGET_RECYCLE  := snvme_smoke_recycle
+TARGET_QGROUP   := snvme_smoke_qgroup
+TARGET_ADDQ     := snvme_smoke_addq
 
 UAPI_INC := ../../nvme/libnvm/include
 
@@ -60,18 +76,21 @@ endif
 NVCCFLAGS  ?= -O2 -std=c++17 -arch=$(CUDA_ARCH) -I$(UAPI_INC) \
               -Xcompiler=-Wall,-Wextra,-Wno-unused-parameter
 
-SRC     := snvme_smoke.c
-SRC_GPU := snvme_smoke_gpu.cu
+SRC         := snvme_smoke.c
+SRC_GPU     := snvme_smoke_gpu.cu
+SRC_RECYCLE := snvme_smoke_recycle.c
+SRC_QGROUP  := snvme_smoke_qgroup.c
+SRC_ADDQ    := snvme_smoke_addq.c
 
 # Build the GPU test only if nvcc is available.
 HAVE_NVCC := $(shell command -v $(NVCC) >/dev/null 2>&1 && echo yes || echo no)
 
-.PHONY: all clean run run-gpu
+.PHONY: all clean run run-gpu run-recycle run-qgroup run-addq
 
 ifeq ($(HAVE_NVCC),yes)
-all: $(TARGET) $(TARGET_GPU)
+all: $(TARGET) $(TARGET_GPU) $(TARGET_RECYCLE) $(TARGET_QGROUP) $(TARGET_ADDQ)
 else
-all: $(TARGET)
+all: $(TARGET) $(TARGET_RECYCLE) $(TARGET_QGROUP) $(TARGET_ADDQ)
 	@echo "[i] nvcc not found; skipping $(TARGET_GPU)."
 	@echo "    Install CUDA Toolkit (or set NVCC=...) and re-run make to enable it."
 endif
@@ -83,8 +102,17 @@ $(TARGET_GPU): $(SRC_GPU)
 	@echo "[+] nvcc: CUDA_ARCH=$(CUDA_ARCH) (override with 'make CUDA_ARCH=sm_XX')"
 	$(NVCC) $(NVCCFLAGS) -o $@ $<
 
+$(TARGET_RECYCLE): $(SRC_RECYCLE)
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+
+$(TARGET_QGROUP): $(SRC_QGROUP)
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+
+$(TARGET_ADDQ): $(SRC_ADDQ)
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+
 clean:
-	rm -f $(TARGET) $(TARGET_GPU)
+	rm -f $(TARGET) $(TARGET_GPU) $(TARGET_RECYCLE) $(TARGET_QGROUP) $(TARGET_ADDQ)
 
 # Convenience: PCI=0000:50:00.0 make run [BIND=1]
 run: $(TARGET)
@@ -107,3 +135,28 @@ run-gpu: $(TARGET_GPU)
 	else \
 	    sudo ./$(TARGET_GPU) $(PCI); \
 	fi
+
+# Convenience: PCI=0000:50:00.0 make run-recycle
+# (this test always binds; there is no UAPI-only mode for it.)
+run-recycle: $(TARGET_RECYCLE)
+	@if [ -z "$(PCI)" ]; then \
+	    echo "usage: PCI=DDDD:BB:DD.F make run-recycle"; exit 1; \
+	fi; \
+	sudo ./$(TARGET_RECYCLE) $(PCI)
+
+# Convenience: PCI=0000:50:00.0 make run-qgroup
+# (queue-group lifecycle smoke; does NOT bind, so no destructive side
+# effects -- safe to run on a host where the device is mounted.)
+run-qgroup: $(TARGET_QGROUP)
+	@if [ -z "$(PCI)" ]; then \
+	    echo "usage: PCI=DDDD:BB:DD.F make run-qgroup"; exit 1; \
+	fi; \
+	sudo ./$(TARGET_QGROUP) $(PCI)
+
+# Convenience: PCI=0000:50:00.0 make run-addq
+# (B3 NVM_ADD_USER_QUEUE smoke; BINDS the controller -- destructive.)
+run-addq: $(TARGET_ADDQ)
+	@if [ -z "$(PCI)" ]; then \
+	    echo "usage: PCI=DDDD:BB:DD.F make run-addq"; exit 1; \
+	fi; \
+	sudo ./$(TARGET_ADDQ) $(PCI)

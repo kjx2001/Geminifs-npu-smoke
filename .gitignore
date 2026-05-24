@@ -36,3 +36,6 @@ CMakePresets.json
 # sources are committed; the binaries are not.
 backends/local/kernel_modules/test/snvme_smoke
 backends/local/kernel_modules/test/snvme_smoke_gpu
+backends/local/kernel_modules/test/snvme_smoke_addq
+backends/local/kernel_modules/test/snvme_smoke_qgroup
+backends/local/kernel_modules/test/snvme_smoke_recycle

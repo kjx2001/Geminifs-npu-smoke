@@ -6,6 +6,7 @@
 #include <linux/cdev.h>
 #include <linux/fs.h>
 #include <linux/device.h>
+#include <linux/mutex.h>           /* user_qid_lock for B3 */
 
 
 /*
@@ -78,6 +79,27 @@ struct ctrl
      *     not-yet-called case).
      */
     struct snvm_queue_setup setup;
+
+    /*
+     * Per-controller user-QID pool (B3, NVM_ADD_USER_QUEUE).
+     *
+     * After bind completes, the QID space looks like:
+     *   QID 0                : admin
+     *   QID 1 ..  online_q-1 : kernel IOQs (managed by upstream)
+     *   QID online_q .. nr-1 : user IOQ pool (managed here)
+     *
+     *   user_qid_first  = ndev->online_queues at first ADD call
+     *   user_qid_last   = ndev->nr_allocated_queues - 1
+     *   user_qid_bitmap : 1 bit per QID in [first, last], 1 = in use.
+     *                     Lazily allocated in NVM_ADD_USER_QUEUE.
+     *   user_qid_lock   : protects bitmap + first/last; nests INSIDE
+     *                     own->groups_lock (the only way to reach
+     *                     this state is via a per-fd ioctl).
+     */
+    unsigned long      *user_qid_bitmap;
+    unsigned int        user_qid_first;
+    unsigned int        user_qid_last;
+    struct mutex        user_qid_lock;
 };
 
 

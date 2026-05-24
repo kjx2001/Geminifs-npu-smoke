@@ -20,24 +20,110 @@
     memcpy(dest, src, DISK_NAME_LEN)
 
 
-/* Memory map request */
+/*
+ * Memory map request (NVM_MAP_HOST_MEMORY / NVM_MAP_DEVICE_MEMORY /
+ * NVM_MAP_DEVICE_QUEUE_MEMORY).
+ *
+ * ABI rev note (queue-group plan, step B2):
+ *
+ *   Two new fields (group_id + reserved) are appended.  This
+ *   breaks the old _IOC_SIZE so any pre-B2 userspace binary
+ *   trying the legacy 32-byte layout will be rejected with
+ *   -ENOTTY at ioctl entry rather than silently mis-decoding.
+ *   The project is open-source / pre-stable; we deliberately do
+ *   not preserve the legacy layout.
+ *
+ * Modes (kernel branches on group_id):
+ *
+ *   group_id == 0   "legacy" mode.  The map is registered against
+ *                   the controller-global host_list / device_list /
+ *                   device_queue_list as before, and is NOT attached
+ *                   to any per-fd queue group.  This is the path
+ *                   used by the legacy NVM_SET_IOQ_NUM bring-up
+ *                   (which still expects ioq_idx / is_cq tags) and
+ *                   by ad-hoc data-buffer registrations from
+ *                   libnvm/dma.cpp.
+ *
+ *   group_id != 0   "new" mode.  The kernel looks up the group_id
+ *                   in the calling fd's own->groups list (the
+ *                   group must have been created via
+ *                   NVM_CREATE_QUEUE_GROUP on the same fd; cross-fd
+ *                   ids are -ENOENT).  The map is registered in
+ *                   the global list AND linked into group->maps so
+ *                   that NVM_DESTROY_QUEUE_GROUP / fd-close
+ *                   cascade-cleanup can release it without the
+ *                   user having to call NVM_UNMAP_*.
+ *
+ *                   ioq_idx / is_cq are IGNORED in this mode --
+ *                   per-queue identity is established later by
+ *                   NVM_ADD_USER_QUEUE (B3), which takes
+ *                   (group_id, sq_vaddr, cq_vaddr).  Userspace
+ *                   should still set them to -1 / -1 for
+ *                   forward-compat with possible future use.
+ *
+ * `reserved` is MBZ; future revisions may add e.g. NUMA hints
+ * without another ABI break.
+ */
 struct nvm_ioctl_map
 {
     uint64_t    vaddr_start;
     size_t      n_pages;
     uint64_t*   ioaddrs;
-    int ioq_idx; // if the ioq_idx > 0, indicate the map is a IOQ
-    int is_cq; // cq = 1 sq = 0
+    int         ioq_idx;        /* legacy mode only; -1 in new mode  */
+    int         is_cq;          /* legacy mode only; -1 in new mode  */
+    uint32_t    group_id;       /* 0 = legacy; nonzero = new mode    */
+    uint32_t    reserved;       /* MBZ; future extension             */
 };
 
+/*
+ * Per-controller info returned by NVM_GET_DEV_INFO.
+ *
+ * ABI rev (queue-group plan, step B3): four new fields appended.
+ * The ioctl number's _IOC_SIZE is therefore different from the
+ * pre-B3 layout; old userspace binaries get -ENOTTY at ioctl
+ * entry rather than silently mis-decoding a shorter struct.
+ *
+ * All NEW fields are sourced either from NVMe spec / controller
+ * CAP register (q_depth, bar0_size, max_user_qid) or from snvme
+ * compile-time limits (max_queues_per_group); userspace can rely
+ * on them as the single source of truth and MUST NOT recompute
+ * them from CAP independently.
+ *
+ * Notes on existing fields:
+ *
+ *   nr_user_q      Legacy field set by NVM_SET_IOQ_NUM.  In the
+ *                  new (queue-group) flow userspace does NOT call
+ *                  NVM_SET_IOQ_NUM -- this field then reads back
+ *                  as 0 and should be ignored.  Kept for backward
+ *                  compatibility with the bind-time bring-up path.
+ *
+ *   start_cq_idx   First QID available to user IOQs.  In the new
+ *                  flow this equals dev->online_queues (admin +
+ *                  kernel IOQ count) and bounds the bottom of the
+ *                  user QID pool; the top is max_user_qid below.
+ */
 struct nvm_ioctl_dev
 {
-    uint32_t    nr_user_q;
-    uint32_t    start_cq_idx;
-    uint8_t     dstrd; 
-    size_t      max_data_size; //get the ctrl->max_hw_sectors from kernel
-    size_t      block_size;    // ns->lba_shift
+    /* === existing (semantics unchanged) === */
+    uint32_t    nr_user_q;          /* legacy NVM_SET_IOQ_NUM result; 0 in new flow */
+    uint32_t    start_cq_idx;       /* first QID available to user IOQs */
+    uint8_t     dstrd;              /* CAP.DSTRD: doorbell stride exponent */
+    size_t      max_data_size;      /* CTRL.MDTS in bytes */
+    size_t      block_size;         /* 1 << ns->lba_shift */
     char        disk_name[DISK_NAME_LEN];
+
+    /* === NEW for B3 === */
+    uint16_t    q_depth;            /* NVMe CAP.MQES + 1, clamped: applies to    */
+                                    /* ALL user queues (snvme does not support   */
+                                    /* per-queue depth)                          */
+    uint16_t    reserved0;          /* MBZ */
+    uint32_t    bar0_size;          /* pci_resource_len(pdev, BAR0); userspace   */
+                                    /* mmaps up to this size for doorbells       */
+    uint32_t    max_user_qid;       /* highest QID kernel will hand out via      */
+                                    /* NVM_ADD_USER_QUEUE; user pool is          */
+                                    /* [start_cq_idx, max_user_qid]              */
+    uint32_t    max_queues_per_group;  /* echoes NVM_MAX_QUEUES_PER_GROUP */
+    uint32_t    reserved1[6];       /* MBZ; future extension */
 };
 
 /*
@@ -63,7 +149,12 @@ struct nvm_ioctl_dev
 
 struct nvm_queue_group {
     uint32_t    owner_id;    /* opaque tag, typically a GPU id.        */
-    uint32_t    count;       /* number of (SQ+CQ) pairs in this group. */
+    uint32_t    count;       /* SQ + CQ entry count for this group     */
+                             /* (kernel unit: 2 * QueuePair count).    */
+                             /* Kernel enforces                        */
+                             /*   sum(groups[].count) == ioq_num       */
+                             /* when nr_groups > 0; see pci.c          */
+                             /* NVM_SET_IOQ_NUM handler.               */
     int32_t     numa_node;   /* doc-only hint; kernel does NOT enforce */
                              /* this.  -1 = "don't care".              */
     uint32_t    reserved;    /* MBZ.                                   */
@@ -110,6 +201,206 @@ struct pci_device_addr{ // Removed redundant definition
     int func;
 };
 
+/*
+ * Raw admin command pass-through (NVM_RAW_ADMIN_CMD).
+ *
+ * Lets userspace send any NVMe admin SQE through the controller's
+ * snvme-owned admin queue and read back the completion's DW0/DW1
+ * (NVMe spec "Command Specific" + reserved) plus the 16-bit status
+ * field (SC | SCT | DNR | MORE) verbatim.
+ *
+ * Originally added to support per-queue recycle (Delete I/O SQ ->
+ * Delete I/O CQ -> Create I/O CQ -> Create I/O SQ; NVMe 1.4 §5.4 /
+ * §5.5) without re-running snvme bring-up.  Generic enough to also
+ * carry Abort (§5.1), Get Log Page (§5.10), vendor admin commands
+ * etc.; the kernel handler does NOT inspect the opcode and only
+ * forwards via snvme_submit_sync_cmd().
+ *
+ * Restrictions enforced by the kernel handler:
+ *   - controller must be bound (NVME_CTRL_LIVE).
+ *   - the caller's fd is a /dev/ssnvme<N> chrdev (snvm_dev_map_ioctl
+ *     dispatcher checks ctrl_find_by_inode).
+ *   - data-buffer admin commands are NOT supported in this revision
+ *     (`buffer` field is reserved/ignored; bufflen=0 is hard-coded).
+ *     Add a follow-up path if Get Log Page / Set Features with
+ *     payloads is ever needed.
+ *
+ * Field semantics:
+ *   sqe        -- 64 raw bytes, byte-for-byte equivalent to one
+ *                 entry in the NVMe admin SQ ring.  Userspace
+ *                 fills in opcode, CID, NSID, CDW10..15, etc.
+ *                 The kernel re-uses the CID by handing this to
+ *                 snvme_submit_sync_cmd which manages its own tag.
+ *   result_dw0 -- CQE DW0 (command-specific result; e.g.
+ *                 Create I/O SQ returns 0 on success).  Populated
+ *                 only on successful return.
+ *   result_dw1 -- CQE DW1.  Mostly reserved; populated for the
+ *                 same reason as DW0.
+ *   nvme_status-- NVMe status field from CQE DW3 (15:1 = SC|SCT|
+ *                 More|DNR, bit 0 = phase).  Populated even when
+ *                 the ioctl returns 0 -- userspace must check
+ *                 (status & 0xFFFE) == 0 for spec success.  When
+ *                 the ioctl returns negative, this field is
+ *                 undefined (the request never reached the
+ *                 controller, e.g. -EFAULT on copy_from_user).
+ *   reserved   -- MBZ; future extension for nsid / data buffer
+ *                 forwarding etc.
+ */
+struct nvm_ioctl_raw_admin {
+    uint8_t     sqe[64];        /* in:  one NVMe admin SQE        */
+    uint32_t    result_dw0;     /* out: CQE DW0                   */
+    uint32_t    result_dw1;     /* out: CQE DW1                   */
+    uint16_t    nvme_status;    /* out: CQE DW3[31:17] (SC|SCT|...)*/
+    uint16_t    reserved0;      /* MBZ                            */
+    uint32_t    reserved1[4];   /* MBZ; future expansion          */
+};
+
+/*
+ * Per-fd queue group container (NVM_CREATE_QUEUE_GROUP /
+ * NVM_DESTROY_QUEUE_GROUP).
+ *
+ * A "queue group" is the runtime resource container that future
+ * NVM_ADD_USER_QUEUE / NVM_RECYCLE_USER_QUEUE calls hang off of.
+ * It is the kernel-side dual of "one logical client" (typically:
+ * one process binding to one GPU on one NVMe controller).
+ *
+ * Lifecycle / ownership:
+ *
+ *   * A group is created with NVM_CREATE_QUEUE_GROUP on an open
+ *     /dev/ssnvme<N> fd.  The kernel returns an opaque, globally
+ *     unique group_id.  The group is bound to (file, ctrl); fd
+ *     close cascades destroy automatically.
+ *
+ *   * A group is destroyed with NVM_DESTROY_QUEUE_GROUP(group_id)
+ *     OR implicitly when the owning fd is closed.  In B1 (this
+ *     header) the group still has nothing in it; later steps add
+ *     map registration (B2) and user IO queues (B3) which are
+ *     freed on group destroy in LIFO order.
+ *
+ *   * A single fd may hold up to NVM_MAX_GROUPS_PER_FD groups.
+ *     The default (1) matches the "one client = one group" model
+ *     used by NVMeService daemons.
+ *
+ * group_id namespace:
+ *
+ *   group_id is opaque to userspace.  Internally allocated via
+ *   ida_simple_get(); userspace MUST treat it as a 32-bit cookie
+ *   and pass it back verbatim.  Group id 0 is invalid (reserved
+ *   to mean "no group" / sentinel).
+ *
+ * Why a separate ioctl from NVM_SET_IOQ_NUM:
+ *
+ *   NVM_SET_IOQ_NUM is the legacy, bind-time, per-controller setup
+ *   path.  It pre-declares the total user IOQ budget for the entire
+ *   controller, then probe consumes it in one shot.  Queue groups
+ *   are the new, per-fd, runtime path -- groups can be created and
+ *   destroyed at any time after bind, independently of each other.
+ *   The two paths coexist; legacy callers see no behavioural change.
+ */
+#define NVM_MAX_GROUPS_PER_FD       1
+#define NVM_MAX_QUEUES_PER_GROUP   16    /* hardcoded cap; see B6 */
+
+struct nvm_ioctl_queue_group {
+    uint32_t    group_id;       /* out: kernel-assigned, opaque   */
+    uint32_t    flags;          /* MBZ; reserved for future       */
+    uint32_t    max_queues;     /* out: per-group queue cap       */
+                                /*      (echoes the kernel cap)   */
+    uint32_t    reserved[5];    /* MBZ                            */
+};
+
+/*
+ * Per-queue-pair input/output for NVM_ADD_USER_QUEUE.
+ *
+ * Userspace pre-registers two ring buffers per queue (one for SQ,
+ * one for CQ) via NVM_MAP_HOST_MEMORY / NVM_MAP_DEVICE_MEMORY
+ * against the group_id.  ADD_USER_QUEUE then takes the *vaddrs*
+ * of those rings -- not map ids -- and the kernel does an O(group
+ * maps) lookup to recover the DMA addresses.
+ *
+ * Ring buffer sizing constraints (userspace MUST satisfy these
+ * before NVM_MAP, otherwise Create I/O CQ/SQ will fail at the
+ * controller):
+ *
+ *   SQ buffer >= q_depth * 64 bytes  (NVMe spec: SQE = 64B fixed)
+ *   CQ buffer >= q_depth * 16 bytes  (NVMe spec: CQE = 16B fixed)
+ *   Both buffers physically contiguous (NVMe spec
+ *     "PHYS_CONTIG" flag -- only single-page-coverage is
+ *     verified by the current snvme implementation, so q_depth *
+ *     entry_size MUST fit in one host page; this is true for
+ *     q_depth <= 64 / 256 respectively on a 4 KiB page).
+ *   Both buffers page-size aligned (PRP1 has the lower 12 bits
+ *     reserved as zero on this code path).
+ *
+ * q_depth and the page size are obtained from NVM_GET_DEV_INFO.
+ *
+ * Output fields populated only on overall ioctl success.
+ */
+struct nvm_user_queue_pair_in {
+    uint64_t    sq_vaddr;       /* userspace VA of an SQ ring registered      */
+                                /* against this group via NVM_MAP_HOST_MEMORY */
+                                /* / NVM_MAP_DEVICE_MEMORY.                   */
+    uint64_t    cq_vaddr;       /* same, for the CQ ring                      */
+};
+
+struct nvm_user_queue_pair_out {
+    uint32_t    sq_doorbell_offset;     /* BAR0 byte offset for SQ tail dbl   */
+    uint32_t    cq_doorbell_offset;     /* BAR0 byte offset for CQ head dbl   */
+    uint32_t    qid;                    /* informational; userspace does NOT  */
+                                        /* need it to write SQEs (NVMe SQE   */
+                                        /* has no SQID field).  Useful for   */
+                                        /* dmesg correlation only.           */
+    uint32_t    reserved;               /* MBZ                                */
+};
+
+/*
+ * NVM_ADD_USER_QUEUE payload.
+ *
+ * Submits up to NVM_MAX_QUEUES_PER_GROUP (SQ, CQ) pairs in one
+ * ioctl.  The kernel handles them as an all-or-nothing batch:
+ * either every pair successfully gets a Create I/O CQ + Create
+ * I/O SQ admin command through the controller, or none do (any
+ * pairs already created in the same call are unwound via Delete
+ * I/O SQ + Delete I/O CQ before the ioctl returns the error).
+ *
+ * Add operations are incremental: a group may receive multiple
+ * NVM_ADD_USER_QUEUE calls as long as cur_queues + nr_pairs <=
+ * max_queues.  The matching teardown is NVM_DESTROY_QUEUE_GROUP
+ * (drains all queues) or NVM_RECYCLE_USER_QUEUE (re-creates them
+ * with the same rings; planned for B5).
+ *
+ * Pre-conditions enforced by the kernel:
+ *
+ *   1. Controller must be bound (NVME_CTRL_LIVE).  The user QID
+ *      pool is only known once nvme_probe has finished allocating
+ *      kernel IOQs -- ADD_USER_QUEUE before bind returns -ENODEV.
+ *   2. group_id must belong to the calling fd (cross-fd usage is
+ *      -ENOENT, same as B1/B2 isolation rules).
+ *   3. nr_pairs in [1, NVM_MAX_QUEUES_PER_GROUP].
+ *   4. flags / reserved fields MBZ.
+ *   5. each (sq_vaddr, cq_vaddr) must resolve to exactly one map
+ *      already registered against this group.  The kernel rejects
+ *      with -ENOENT otherwise; rings registered against a
+ *      different group (even on the same fd) are not visible.
+ *   6. cur_queues + nr_pairs <= max_queues_per_group.  Returns
+ *      -EBUSY if the group is full.
+ *   7. No two pairs in one call may share the same sq_vaddr or
+ *      the same cq_vaddr.  -EINVAL.
+ *
+ * Output: out_pairs[i] is populated for i < nr_pairs only;
+ * trailing entries are left zero.
+ */
+struct nvm_ioctl_add_user_queue {
+    /* in */
+    uint32_t    group_id;
+    uint32_t    nr_pairs;       /* 1..NVM_MAX_QUEUES_PER_GROUP */
+    uint32_t    flags;          /* MBZ */
+    uint32_t    reserved[5];    /* MBZ */
+    struct nvm_user_queue_pair_in   pairs[NVM_MAX_QUEUES_PER_GROUP];
+
+    /* out */
+    struct nvm_user_queue_pair_out  out_pairs[NVM_MAX_QUEUES_PER_GROUP];
+};
+
 /* Supported operations */
 enum nvm_ioctl_type{
     NVM_MAP_HOST_MEMORY             = _IOW(NVM_IOCTL_TYPE, 1, struct nvm_ioctl_map),
@@ -132,6 +423,65 @@ enum nvm_ioctl_type{
     NVM_SET_SHARE_REG               = _IOW(NVM_IOCTL_TYPE, 8, struct nvm_ioctl_dev),
     NVM_GET_DEV_INFO                = _IOR(NVM_IOCTL_TYPE, 9, struct nvm_ioctl_dev),   
     NVM_CLEAR_IOQ_NUM               = _IOW(NVM_IOCTL_TYPE, 10, struct nvm_ioctl_dev),
+    /*
+     * NVM_RAW_ADMIN_CMD: generic admin SQE forwarder, used to drive
+     * per-queue recycle (Delete + Create I/O SQ/CQ) and any other
+     * admin-only command that snvme does not need a dedicated
+     * ioctl for.  See struct nvm_ioctl_raw_admin above for the
+     * payload contract.
+     */
+    NVM_RAW_ADMIN_CMD               = _IOWR(NVM_IOCTL_TYPE, 11, struct nvm_ioctl_raw_admin),
+    /*
+     * NVM_CREATE_QUEUE_GROUP / NVM_DESTROY_QUEUE_GROUP:
+     *   Per-fd runtime container for user IO queues.  Step B1 of
+     *   the queue-group plan -- container only, no NVMe resources
+     *   yet.  See struct nvm_ioctl_queue_group above.
+     *
+     *   CREATE returns the new group_id in the payload.
+     *   DESTROY takes the group_id directly (uint32_t payload).
+     *   FD close auto-destroys all groups owned by that fd.
+     */
+    NVM_CREATE_QUEUE_GROUP          = _IOWR(NVM_IOCTL_TYPE, 12, struct nvm_ioctl_queue_group),
+    NVM_DESTROY_QUEUE_GROUP         = _IOW (NVM_IOCTL_TYPE, 13, uint32_t),
+    /*
+     * NVM_ADD_USER_QUEUE: create (SQ, CQ) pairs against a queue
+     * group, all-or-nothing batch.  Userspace pre-registers ring
+     * buffers via NVM_MAP_HOST_MEMORY/NVM_MAP_DEVICE_MEMORY (with
+     * group_id), then passes the ring vaddrs in the payload's
+     * pairs[] array.  See struct nvm_ioctl_add_user_queue above
+     * for the full contract; this is the B3 step in the
+     * queue-group plan.
+     */
+    NVM_ADD_USER_QUEUE              = _IOWR(NVM_IOCTL_TYPE, 14, struct nvm_ioctl_add_user_queue),
+    /*
+     * NVM_SET_KERNEL_IOQ_CAP: B3 cap-only path.
+     *
+     * Pre-bind, declare an upper bound on how many IO queues the
+     * kernel side may consume from the controller's granted IOQ
+     * count.  Whatever the controller actually grants (typically
+     * limited by its MSI-X vector count) above this cap becomes
+     * available to the NVM_ADD_USER_QUEUE user pool.
+     *
+     * Distinct from NVM_SET_IOQ_NUM:
+     *   - NVM_SET_IOQ_NUM is the legacy bring-up flow that also
+     *     declares ioq_num (pre-registered user CQ count via
+     *     NVM_MAP_*), use_sreg, and per-owner groups[].  It is
+     *     intended for the dma_alloc_coherent-vs-user-share probe
+     *     path and forces ctrl->use_sreg / ctrl->ioq_num state.
+     *   - NVM_SET_KERNEL_IOQ_CAP does ONLY the cap.  ctrl->ioq_num
+     *     stays at 0, use_sreg stays at 0, the probe path runs as
+     *     plain in-tree-style nvme.  This is the right knob when
+     *     userspace plans to create IOQs dynamically post-bind via
+     *     NVM_ADD_USER_QUEUE rather than declaring them upfront.
+     *
+     * Payload is a uint32_t = the cap value.  Zero means "no cap"
+     * and clears any previously-set cap on this controller.
+     *
+     * Must be called before SNVM_DEVICE_BIND for the cap to take
+     * effect; calls after bind set ctrl->setup.cap_kernel_ioq but
+     * have no probe to apply it to.
+     */
+    NVM_SET_KERNEL_IOQ_CAP          = _IOW (NVM_IOCTL_TYPE, 15, uint32_t),
 };
 
 // snvm_ctrl_ioctl_type

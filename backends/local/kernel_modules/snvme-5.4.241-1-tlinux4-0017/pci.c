@@ -145,6 +145,7 @@
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/ioctl.h>           /* _IOC_TYPE() in snvm_dev_map_ioctl default */
+#include <linux/list.h>            /* list_head / INIT_LIST_HEAD for queue groups */
 #include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
@@ -219,6 +220,27 @@ static struct list      host_list;
 static struct list      device_list;
 static struct list      device_queue_list;
 
+/*
+ * Per-fd queue group support (NVM_CREATE_QUEUE_GROUP /
+ * NVM_DESTROY_QUEUE_GROUP).
+ *
+ * snvm_queue_group_ida is the allocator for the opaque group_id
+ * returned to userspace.  We bias allocations to >= 1 because
+ * group_id 0 is reserved as an "invalid / no group" sentinel
+ * (see ioctl.h struct nvm_ioctl_queue_group).  Lifetime: per-
+ * module; ida_destroy() is paired with ida_destroy() of the
+ * minor allocator in module exit (see pci.c snvm_helpers_release).
+ *
+ * A group's actual descriptor (struct snvm_qgroup, declared
+ * below near snvm_dev_owner) is hung off the owning fd's
+ * file->private_data.  This module-global IDA only owns the id
+ * namespace, not the descriptors.  No global descriptor list is
+ * needed: every group is reachable exactly once via its owning
+ * fd, which guarantees fd-close cascade-cleanup is sufficient to
+ * leak-free unwind.
+ */
+static DEFINE_IDA(snvm_queue_group_ida);
+
 /* Upper bound on how many NVMe controllers snvme will manage
  * concurrently (= max number of /dev/ssnvme%d char devices).
  */
@@ -272,9 +294,31 @@ static const struct kernel_param_ops io_queue_depth_ops = {
 	.get = param_get_int,
 };
 
-static int io_queue_depth = 1024;
+/*
+ * snvme: default io_queue_depth lowered from 1024 to 64.
+ *
+ * Rationale: user IOQs are created via NVM_ADD_USER_QUEUE, whose
+ * adapter_alloc_{sq,cq}_user path currently uses Create I/O SQ/CQ
+ * with CDW11.PC=1 (Physically Contiguous) and PRP1 = addrs[0] from
+ * the userspace-registered ring map.  Userspace mmap() yields
+ * virtually-contiguous but physically-fragmented pages, so the ring
+ * MUST fit in a single 4 KiB page:
+ *
+ *   SQ ring bytes = q_depth * 64 (SQE)   <= 4096  -> q_depth <= 64
+ *   CQ ring bytes = q_depth * 16 (CQE)   <= 4096  -> q_depth <= 256
+ *
+ * 64 is the tighter of the two and is the largest value that lets
+ * NVM_ADD_USER_QUEUE work out-of-the-box.  Operators who want
+ * deeper rings can pass io_queue_depth=N on insmod, but they must
+ * either (a) only use kernel-managed IOQs (legacy path, which uses
+ * dma_alloc_coherent and is unaffected) or (b) wait for the
+ * planned PC=0 + PRP-List extension to land in adapter_alloc_sq_user.
+ */
+static int io_queue_depth = 64;
 module_param_cb(io_queue_depth, &io_queue_depth_ops, &io_queue_depth, 0644);
-MODULE_PARM_DESC(io_queue_depth, "set io queue depth, should >= 2");
+MODULE_PARM_DESC(io_queue_depth,
+	"set io queue depth, should >= 2; default 64 because user IOQ "
+	"rings (NVM_ADD_USER_QUEUE) must fit in a single 4K page");
 
 static unsigned int write_queues;
 module_param(write_queues, uint, 0644);
@@ -403,6 +447,24 @@ struct nvme_dev {
 	 * MSI-X count is smaller than num_possible_cpus() on the host.
 	 */
 	unsigned int cap_kernel_ioq;
+	/*
+	 * snvme B3: controller-granted total IO queue count.  Written
+	 * inside s_nvme_setup_io_queues() right after snvme_set_queue_count
+	 * returns -- this is the authoritative upper bound on legal IOQ
+	 * QIDs (1..ctrl_max_io_queues).  The kernel keeps the first
+	 * (online_queues - 1) of those for its own use; the rest
+	 * (online_queues..ctrl_max_io_queues) are handed to userspace
+	 * via NVM_ADD_USER_QUEUE.
+	 *
+	 * Distinct from nr_allocated_queues, which is the snvme-side
+	 * dev->queues[] capacity (admin + nvme_max_io_queues()).  On
+	 * hosts where num_possible_cpus() > controller MSI-X count,
+	 * nr_allocated_queues is significantly larger than what the
+	 * controller will actually accept, and using nr_allocated_queues
+	 * as the user QID upper bound triggers Invalid Queue Identifier
+	 * (SC=0x4101) on Create I/O CQ.
+	 */
+	unsigned int ctrl_max_io_queues;
 };
 
 static int io_queue_depth_set(const char *val, const struct kernel_param *kp)
@@ -2734,29 +2796,41 @@ static int s_nvme_setup_io_queues(struct nvme_dev *dev)
 	/*
 	 * If tags are shared with admin queue (Apple bug), then
 	 * make sure we only use one IO queue.
+	 *
+	 * Otherwise: stay byte-for-byte compatible with in-tree
+	 * nvme-5.4 here -- ask the controller for nvme_max_io_queues()
+	 * and let snvme_set_queue_count() write back the real grant.
+	 * In-tree always has had the property that nr_io_queues
+	 * coming out of Set-Features is the controller's
+	 * authoritative IOQ ceiling, which we capture below as
+	 * dev->ctrl_max_io_queues for the user QID pool.
+	 *
+	 * Any cap_kernel_ioq the user requested is applied AFTER
+	 * the negotiation (further down): the kernel just stops
+	 * creating IOQs once it has consumed `cap` of them, leaving
+	 * QIDs [cap+1 .. ctrl_max_io_queues] free for
+	 * NVM_ADD_USER_QUEUE.  This decouples "what the controller
+	 * is willing to grant" (a hardware fact) from "what the
+	 * kernel actually consumes" (a policy decision).
 	 */
-	if (dev->ctrl.quirks & NVME_QUIRK_SHARED_TAGS) {
+	if (dev->ctrl.quirks & NVME_QUIRK_SHARED_TAGS)
 		nr_io_queues = 1;
-	} else {
-		/*
-		 * Kernel-side IOQ target = min(upstream default,
-		 * caller-supplied cap).  cap_kernel_ioq == 0 means "no
-		 * cap, use upstream's num_possible_cpus()-based math".
-		 * cap_kernel_ioq > 0 lets the user shrink the kernel's
-		 * Set-Features ask so the controller's MSI-X grant has
-		 * room left for the user share -- critical when the
-		 * NVMe's MSI-X vector count is smaller than the host's
-		 * num_possible_cpus() (e.g. Intel DC SSD: MSI-X=136 on
-		 * a 192-vCPU host) and we'd otherwise trip the
-		 * fallback-to-dma_alloc_coherent branch below.
-		 */
-		kernel_target = min(nvme_max_io_queues(dev),
-				    dev->nr_allocated_queues - 1);
-		if (dev->cap_kernel_ioq && dev->cap_kernel_ioq < kernel_target)
-			kernel_target = dev->cap_kernel_ioq;
+	else
+		nr_io_queues = min(nvme_max_io_queues(dev),
+				   dev->nr_allocated_queues - 1);
 
-		nr_io_queues = kernel_target;
-	}
+	/*
+	 * kernel_target: how many IOQs the kernel ultimately wants for
+	 * itself.  Used (a) by the use_user_allocated A1/A2/B/C
+	 * reconciliation block below to compute the legacy
+	 * kernel-vs-user squeeze, and (b) by the B3 cap-only path
+	 * after Set-Features to shrink nr_io_queues so the user QID
+	 * pool gets the leftover range.  Default = nr_io_queues
+	 * (no narrowing); cap_kernel_ioq=N narrows to min(N, ...).
+	 */
+	kernel_target = nr_io_queues;
+	if (dev->cap_kernel_ioq && dev->cap_kernel_ioq < kernel_target)
+		kernel_target = dev->cap_kernel_ioq;
 
 	/*
 	 * snvme hook 6b-1: if userspace pre-registered IO queues, bias
@@ -2770,6 +2844,45 @@ static int s_nvme_setup_io_queues(struct nvme_dev *dev)
 	}
 
 	result = snvme_set_queue_count(&dev->ctrl, &nr_io_queues);
+
+	/*
+	 * snvme B3: record the controller-granted IOQ ceiling.  This
+	 * is the authoritative bound for legal QID values used by
+	 * NVM_ADD_USER_QUEUE; the user QID pool will be
+	 * [online_queues..ctrl_max_io_queues].  Captured BEFORE any
+	 * downstream code mutates nr_io_queues (the cap-shrink below,
+	 * or the use_user_allocated A1/A2/B/C reconciliation further
+	 * down) so the pool sizer always sees the controller's real
+	 * grant -- not whatever value the kernel ends up consuming.
+	 */
+	if (result == 0)
+		dev->ctrl_max_io_queues = nr_io_queues;
+
+	/*
+	 * B3 cap-only path: shrink the kernel-side consumption to
+	 * cap_kernel_ioq AFTER the controller negotiation.  The
+	 * controller already granted up to nr_io_queues, but we want
+	 * QIDs [kernel_target+1 .. ctrl_max_io_queues] to remain
+	 * unused by the kernel so NVM_ADD_USER_QUEUE can claim them.
+	 *
+	 * Guarded so it only fires when (a) cap_kernel_ioq was set --
+	 * otherwise kernel_target == nr_io_queues and the comparison
+	 * is a no-op anyway, AND (b) we are not on the legacy
+	 * use_user_allocated path which has its own reconciliation
+	 * block below with squeeze semantics.  When cap_kernel_ioq
+	 * is 0, this whole block is a no-op and nr_io_queues flows
+	 * to setup_irqs/create_io_queues unchanged from the in-tree
+	 * Set-Features grant.
+	 */
+	if (dev->cap_kernel_ioq && !dev->use_user_allocated &&
+	    nr_io_queues > kernel_target) {
+		pr_info("snvme: capping kernel-side IOQ count from %d to %u "
+			"(ctrl_max=%u, user pool gets [%u..%u])\n",
+			nr_io_queues, kernel_target,
+			dev->ctrl_max_io_queues,
+			kernel_target + 1, dev->ctrl_max_io_queues);
+		nr_io_queues = kernel_target;
+	}
 
 	/*
 	 * snvme hook 6b-2: reconcile what the controller actually
@@ -4269,6 +4382,33 @@ static char *get_snvme_mode(struct device *dev, umode_t *mode)
  *   - snvm_devno is placed at minor = max_num_ctrls (one past the
  *     reserved range) so that /dev/snvm_control cannot collide with
  *     any ssnvme%d minor.
+ *
+ * Failure semantics:
+ *
+ *   On any failure, all sub-resources allocated up to that point
+ *   are released via the goto-chain below.  Two failure modes
+ *   leave behind state that *cannot* be cleaned up by the module
+ *   itself, and the operator must intervene before the next
+ *   insmod attempt:
+ *
+ *     (a) class_create returns -EEXIST.  A previous module
+ *         instance died after class_create succeeded but before
+ *         class_destroy ran (e.g. partial init failure on an
+ *         earlier load, or a forced unload that did not run
+ *         module_exit).  /sys/class/"libsnvm helper"/ persists.
+ *
+ *     (b) device_create returns -EEXIST.  Same root cause as
+ *         (a) but the residue is the /dev/snvm_control entry
+ *         (sysfs + chrdev region).
+ *
+ *   Operator fix for both: reboot.  Removing the sysfs node by
+ *   hand is fragile -- a partially-initialised class can hold
+ *   internal kobject refs that surface as a BUG when re-inserted.
+ *   We deliberately do NOT try to "rescue" by reusing the
+ *   pre-existing kobject; sysfs ABI does not give us a clean way
+ *   to do that, and silently adopting external state would mask
+ *   the underlying instability.  Loud failure with explicit
+ *   reboot guidance is the safer default.
  */
 static int snvm_cdev_init(void)
 {
@@ -4280,14 +4420,23 @@ static int snvm_cdev_init(void)
 	dev_class = class_create(THIS_MODULE, DRIVER_NAME);
 	if (IS_ERR(dev_class)) {
 		ret = PTR_ERR(dev_class);
-		pr_err("snvme: failed to create class: %d\n", ret);
+		pr_err("snvme: class_create(\"%s\") failed: %d\n",
+		       DRIVER_NAME, ret);
+		if (ret == -EEXIST)
+			pr_err("snvme: stale sysfs node /sys/class/\"%s\"/ "
+			       "from a previous module instance.  "
+			       "Reboot before retrying insmod.\n",
+			       DRIVER_NAME);
+		mutex_destroy(&snvm_control_lock);
+		dev_class = NULL;
 		return ret;
 	}
 	dev_class->devnode = get_snvme_mode;
 
 	ret = alloc_chrdev_region(&dev_first, 0, max_num_ctrls, DRIVER_NAME);
 	if (ret < 0) {
-		pr_err("snvme: failed to allocate device numbers: %d\n", ret);
+		pr_err("snvme: alloc_chrdev_region(%d minors) failed: %d\n",
+		       max_num_ctrls, ret);
 		goto destroy_class;
 	}
 
@@ -4296,14 +4445,20 @@ static int snvm_cdev_init(void)
 	snvm_cdev.owner = THIS_MODULE;
 	ret = cdev_add(&snvm_cdev, snvm_devno, 1);
 	if (ret < 0) {
-		pr_err("snvme: failed to add cdev: %d\n", ret);
+		pr_err("snvme: cdev_add failed: %d\n", ret);
 		goto err_unregister_chrdev;
 	}
 
 	device = device_create(dev_class, NULL, snvm_devno, NULL, "snvm_control");
 	if (IS_ERR(device)) {
 		ret = PTR_ERR(device);
-		pr_err("snvme: failed to create /dev/snvm_control: %d\n", ret);
+		pr_err("snvme: device_create(/dev/snvm_control) failed: %d\n",
+		       ret);
+		if (ret == -EEXIST)
+			pr_err("snvme: stale /dev/snvm_control or sysfs "
+			       "device node from a previous module "
+			       "instance.  Reboot before retrying "
+			       "insmod.\n");
 		goto destroy_cdev;
 	}
 	return 0;
@@ -4314,6 +4469,8 @@ err_unregister_chrdev:
 	unregister_chrdev_region(dev_first, max_num_ctrls);
 destroy_class:
 	class_destroy(dev_class);
+	dev_class = NULL;
+	mutex_destroy(&snvm_control_lock);
 	return ret;
 }
 
@@ -4325,6 +4482,17 @@ static void snvm_cdev_release(void)
 	class_destroy(dev_class);
 	mutex_destroy(&snvm_control_lock);
 	ida_destroy(&snvm_chrdev_minor_ida);
+	/*
+	 * Drain the queue-group id namespace.  All per-fd group
+	 * descriptors should already be gone by the time we get
+	 * here (every owning fd has been closed before module exit,
+	 * because module exit is rmmod-only and the chrdev cdev is
+	 * about to be torn down).  ida_destroy is safe to call on
+	 * an empty IDA, but a non-empty one would leak ints; in
+	 * that pathological case the WARN inside ida_destroy will
+	 * fire and we'll catch it in dmesg.
+	 */
+	ida_destroy(&snvm_queue_group_ida);
 	pr_info("snvme: /dev/snvm_control released\n");
 }
 
@@ -4627,6 +4795,505 @@ static int snvm_unbind_driver(struct pci_device_addr dev_addr)
  *     unmap_and_release()s `map` when ioq_idx<0 returns -EFAULT
  *     (snvme-5.15 leaked the fresh mapping).
  */
+
+/* ------------------------------------------------------------------ *
+ *  Per-fd queue-group machinery
+ *
+ *  These types and helpers are defined here (above
+ *  snvm_dev_map_ioctl) so the NVM_CREATE_QUEUE_GROUP /
+ *  NVM_DESTROY_QUEUE_GROUP cases can dereference snvm_dev_owner
+ *  members directly.  open / release / fops vtable still live
+ *  near the bottom of the file with the rest of the chrdev
+ *  lifecycle code -- only the type *definitions* need to be in
+ *  scope here.
+ *
+ *  See the rationale comment block above snvm_dev_open below for
+ *  the full leak-on-crash story that motivates having a per-fd
+ *  owner descriptor at all.
+ * ------------------------------------------------------------------ */
+
+struct snvm_dev_owner {
+	struct ctrl		*ctrl;
+	struct task_struct	*owner;
+
+	/*
+	 * Per-fd queue group list (NVM_CREATE_QUEUE_GROUP added them,
+	 * NVM_DESTROY_QUEUE_GROUP / fd-close drains them).  Protected
+	 * by groups_lock against concurrent ioctl threads on the same
+	 * fd; release() runs after all ioctl handlers have returned
+	 * (vfs guarantees fput happens after the last ref drops) so
+	 * the lock is uncontended there but we still take it for
+	 * lockdep cleanliness.
+	 *
+	 * We don't put the group descriptors in a global list because
+	 * cascade-cleanup on fd-close needs only this fd's groups,
+	 * and there's no cross-fd sharing of group_id (the IDA owns
+	 * the namespace, descriptors are strictly per-fd).
+	 */
+	struct list_head	groups;       /* head of struct snvm_qgroup */
+	struct mutex		groups_lock;  /* serialises group list mutation  */
+	unsigned int		nr_groups;    /* current count, for cap check    */
+};
+
+/*
+ * Per-fd queue group descriptor.
+ *
+ * NB: This is the runtime per-fd container introduced for
+ * NVM_CREATE_QUEUE_GROUP / NVM_DESTROY_QUEUE_GROUP.  Do NOT
+ * confuse with `struct snvm_queue_group` in ctrl.h, which is the
+ * legacy bind-time per-controller GPU partitioning descriptor used
+ * by NVM_SET_IOQ_NUM.  The two solve different problems and have
+ * different lifetimes; we deliberately use the suffix _qgroup to
+ * keep the namespaces distinct.
+ *
+ * Step B1: this is just a container.  Steps B2-B6 will hang
+ * registered maps and user IO queues off the per-group lists.
+ *
+ * Lifetime:
+ *   - allocated by NVM_CREATE_QUEUE_GROUP, group_id assigned via
+ *     ida_simple_get(&snvm_queue_group_ida, 1, 0, GFP_KERNEL).
+ *   - released by NVM_DESTROY_QUEUE_GROUP or by fd-close cascade.
+ *   - The IDA id is freed in destroy_qgroup_locked() AFTER all
+ *     child resources are released, to avoid a window where the
+ *     same group_id could be observed by two different
+ *     descriptors (the IDA recycles aggressively).
+ */
+struct snvm_qgroup {
+	struct list_head	link;       /* into snvm_dev_owner.groups */
+	uint32_t		group_id;
+	uint32_t		max_queues; /* hardcoded NVM_MAX_QUEUES_PER_GROUP for B1 */
+
+	/*
+	 * Per-group registered maps (B2).  Each entry is a struct map
+	 * threaded by its group_link member.  Adding a map is done by
+	 * NVM_MAP_HOST_MEMORY / NVM_MAP_DEVICE_MEMORY when the
+	 * payload's group_id != 0; removing happens via NVM_UNMAP_*
+	 * (vaddr lookup) or via destroy_qgroup_locked() during
+	 * NVM_DESTROY_QUEUE_GROUP / fd-close cascade.
+	 *
+	 * Why a separate per-group list (rather than scanning the
+	 * global host_list etc.)?  Two reasons:
+	 *   1. Cascade cleanup is O(group_maps) instead of
+	 *      O(global_maps); the global lists are intentionally
+	 *      kept controller-wide because legacy NVM_SET_IOQ_NUM
+	 *      paths still walk them.
+	 *   2. Cross-group / cross-fd isolation: a map registered
+	 *      under group A is not reachable via group B, even if
+	 *      they happen to share a vaddr.
+	 *
+	 * No cap on nr_maps in B2; userspace can register
+	 * arbitrarily many buffers (KVCache, page cache, ring
+	 * buffers).  Future revisions should hook into RLIMIT_MEMLOCK
+	 * or cgroup memory accounting to bound total pinned pages
+	 * per fd.
+	 */
+	struct list_head	maps;
+	unsigned int		nr_maps;
+
+	/*
+	 * Per-group user IO queues (B3, NVM_ADD_USER_QUEUE).
+	 *
+	 * Each slot pairs an SQ with a CQ on the controller.  The
+	 * NVMe-controller-side state (Create I/O CQ + Create I/O SQ
+	 * was issued, qid is committed) is reflected by
+	 * queues[i].alive == 1.  destroy_qgroup_locked walks this
+	 * array in reverse order issuing Delete I/O SQ + Delete I/O
+	 * CQ (NVMe spec ordering: SQ before CQ) and freeing the qid
+	 * back to ctrl->user_qid_bitmap.
+	 *
+	 * Layout choice -- inline array vs list:
+	 *   - max_queues is a fixed compile-time cap (16), so the
+	 *     overhead is bounded (16 * sizeof(struct snvm_user_queue)
+	 *     ~= 256 B per group).
+	 *   - inline array means destroy/cascade walk is cache-
+	 *     friendly and we don't need yet another list_head
+	 *     pair on struct map.
+	 *
+	 * Concurrency: protected by own->groups_lock at the qgroup
+	 * level (the same mutex protecting maps[] and the group
+	 * descriptor itself).  ctrl->user_qid_lock is taken inside
+	 * own->groups_lock when the bitmap is mutated.
+	 */
+	struct snvm_user_queue {
+		uint16_t qid;
+		uint16_t alive;     /* 1 once Create I/O SQ committed */
+		uint64_t sq_vaddr;  /* echoed back so destroy / recycle  */
+		uint64_t cq_vaddr;  /* can recover the rings if needed   */
+	} queues[NVM_MAX_QUEUES_PER_GROUP];
+	unsigned int		cur_queues; /* number of slots currently alive */
+};
+
+/*
+ * B3 user-QID pool management.
+ *
+ * Lazy-init the bitmap on the first allocation request: the pool
+ * range [user_qid_first, user_qid_last] is only known once
+ * nvme_probe has set ndev->online_queues / nr_allocated_queues,
+ * which happens asynchronously after SNVM_DEVICE_BIND.  Doing it
+ * eagerly at bind would require a probe-completion hook the
+ * upstream driver doesn't expose; doing it lazily keeps the code
+ * out of any reset/error path.
+ *
+ * Caller MUST hold ctrl->user_qid_lock.  ndev is the result of
+ * pci_get_drvdata(ctrl->pdev) and must be non-NULL with admin_q
+ * live (i.e. controller is bound and probe finished).
+ */
+static int snvm_user_qid_pool_init_locked(struct ctrl *ctrl,
+					  struct nvme_dev *ndev)
+{
+	unsigned int first, last, count;
+	unsigned long *bm;
+
+	if (ctrl->user_qid_bitmap)
+		return 0;     /* already initialised */
+
+	if (!ndev || !ndev->online_queues || !ndev->nr_allocated_queues)
+		return -ENODEV;
+
+	/*
+	 * online_queues counts admin + every kernel IOQ that finished
+	 * Create I/O SQ; nr_allocated_queues is the total dev->queues[]
+	 * capacity (admin + max_io_queues).  User QIDs occupy the gap.
+	 *
+	 * If the controller granted exactly num_possible_cpus() kernel
+	 * IOQs, online_queues == nr_allocated_queues and there is no
+	 * room for user queues -- treat that as -EBUSY so the caller
+	 * surfaces a meaningful error to userspace.
+	 */
+	/*
+	 * online_queues counts admin + every kernel IOQ that finished
+	 * Create I/O SQ.  ctrl_max_io_queues is the authoritative
+	 * controller-granted IOQ ceiling captured in s_nvme_setup_io_queues
+	 * right after snvme_set_queue_count returned.
+	 *
+	 * The user QID pool occupies the gap between "first kernel
+	 * unused QID" and "highest QID the controller will accept":
+	 *   first = online_queues               (admin=0 + kernel IOQs)
+	 *   last  = ctrl_max_io_queues          (granted ceiling)
+	 *
+	 * Why not nr_allocated_queues - 1?  On hosts where
+	 * num_possible_cpus() exceeds the controller's MSI-X grant
+	 * (e.g. 192-vCPU host + Intel DC SSD with MSI-X=136), the
+	 * snvme-side dev->queues[] capacity is bigger than what the
+	 * controller will actually accept; using nr_allocated_queues-1
+	 * placed valid-looking QIDs in the pool that the controller
+	 * then rejected with SC=0x4101 (Invalid Queue Identifier) at
+	 * Create I/O CQ time.  ctrl_max_io_queues fixes this by
+	 * surfacing the real controller ceiling to the pool sizer.
+	 *
+	 * If ctrl_max_io_queues is zero, probe never reached the
+	 * negotiation step (or the build is older than this fix);
+	 * fail loudly rather than fall back to the broken
+	 * nr_allocated_queues-1 estimate.
+	 */
+	if (!ndev->ctrl_max_io_queues) {
+		pr_warn("snvme: user QID pool: ctrl_max_io_queues=0 "
+			"(probe did not complete the Set-Features negotiation?)\n");
+		return -ENODEV;
+	}
+
+	first = ndev->online_queues;
+	last  = ndev->ctrl_max_io_queues;
+	if (first > last) {
+		pr_warn("snvme: user QID pool empty (online=%u, ctrl_max=%u); "
+			"controller refused to leave room for user IOQs.  "
+			"Lower cap_kernel_ioq via NVM_SET_IOQ_NUM before bind, "
+			"or attach to a controller with a larger MSI-X grant.\n",
+			ndev->online_queues, ndev->ctrl_max_io_queues);
+		return -EBUSY;
+	}
+	count = last - first + 1;
+
+	bm = kcalloc(BITS_TO_LONGS(count), sizeof(unsigned long), GFP_KERNEL);
+	if (!bm)
+		return -ENOMEM;
+
+	ctrl->user_qid_first  = first;
+	ctrl->user_qid_last   = last;
+	ctrl->user_qid_bitmap = bm;
+
+	pr_info("snvme: user QID pool initialised: [%u..%u] (%u QIDs)\n",
+		first, last, count);
+	return 0;
+}
+
+/*
+ * Allocate `nr` consecutive (per-call) user QIDs.  Not actually
+ * required to be contiguous on the wire -- NVMe doesn't care --
+ * but find_first_zero_bit + setting individually is plenty fast
+ * for nr <= 16, so we just iterate.
+ *
+ * Caller MUST hold ctrl->user_qid_lock.  Returns the first QID
+ * allocated (caller can deduce the rest in qids_out[]) or
+ * -EAGAIN if the pool is full.  On failure, no bits are set.
+ */
+static int snvm_user_qid_alloc_locked(struct ctrl *ctrl,
+				      unsigned int nr,
+				      uint16_t *qids_out)
+{
+	unsigned int pool_size = ctrl->user_qid_last - ctrl->user_qid_first + 1;
+	unsigned int i;
+	unsigned int bit;
+
+	for (i = 0; i < nr; i++) {
+		bit = find_first_zero_bit(ctrl->user_qid_bitmap, pool_size);
+		if (bit >= pool_size) {
+			/* Pool exhausted; roll back the bits we already set. */
+			while (i > 0) {
+				--i;
+				clear_bit(qids_out[i] - ctrl->user_qid_first,
+					  ctrl->user_qid_bitmap);
+			}
+			return -EAGAIN;
+		}
+		set_bit(bit, ctrl->user_qid_bitmap);
+		qids_out[i] = (uint16_t)(ctrl->user_qid_first + bit);
+	}
+	return 0;
+}
+
+/*
+ * Release one previously-allocated user QID back to the pool.
+ * Idempotent: calling on a never-allocated QID is a no-op (and
+ * a WARN, since that indicates a bookkeeping bug).
+ *
+ * Caller MUST hold ctrl->user_qid_lock.
+ */
+static void snvm_user_qid_free_locked(struct ctrl *ctrl, uint16_t qid)
+{
+	unsigned int bit;
+
+	if (qid < ctrl->user_qid_first || qid > ctrl->user_qid_last) {
+		pr_warn("snvme: user_qid_free: qid %u outside pool [%u..%u]\n",
+			qid, ctrl->user_qid_first, ctrl->user_qid_last);
+		return;
+	}
+	bit = qid - ctrl->user_qid_first;
+	if (!test_and_clear_bit(bit, ctrl->user_qid_bitmap))
+		pr_warn("snvme: user_qid_free: qid %u was already free\n", qid);
+}
+
+/*
+ * Forward declarations for adapter helpers used by user-queue
+ * teardown.  Defined further up in the file (adapter_delete_cq /
+ * adapter_delete_sq, currently around line 1597).  Re-declared
+ * here so destroy_qgroup_locked, defined immediately below, can
+ * reach them without re-ordering ~3000 lines.
+ */
+static int adapter_delete_cq(struct nvme_dev *dev, u16 cqid);
+static int adapter_delete_sq(struct nvme_dev *dev, u16 sqid);
+
+/*
+ * Forward decl for snvm_ctrl_get_live_ndev (defined a few hundred
+ * lines below, alongside find_qgroup_locked).  destroy_qgroup_locked
+ * needs it to drain Delete I/O SQ/CQ admin commands while running
+ * on cascade-cleanup paths that may race with unbind.
+ */
+static struct nvme_dev *snvm_ctrl_get_live_ndev(const struct ctrl *ctrl);
+
+
+/*
+ * Free a group descriptor and release its IDA id.  Caller must
+ * hold own->groups_lock and must have already unlinked the group
+ * from own->groups (or be in cascade cleanup where the list is
+ * being walked-and-emptied).
+ *
+ * Order of operations (matters!):
+ *
+ *   1. Drain user queues (B3): for each alive (qid), issue
+ *      Delete I/O SQ then Delete I/O CQ via the controller's
+ *      admin queue.  NVMe 1.4 §5.4 requires SQ-before-CQ.
+ *      Free the qid back to ctrl->user_qid_bitmap.  This MUST
+ *      happen before maps are freed -- the rings the controller
+ *      DMAs into are owned by maps[]; freeing them while the
+ *      controller still thinks the SQ exists is a use-after-free
+ *      from the DMA engine's perspective.
+ *
+ *   2. Drain maps (B2): unmap_and_release each one.  This frees
+ *      pinned host pages / nvidia_p2p refs, removes the map from
+ *      both the global list and g->maps.
+ *
+ *   3. Release the group_id back to the IDA and kfree(g).
+ *
+ * Failure handling for step 1: NVMe Delete I/O SQ/CQ admin
+ * commands almost never fail in practice (the only documented
+ * failure modes are "queue not found", which is a kernel bug,
+ * and timeout, which means the controller is stuck).  We log a
+ * warning and continue rather than aborting the whole teardown
+ * -- aborting would leave the group descriptor and its maps
+ * leaked, which is strictly worse than a controller-side
+ * residual SQ that the next bind will reset away.
+ *
+ * `ctrl` may be NULL if the caller knows the controller is gone
+ * (e.g. final module exit).  In that case we skip the admin
+ * commands and just reclaim the kernel-side state -- the
+ * controller-side SQs will be reset on the next bind anyway.
+ */
+static void destroy_qgroup_locked(struct snvm_qgroup *g, struct ctrl *ctrl)
+{
+	struct map *m, *tmp_m;
+	struct nvme_dev *ndev = NULL;
+	unsigned int n_drained = 0;
+	unsigned int n_queues = 0;
+	unsigned int i;
+
+	if (!g)
+		return;
+
+	/* ----- Step 1: drain user queues ----- */
+	/*
+	 * Resolve ndev defensively: we may be running on the
+	 * fd-close cascade path AFTER SNVM_DEVICE_UNBIND already
+	 * detached snvme from this BDF, in which case the in-tree
+	 * nvme driver may have already rebound and reset the
+	 * controller.  snvm_ctrl_get_live_ndev returns NULL for
+	 * "not currently owned by snvme", and below we treat NULL
+	 * as "skip the Delete I/O SQ/CQ admin step and just free
+	 * host-side bookkeeping".  This keeps cleanup idempotent
+	 * across unbind/rebind races.
+	 */
+	ndev = snvm_ctrl_get_live_ndev(ctrl);
+
+	/*
+	 * Walk in reverse just for symmetry with creation order;
+	 * NVMe spec doesn't require any particular qid ordering as
+	 * long as Delete-SQ precedes Delete-CQ for the same qid.
+	 */
+	for (i = NVM_MAX_QUEUES_PER_GROUP; i > 0; i--) {
+		struct snvm_user_queue *uq = &g->queues[i - 1];
+
+		if (!uq->alive)
+			continue;
+
+		if (ndev && ndev->ctrl.admin_q) {
+			int rc;
+			rc = adapter_delete_sq(ndev, uq->qid);
+			if (rc)
+				pr_warn("snvme: destroy_qgroup id=%u: "
+					"Delete I/O SQ qid=%u failed: %d\n",
+					g->group_id, uq->qid, rc);
+			rc = adapter_delete_cq(ndev, uq->qid);
+			if (rc)
+				pr_warn("snvme: destroy_qgroup id=%u: "
+					"Delete I/O CQ qid=%u failed: %d\n",
+					g->group_id, uq->qid, rc);
+		}
+
+		if (ctrl) {
+			mutex_lock(&ctrl->user_qid_lock);
+			snvm_user_qid_free_locked(ctrl, uq->qid);
+			mutex_unlock(&ctrl->user_qid_lock);
+		}
+
+		uq->alive = 0;
+		n_queues++;
+	}
+	if (n_queues)
+		pr_info("snvme: destroy_qgroup id=%u drained %u user queue(s)\n",
+			g->group_id, n_queues);
+	g->cur_queues = 0;
+
+	/* ----- Step 2: drain maps ----- */
+	list_for_each_entry_safe(m, tmp_m, &g->maps, group_link) {
+		/*
+		 * unmap_and_release() will list_del our group_link
+		 * out as part of its global-list-and-group-list
+		 * teardown, then free the page pins / nvidia p2p
+		 * refs / etc.  We don't list_del here ourselves to
+		 * keep the cleanup logic in one place.
+		 */
+		unmap_and_release(m);
+		n_drained++;
+	}
+	if (n_drained)
+		pr_info("snvme: destroy_qgroup id=%u drained %u map(s)\n",
+			g->group_id, n_drained);
+
+	g->nr_maps = 0;
+
+	/* ----- Step 3: release group_id ----- */
+	ida_simple_remove(&snvm_queue_group_ida, g->group_id);
+	kfree(g);
+}
+
+/*
+ * Resolve a per-controller "snvme owns this PCI device AND its
+ * NVMe controller is fully initialised" check, returning the
+ * struct nvme_dev * on success.
+ *
+ * Why this helper exists:
+ *
+ *   pci_get_drvdata(ctrl->pdev) is the obvious-looking way to
+ *   reach the nvme_dev, but the in-tree `nvme` PCI driver ALSO
+ *   stashes its struct nvme_dev there with a live admin_q.  If
+ *   we use `pci_get_drvdata + admin_q` as the sole liveness
+ *   check, an ioctl issued while the device is still owned by
+ *   the in-tree driver would happily fall through and start
+ *   issuing admin commands against a controller snvme does not
+ *   own -- fighting the in-tree driver over IOQ resources, and
+ *   in the worst case scribbling on its admin queue.
+ *
+ *   The single source of truth for "did SNVM_DEVICE_BIND succeed
+ *   on this BDF" is the PCI core's pdev->dev.driver pointer: if
+ *   it names PCI_DRIVER_NAME ("snvme") then probe ran here, and
+ *   the drvdata field is owned by us.  Otherwise it's either NULL
+ *   (no driver) or the in-tree nvme driver's.
+ *
+ * Returns:
+ *   non-NULL  -- a struct nvme_dev * owned by snvme, admin_q live;
+ *                safe to call adapter_alloc_*_user / etc.
+ *   NULL      -- either the device is not bound to snvme, or it
+ *                is bound but admin_q has not finished probe.
+ *                Callers MUST surface -ENODEV in that case so
+ *                userspace can poll (e.g. on probe race).
+ *
+ * No locking needed: pdev->dev.driver is stable for the duration
+ * of one ioctl because BIND/UNBIND go through snvm_control_lock
+ * via the control-plane ioctl path.
+ */
+static struct nvme_dev *snvm_ctrl_get_live_ndev(const struct ctrl *ctrl)
+{
+	struct device_driver *drv;
+	struct nvme_dev *ndev;
+
+	if (!ctrl || !ctrl->pdev)
+		return NULL;
+
+	drv = ctrl->pdev->dev.driver;
+	if (!drv || !drv->name || strcmp(drv->name, PCI_DRIVER_NAME) != 0)
+		return NULL;
+
+	ndev = pci_get_drvdata(ctrl->pdev);
+	if (!ndev || !ndev->ctrl.admin_q)
+		return NULL;
+
+	return ndev;
+}
+
+/*
+ * Look up a queue group by id within a single fd's owner list.
+ * Returns NULL if not found.  Caller MUST hold own->groups_lock.
+ *
+ * Cross-fd isolation is enforced here implicitly: groups are only
+ * reachable from the owning fd's snvm_dev_owner.groups list, so a
+ * group_id allocated by fd A is invisible to fd B's lookup.  The
+ * IDA may recycle ids, but the descriptor identity is per-fd, so
+ * a recycled id cannot be misused to alias someone else's group.
+ */
+static struct snvm_qgroup *find_qgroup_locked(struct snvm_dev_owner *own,
+					      uint32_t group_id)
+{
+	struct snvm_qgroup *g;
+
+	if (!own || group_id == 0)
+		return NULL;
+	list_for_each_entry(g, &own->groups, link) {
+		if (g->group_id == group_id)
+			return g;
+	}
+	return NULL;
+}
+
 static long snvm_dev_map_ioctl(struct file *file, unsigned int cmd,
 			       unsigned long arg)
 {
@@ -4650,19 +5317,54 @@ static long snvm_dev_map_ioctl(struct file *file, unsigned int cmd,
 
 	switch (cmd) {
 	case NVM_MAP_HOST_MEMORY:
-		/* Pin user pages, hand back DMA addrs.  If the caller
-		 * tags the mapping with an ioq_idx, count it against
-		 * the controller's pre-declared queue budget.
+		/*
+		 * Pin user pages, hand back DMA addrs.  Two modes
+		 * coexist (see ioctl.h struct nvm_ioctl_map):
+		 *
+		 *   group_id == 0  legacy.  ioq_idx >= 0 counts the
+		 *                  map against ctrl->ioq_num /
+		 *                  ctrl->cq_num and tags it for the
+		 *                  NVM_SET_IOQ_NUM bring-up.  Map is
+		 *                  reachable only via the global
+		 *                  host_list.
+		 *
+		 *   group_id != 0  new mode.  Map is registered on
+		 *                  the per-fd group's maps list so
+		 *                  destroy/cascade can drain it.
+		 *                  ioq_idx / is_cq are ignored.
 		 */
 		if (copy_from_user(&request, argp, sizeof(request)))
 			return -EFAULT;
+		if (request.reserved != 0)
+			return -EINVAL;     /* MBZ; future compat */
 
 		map = map_userspace(&host_list, ctrl,
 				    request.vaddr_start, request.n_pages);
 		if (IS_ERR_OR_NULL(map))
 			return map ? PTR_ERR(map) : -ENOMEM;
 
-		if (request.ioq_idx >= 0) {
+		if (request.group_id != 0) {
+			/* New mode: attach to per-fd queue group. */
+			struct snvm_dev_owner *own = file->private_data;
+			struct snvm_qgroup *g;
+
+			if (!own) {
+				unmap_and_release(map);
+				return -ENODEV;
+			}
+			mutex_lock(&own->groups_lock);
+			g = find_qgroup_locked(own, request.group_id);
+			if (!g) {
+				mutex_unlock(&own->groups_lock);
+				unmap_and_release(map);
+				return -ENOENT;
+			}
+			map->group_id = request.group_id;
+			list_add_tail(&map->group_link, &g->maps);
+			g->nr_maps++;
+			mutex_unlock(&own->groups_lock);
+		} else if (request.ioq_idx >= 0) {
+			/* Legacy mode: account against ctrl budget. */
 			ctrl->ioq_map_num += 1;
 			if (ctrl->ioq_map_num > ctrl->ioq_num) {
 				pr_err("snvme: NVM_MAP_HOST_MEMORY budget overflow (mapped=%u, declared=%u)\n",
@@ -4682,13 +5384,23 @@ static long snvm_dev_map_ioctl(struct file *file, unsigned int cmd,
 			/*
 			 * PORTING.md section 7.3.1 trap #4: roll back every
 			 * counter we bumped above AND release the
-			 * mapping we just allocated.  Skipping any one
-			 * of these poisons the use_sreg gate (the next
-			 * SNVM_DEVICE_BIND silently falls back to
-			 * dma_alloc_coherent) and leaks pinned pages
-			 * until module unload.
+			 * mapping we just allocated.  For new-mode (group)
+			 * maps, unmap_and_release will list_del the
+			 * group_link out so g->nr_maps is the only thing
+			 * we have to roll back manually.
 			 */
-			if (request.ioq_idx >= 0) {
+			if (request.group_id != 0) {
+				struct snvm_dev_owner *own = file->private_data;
+				struct snvm_qgroup *g;
+
+				if (own) {
+					mutex_lock(&own->groups_lock);
+					g = find_qgroup_locked(own, request.group_id);
+					if (g)
+						g->nr_maps--;
+					mutex_unlock(&own->groups_lock);
+				}
+			} else if (request.ioq_idx >= 0) {
 				if (map->is_cq)
 					ctrl->cq_num--;
 				ctrl->ioq_map_num--;
@@ -4700,9 +5412,24 @@ static long snvm_dev_map_ioctl(struct file *file, unsigned int cmd,
 		break;
 
 	case NVM_MAP_DEVICE_MEMORY:
-		/* Pin GPU pages (NVIDIA p2p) into device_list. */
+		/*
+		 * Pin GPU pages (NVIDIA p2p) into device_list.  Same
+		 * dual-mode semantics as NVM_MAP_HOST_MEMORY: nonzero
+		 * group_id attaches the map to a per-fd group; zero
+		 * keeps it on the controller-global list only.
+		 *
+		 * Note: the legacy NVM_MAP_DEVICE_MEMORY case did NOT
+		 * touch ctrl->ioq_map_num / cq_num at all (data path
+		 * only).  We preserve that: even with group_id == 0
+		 * and ioq_idx >= 0 we just ignore the ioq tag here,
+		 * matching the historical behaviour.  GPU queue ring
+		 * registration still goes through
+		 * NVM_MAP_DEVICE_QUEUE_MEMORY in legacy mode.
+		 */
 		if (copy_from_user(&request, argp, sizeof(request)))
 			return -EFAULT;
+		if (request.reserved != 0)
+			return -EINVAL;
 
 		map = map_device_memory(&device_list, ctrl,
 					request.vaddr_start, request.n_pages,
@@ -4710,18 +5437,41 @@ static long snvm_dev_map_ioctl(struct file *file, unsigned int cmd,
 		if (IS_ERR_OR_NULL(map))
 			return map ? PTR_ERR(map) : -ENOMEM;
 
+		if (request.group_id != 0) {
+			struct snvm_dev_owner *own = file->private_data;
+			struct snvm_qgroup *g;
+
+			if (!own) {
+				unmap_and_release(map);
+				return -ENODEV;
+			}
+			mutex_lock(&own->groups_lock);
+			g = find_qgroup_locked(own, request.group_id);
+			if (!g) {
+				mutex_unlock(&own->groups_lock);
+				unmap_and_release(map);
+				return -ENOENT;
+			}
+			map->group_id = request.group_id;
+			list_add_tail(&map->group_link, &g->maps);
+			g->nr_maps++;
+			mutex_unlock(&own->groups_lock);
+		}
+
 		if (copy_to_user((void __user *)request.ioaddrs, map->addrs,
 				 map->n_addrs * sizeof(uint64_t))) {
-			/*
-			 * PORTING.md section 7.3.1 trap "NVM_MAP_DEVICE_MEMORY
-			 * (data path) must unmap_and_release() on
-			 * copy_to_user failure".  Otherwise a userspace
-			 * crash between ioctl() and receiving the IO
-			 * addresses leaks pinned GPU pages for the
-			 * lifetime of the module.  No queue accounting
-			 * to roll back here -- data-path MAP_DEVICE
-			 * mappings do not touch ioq_map_num / cq_num.
-			 */
+			if (request.group_id != 0) {
+				struct snvm_dev_owner *own = file->private_data;
+				struct snvm_qgroup *g;
+
+				if (own) {
+					mutex_lock(&own->groups_lock);
+					g = find_qgroup_locked(own, request.group_id);
+					if (g)
+						g->nr_maps--;
+					mutex_unlock(&own->groups_lock);
+				}
+			}
 			unmap_and_release(map);
 			return -EFAULT;
 		}
@@ -4783,12 +5533,45 @@ static long snvm_dev_map_ioctl(struct file *file, unsigned int cmd,
 
 		map = map_find(&host_list, addr);
 		if (map) {
+			/*
+			 * If the map is attached to a per-fd queue group
+			 * (group_id != 0), take own->groups_lock first so
+			 * the group_link list_del inside unmap_and_release
+			 * is serialised against concurrent destroy /
+			 * cascade-cleanup paths.  Legacy maps (group_id ==
+			 * 0) skip the lock altogether.
+			 */
+			struct snvm_dev_owner *own = file->private_data;
+			bool need_grp_lock = (map->group_id != 0 && own);
+
+			if (need_grp_lock)
+				mutex_lock(&own->groups_lock);
+
 			if (map->ioq_idx >= 0) {
 				if (map->is_cq)
 					ctrl->cq_num--;
 				ctrl->ioq_map_num--;
 			}
+			if (map->group_id != 0 && own) {
+				/*
+				 * Decrement nr_maps before unmap_and_release
+				 * (which list_dels group_link) so the count
+				 * stays consistent throughout.  find_qgroup
+				 * may return NULL if userspace destroyed the
+				 * group between the map insertion and now;
+				 * in that pathological case the map was
+				 * already drained by destroy_qgroup_locked
+				 * and we wouldn't be here.  Guard anyway.
+				 */
+				struct snvm_qgroup *g =
+					find_qgroup_locked(own, map->group_id);
+				if (g && g->nr_maps > 0)
+					g->nr_maps--;
+			}
 			unmap_and_release(map);
+
+			if (need_grp_lock)
+				mutex_unlock(&own->groups_lock);
 			ret = 0;
 		} else {
 			pr_warn("snvme: NVM_UNMAP_HOST_MEMORY: addr %llx not found\n", addr);
@@ -4802,7 +5585,22 @@ static long snvm_dev_map_ioctl(struct file *file, unsigned int cmd,
 
 		map = map_find(&device_list, addr);
 		if (map) {
+			struct snvm_dev_owner *own = file->private_data;
+			bool need_grp_lock = (map->group_id != 0 && own);
+
+			if (need_grp_lock)
+				mutex_lock(&own->groups_lock);
+
+			if (map->group_id != 0 && own) {
+				struct snvm_qgroup *g =
+					find_qgroup_locked(own, map->group_id);
+				if (g && g->nr_maps > 0)
+					g->nr_maps--;
+			}
 			unmap_and_release(map);
+
+			if (need_grp_lock)
+				mutex_unlock(&own->groups_lock);
 			ret = 0;
 		} else {
 			pr_warn("snvme: NVM_UNMAP_DEVICE_MEMORY: addr %llx not found\n", addr);
@@ -4962,10 +5760,19 @@ static long snvm_dev_map_ioctl(struct file *file, unsigned int cmd,
 		 * never enqueued because state never reached
 		 * NVME_CTRL_LIVE).
 		 */
-		ndev = pci_get_drvdata(ctrl->pdev);
+		/*
+		 * Same liveness rule as the other admin-touching paths:
+		 * if the device is still owned by the in-tree nvme
+		 * driver, we MUST NOT return its drvdata as ours.  The
+		 * B3 NVM_GET_DEV_INFO contract guarantees that fields
+		 * like max_user_qid / max_queues_per_group are derived
+		 * from snvme-internal state, so a pre-bind GET_DEV_INFO
+		 * has no valid values to report.
+		 */
+		ndev = snvm_ctrl_get_live_ndev(ctrl);
 		if (!ndev) {
-			pr_err("snvme: pci_get_drvdata returned NULL in NVM_GET_DEV_INFO\n");
-			return -EFAULT;
+			pr_debug("snvme: NVM_GET_DEV_INFO: controller not bound to snvme yet\n");
+			return -ENODEV;
 		}
 
 		ns = snvme_find_get_ns(&ndev->ctrl, 1);
@@ -5008,11 +5815,61 @@ static long snvm_dev_map_ioctl(struct file *file, unsigned int cmd,
 		memset(&drequest, 0, sizeof(drequest));
 		memcpy(drequest.disk_name, ns->disk->disk_name,
 		       DISK_NAME_LEN * sizeof(char));
-		drequest.start_cq_idx  = ndev->user_start_qid;
+		/*
+		 * start_cq_idx: first QID available to user IOQs.
+		 * Old path (NVM_SET_SHARE_REG -> probe -> mix) sets
+		 * user_start_qid = online_queues at the end of mix.
+		 * New path (no SET_SHARE_REG) leaves user_start_qid
+		 * at 0; fall back to online_queues so userspace gets
+		 * a consistent answer regardless of which flow brought
+		 * the controller up.
+		 */
+		drequest.start_cq_idx  = ndev->user_start_qid
+					 ? ndev->user_start_qid
+					 : ndev->online_queues;
 		drequest.dstrd         = ndev->db_stride;
 		drequest.nr_user_q     = ndev->nr_user_use_cq;
 		drequest.block_size    = 1 << ns->lba_shift;
 		drequest.max_data_size = ndev->ctrl.max_hw_sectors;
+
+		/*
+		 * B3 fields.  These are the single source of truth for
+		 * userspace ring sizing and QID allocation:
+		 *
+		 *   q_depth                NVMe CAP.MQES + 1, clamped by
+		 *                          io_queue_depth module param.
+		 *                          Applies to *every* user queue
+		 *                          -- snvme does not support
+		 *                          per-queue depth.
+		 *   bar0_size              Full BAR0 region size; userspace
+		 *                          mmaps up to this many bytes
+		 *                          starting at offset 0 to reach
+		 *                          all doorbell registers.
+		 *   max_user_qid           Highest QID kernel will hand
+		 *                          out via NVM_ADD_USER_QUEUE,
+		 *                          inclusive.  User QID pool is
+		 *                          [start_cq_idx, max_user_qid].
+		 *   max_queues_per_group   Echoes the kernel-fixed cap
+		 *                          (NVM_MAX_QUEUES_PER_GROUP)
+		 *                          so userspace doesn't have to
+		 *                          hardcode the value.
+		 */
+		drequest.q_depth             = (uint16_t)ndev->q_depth;
+		drequest.bar0_size           = (uint32_t)pci_resource_len(ctrl->pdev, 0);
+		/*
+		 * B3 contract: max_user_qid is the inclusive top of the
+		 * user QID pool, i.e. the controller-granted IOQ
+		 * ceiling.  Userspace can rely on
+		 *   start_cq_idx <= qid <= max_user_qid
+		 * being safe to drive Create I/O SQ/CQ on.  We
+		 * intentionally do NOT report nr_allocated_queues-1
+		 * (the snvme dev->queues[] capacity), which on hosts
+		 * with num_possible_cpus() > controller MSI-X grant is
+		 * higher than what the controller will accept and would
+		 * mis-tell userspace it has more headroom than reality.
+		 */
+		drequest.max_user_qid        = ndev->ctrl_max_io_queues;
+		drequest.max_queues_per_group = NVM_MAX_QUEUES_PER_GROUP;
 
 		snvme_put_ns(ns);
 
@@ -5035,6 +5892,551 @@ static long snvm_dev_map_ioctl(struct file *file, unsigned int cmd,
 		memset(&ctrl->setup, 0, sizeof(ctrl->setup));
 		ret = 0;
 		break;
+
+	case NVM_RAW_ADMIN_CMD: {
+		/*
+		 * Pass-through admin SQE forwarder.  Used by userspace
+		 * (NVMeService, smoke tests) to drive per-queue recycle
+		 * (Delete + Create I/O SQ/CQ; NVMe 1.4 §5.4/§5.5) and
+		 * any other admin command that snvme does not need a
+		 * dedicated ioctl for.
+		 *
+		 * Restrictions:
+		 *   - controller must be probed/bound: ctrl->pdev's
+		 *     drvdata == valid struct nvme_dev with admin_q.
+		 *     We surface -ENODEV otherwise so userspace knows
+		 *     the bind step is missing.
+		 *   - data-buffer admin commands are NOT supported in
+		 *     this revision: we always hand snvme_submit_sync_cmd
+		 *     buffer=NULL, bufflen=0.  Add a follow-up path if
+		 *     Get Log Page / Set Features with payload is ever
+		 *     needed (signal via reserved fields in the UAPI
+		 *     struct so the _IOC_SIZE stays stable).
+		 *
+		 * We do NOT inspect the opcode -- this is deliberately
+		 * a generic forwarder.  The caller is expected to be a
+		 * privileged daemon that knows what it is sending.
+		 */
+		struct nvm_ioctl_raw_admin admin_req;
+		struct nvme_command nvme_cmd;
+		union nvme_result nvme_res;
+		int admin_ret;
+
+		if (copy_from_user(&admin_req, argp, sizeof(admin_req)))
+			return -EFAULT;
+
+		/*
+		 * Same liveness rule as NVM_ADD_USER_QUEUE: only forward
+		 * admin commands when snvme actually owns this BDF.
+		 * pci_get_drvdata alone would happily return the in-tree
+		 * nvme driver's nvme_dev pre-bind, which would be a
+		 * cross-driver admin_q hijack.
+		 */
+		ndev = snvm_ctrl_get_live_ndev(ctrl);
+		if (!ndev) {
+			pr_warn("snvme: NVM_RAW_ADMIN_CMD on unbound controller (BDF=%04x:%02x:%02x.%x)\n",
+				pci_domain_nr(ctrl->pdev->bus),
+				ctrl->pdev->bus->number,
+				PCI_SLOT(ctrl->pdev->devfn),
+				PCI_FUNC(ctrl->pdev->devfn));
+			return -ENODEV;
+		}
+
+		BUILD_BUG_ON(sizeof(admin_req.sqe) != sizeof(nvme_cmd));
+		memcpy(&nvme_cmd, admin_req.sqe, sizeof(nvme_cmd));
+		memset(&nvme_res, 0, sizeof(nvme_res));
+
+		admin_ret = __snvme_submit_sync_cmd(ndev->ctrl.admin_q,
+						   &nvme_cmd, &nvme_res,
+						   NULL, 0,
+						   0, NVME_QID_ANY, 0,
+						   0, false);
+		/*
+		 * Per __snvme_submit_sync_cmd contract:
+		 *   admin_ret == 0      -> success, result populated
+		 *   admin_ret < 0       -> Linux errno; CQE never arrived
+		 *   admin_ret > 0       -> NVMe spec status code
+		 *                          (SC|SCT|...); CQE arrived but
+		 *                          controller rejected the cmd
+		 *
+		 * We surface (>0) as ioctl success with nvme_status set
+		 * so userspace can pattern-match on NVMe SC values
+		 * (e.g. 0x01 "Invalid Command Opcode" for a controller
+		 * that does not implement an opcode we sent).  Negative
+		 * (transport) errors stay -errno.
+		 */
+		if (admin_ret < 0) {
+			admin_req.nvme_status = 0;
+			admin_req.result_dw0  = 0;
+			admin_req.result_dw1  = 0;
+			if (copy_to_user(argp, &admin_req, sizeof(admin_req)))
+				return -EFAULT;
+			return admin_ret;
+		}
+		admin_req.nvme_status = (uint16_t)(admin_ret & 0xFFFF);
+		admin_req.result_dw0  = le32_to_cpu(nvme_res.u32);
+		admin_req.result_dw1  = 0;     /* spec reserves DW1 for most admin cmds */
+
+		if (copy_to_user(argp, &admin_req, sizeof(admin_req)))
+			return -EFAULT;
+		ret = 0;
+		break;
+	}
+
+	case NVM_CREATE_QUEUE_GROUP:
+	{
+		/*
+		 * Allocate a new per-fd queue group.  In B1 the group is
+		 * just a kernel-side container; later steps will hang
+		 * registered maps (B2) and user IO queues (B3) off of it.
+		 *
+		 * Why we don't require the controller to be bound:
+		 * the group itself doesn't touch any NVMe state.  Bind
+		 * status will be enforced when a child operation
+		 * (NVM_ADD_USER_QUEUE) actually needs admin_q.  This
+		 * matches the existing behaviour for NVM_MAP_HOST_MEMORY
+		 * which is also bind-agnostic.
+		 *
+		 * Caps:
+		 *   - per-fd:  NVM_MAX_GROUPS_PER_FD (default 1)
+		 *   - per-group queue cap: NVM_MAX_QUEUES_PER_GROUP, echoed
+		 *     back in payload.max_queues so userspace doesn't have
+		 *     to hardcode the value.
+		 */
+		struct nvm_ioctl_queue_group req;
+		struct snvm_dev_owner *own = file->private_data;
+		struct snvm_qgroup *g;
+		int new_id;
+
+		if (!own)
+			return -ENODEV;
+
+		if (copy_from_user(&req, argp, sizeof(req)))
+			return -EFAULT;
+		if (req.flags != 0)
+			return -EINVAL;
+		/* MBZ check on reserved[]. */
+		{
+			size_t i;
+			for (i = 0; i < ARRAY_SIZE(req.reserved); i++)
+				if (req.reserved[i] != 0)
+					return -EINVAL;
+		}
+
+		mutex_lock(&own->groups_lock);
+		if (own->nr_groups >= NVM_MAX_GROUPS_PER_FD) {
+			mutex_unlock(&own->groups_lock);
+			return -EBUSY;
+		}
+
+		g = kzalloc(sizeof(*g), GFP_KERNEL);
+		if (!g) {
+			mutex_unlock(&own->groups_lock);
+			return -ENOMEM;
+		}
+
+		/*
+		 * IDA range starts at 1 -- group_id 0 is reserved as the
+		 * "no group" sentinel for userspace.  ida_simple_get's
+		 * (start, end) is [start, end), end=0 means "no upper
+		 * bound", which gives us the full uint32_t range less id 0.
+		 */
+		new_id = ida_simple_get(&snvm_queue_group_ida, 1, 0, GFP_KERNEL);
+		if (new_id < 0) {
+			kfree(g);
+			mutex_unlock(&own->groups_lock);
+			return new_id;
+		}
+
+		g->group_id   = (uint32_t)new_id;
+		g->max_queues = NVM_MAX_QUEUES_PER_GROUP;
+		INIT_LIST_HEAD(&g->link);
+		INIT_LIST_HEAD(&g->maps);
+		g->nr_maps    = 0;
+		list_add_tail(&g->link, &own->groups);
+		own->nr_groups++;
+		mutex_unlock(&own->groups_lock);
+
+		req.group_id   = g->group_id;
+		req.max_queues = g->max_queues;
+		/* req.flags / req.reserved are already zeroed from input
+		 * MBZ check; copy back unchanged. */
+		if (copy_to_user(argp, &req, sizeof(req))) {
+			/*
+			 * Rollback: copy_to_user can fail if userspace
+			 * unmapped the buffer between the copy_from and
+			 * here.  Walk the group back out so the IDA
+			 * doesn't leak an unreachable id.
+			 */
+			mutex_lock(&own->groups_lock);
+			list_del(&g->link);
+			own->nr_groups--;
+			destroy_qgroup_locked(g, ctrl);
+			mutex_unlock(&own->groups_lock);
+			return -EFAULT;
+		}
+
+		pr_debug("snvme: NVM_CREATE_QUEUE_GROUP id=%u max_queues=%u pid=%d\n",
+			 g->group_id, g->max_queues, current->pid);
+		ret = 0;
+		break;
+	}
+
+	case NVM_DESTROY_QUEUE_GROUP:
+	{
+		/*
+		 * Explicit destroy.  Userspace passes the opaque
+		 * group_id (uint32_t), we look it up in the per-fd
+		 * group list (via find_qgroup_locked) and tear it
+		 * down.  Cross-fd destroy is disallowed by
+		 * construction: the group descriptor is only
+		 * reachable via this fd's owner->groups list, so a
+		 * foreign group_id is invisible and returns -ENOENT.
+		 *
+		 * Teardown is delegated to destroy_qgroup_locked,
+		 * which since B2/B3 drains all attached user queues
+		 * (Delete I/O SQ + Delete I/O CQ via the admin path)
+		 * and registered maps before freeing the descriptor.
+		 */
+		uint32_t group_id;
+		struct snvm_dev_owner *own = file->private_data;
+		struct snvm_qgroup *g;
+		bool found;
+
+		if (!own)
+			return -ENODEV;
+
+		if (copy_from_user(&group_id, argp, sizeof(group_id)))
+			return -EFAULT;
+		if (group_id == 0)
+			return -EINVAL;     /* sentinel value, never assigned */
+
+		mutex_lock(&own->groups_lock);
+		g = find_qgroup_locked(own, group_id);
+		found = (g != NULL);
+		if (found) {
+			list_del(&g->link);
+			own->nr_groups--;
+			destroy_qgroup_locked(g, ctrl);
+			g = NULL;     /* descriptor freed; null out to avoid use-after-free */
+		}
+		mutex_unlock(&own->groups_lock);
+
+		if (!found) {
+			pr_debug("snvme: NVM_DESTROY_QUEUE_GROUP id=%u not found on fd (pid=%d)\n",
+				 group_id, current->pid);
+			return -ENOENT;
+		}
+
+		pr_debug("snvme: NVM_DESTROY_QUEUE_GROUP id=%u pid=%d\n",
+			 group_id, current->pid);
+		ret = 0;
+		break;
+	}
+
+	case NVM_ADD_USER_QUEUE:
+	{
+		/*
+		 * Create a batch of (SQ, CQ) pairs against a queue group.
+		 *
+		 * The contract (see ioctl.h struct nvm_ioctl_add_user_queue
+		 * for full text):
+		 *   - controller must be bound (NVME_CTRL_LIVE),
+		 *   - group_id must belong to this fd,
+		 *   - 1 <= nr_pairs <= NVM_MAX_QUEUES_PER_GROUP,
+		 *   - flags / reserved MBZ,
+		 *   - each (sq_vaddr, cq_vaddr) resolves to a map already
+		 *     registered against this group via NVM_MAP_HOST_MEMORY
+		 *     / NVM_MAP_DEVICE_MEMORY (group_id != 0 path),
+		 *   - cur_queues + nr_pairs <= max_queues_per_group,
+		 *   - vaddrs unique within the call.
+		 *
+		 * On any failure mid-batch we Delete I/O SQ / CQ for every
+		 * pair we already Created in this same call, free the QIDs
+		 * back to the bitmap, and return the error.  The group is
+		 * left exactly as the caller saw it before the ioctl.
+		 */
+		struct nvm_ioctl_add_user_queue *req;
+		struct snvm_dev_owner *own = file->private_data;
+		struct snvm_qgroup *g;
+		struct nvme_dev *ndev;
+		/*
+		 * Zero-init defensively: snvm_user_qid_alloc_locked
+		 * writes qids[0..nr_pairs-1] on success, and we never
+		 * reach the rollback path unless alloc_locked succeeded
+		 * (alloc_n stays 0 on alloc_locked failure).  But
+		 * zeroing here keeps the invariant local and prevents
+		 * a future refactor from accidentally reading stack
+		 * garbage if some new error path lands here with
+		 * alloc_n still > 0.
+		 */
+		uint16_t qids[NVM_MAX_QUEUES_PER_GROUP] = {0};
+		struct map *sq_maps[NVM_MAX_QUEUES_PER_GROUP] = {NULL};
+		struct map *cq_maps[NVM_MAX_QUEUES_PER_GROUP] = {NULL};
+		unsigned int created = 0;     /* how many SQ+CQ pairs Create succeeded */
+		unsigned int alloc_n  = 0;    /* how many qids allocated from bitmap   */
+		unsigned int i, j;
+		int rc;
+		size_t k;
+
+		if (!own)
+			return -ENODEV;
+
+		req = kzalloc(sizeof(*req), GFP_KERNEL);
+		if (!req)
+			return -ENOMEM;
+
+		if (copy_from_user(req, argp, sizeof(*req))) {
+			kfree(req);
+			return -EFAULT;
+		}
+
+		/* Validate primitives. */
+		if (req->flags != 0) {
+			kfree(req);
+			return -EINVAL;
+		}
+		for (k = 0; k < ARRAY_SIZE(req->reserved); k++) {
+			if (req->reserved[k] != 0) {
+				kfree(req);
+				return -EINVAL;
+			}
+		}
+		if (req->nr_pairs == 0 ||
+		    req->nr_pairs > NVM_MAX_QUEUES_PER_GROUP) {
+			kfree(req);
+			return -EINVAL;
+		}
+
+		/* Detect duplicate vaddrs in the batch. */
+		for (i = 0; i < req->nr_pairs; i++) {
+			if (req->pairs[i].sq_vaddr == 0 ||
+			    req->pairs[i].cq_vaddr == 0 ||
+			    req->pairs[i].sq_vaddr == req->pairs[i].cq_vaddr) {
+				kfree(req);
+				return -EINVAL;
+			}
+			for (j = 0; j < i; j++) {
+				if (req->pairs[i].sq_vaddr == req->pairs[j].sq_vaddr ||
+				    req->pairs[i].cq_vaddr == req->pairs[j].cq_vaddr) {
+					kfree(req);
+					return -EINVAL;
+				}
+			}
+		}
+
+		/*
+		 * Controller must be bound to snvme AND its admin_q
+		 * must be live (probe finished).  snvm_ctrl_get_live_ndev
+		 * checks pdev->dev.driver against PCI_DRIVER_NAME first
+		 * to distinguish "owned by snvme" from "still owned by
+		 * the in-tree nvme driver", which pci_get_drvdata
+		 * cannot tell apart on its own.
+		 */
+		ndev = snvm_ctrl_get_live_ndev(ctrl);
+		if (!ndev) {
+			kfree(req);
+			return -ENODEV;
+		}
+
+		mutex_lock(&own->groups_lock);
+
+		g = find_qgroup_locked(own, req->group_id);
+		if (!g) {
+			mutex_unlock(&own->groups_lock);
+			kfree(req);
+			return -ENOENT;
+		}
+		if (g->cur_queues + req->nr_pairs > g->max_queues) {
+			mutex_unlock(&own->groups_lock);
+			kfree(req);
+			return -EBUSY;
+		}
+
+		/*
+		 * Resolve every (sq_vaddr, cq_vaddr) to a map living on
+		 * g->maps.  We do this BEFORE allocating QIDs or sending
+		 * any admin command so a bad lookup costs nothing on the
+		 * controller side.
+		 *
+		 * The lookup is O(nr_pairs * group_maps) which is fine:
+		 * both bounds are tiny in practice (16 * a few-dozen).
+		 */
+		for (i = 0; i < req->nr_pairs; i++) {
+			struct map *m_sq = NULL, *m_cq = NULL;
+			struct map *cursor;
+
+			list_for_each_entry(cursor, &g->maps, group_link) {
+				if (cursor->vaddr == (req->pairs[i].sq_vaddr & PAGE_MASK))
+					m_sq = cursor;
+				if (cursor->vaddr == (req->pairs[i].cq_vaddr & PAGE_MASK))
+					m_cq = cursor;
+				if (m_sq && m_cq)
+					break;
+			}
+			if (!m_sq || !m_cq) {
+				mutex_unlock(&own->groups_lock);
+				kfree(req);
+				return -ENOENT;
+			}
+			sq_maps[i] = m_sq;
+			cq_maps[i] = m_cq;
+		}
+
+		/*
+		 * Allocate QIDs.  Lazy-init the pool on first use (this
+		 * is the only ADD path that can be the very first ioctl
+		 * after probe completes).
+		 */
+		mutex_lock(&ctrl->user_qid_lock);
+		rc = snvm_user_qid_pool_init_locked(ctrl, ndev);
+		if (rc) {
+			mutex_unlock(&ctrl->user_qid_lock);
+			mutex_unlock(&own->groups_lock);
+			kfree(req);
+			return rc;
+		}
+		rc = snvm_user_qid_alloc_locked(ctrl, req->nr_pairs, qids);
+		mutex_unlock(&ctrl->user_qid_lock);
+		if (rc) {
+			mutex_unlock(&own->groups_lock);
+			kfree(req);
+			return rc;     /* -EAGAIN: pool full */
+		}
+		alloc_n = req->nr_pairs;
+
+		/*
+		 * Drive the controller: Create I/O CQ first, then Create
+		 * I/O SQ (the SQ creation references the CQ by qid, so
+		 * NVMe spec requires this order).  On failure, unwind:
+		 * delete all (CQ, SQ) pairs we already created, free all
+		 * QIDs we allocated.
+		 */
+		for (i = 0; i < req->nr_pairs; i++) {
+			rc = adapter_alloc_cq_user(ndev, cq_maps[i], qids[i]);
+			if (rc) {
+				pr_warn("snvme: NVM_ADD_USER_QUEUE: Create I/O CQ qid=%u rc=%d\n",
+					qids[i], rc);
+				goto rollback_unlocked;
+			}
+			rc = adapter_alloc_sq_user(ndev, sq_maps[i], qids[i]);
+			if (rc) {
+				pr_warn("snvme: NVM_ADD_USER_QUEUE: Create I/O SQ qid=%u rc=%d\n",
+					qids[i], rc);
+				/*
+				 * SQ failed but CQ for this i was already
+				 * created -- delete it before unwinding the
+				 * earlier pairs.  Account for this with
+				 * created++ first so the rollback loop
+				 * picks it up.
+				 */
+				adapter_delete_cq(ndev, qids[i]);
+				goto rollback_unlocked;
+			}
+			created++;
+		}
+
+		/* All pairs created; commit them to the group descriptor. */
+		for (i = 0; i < req->nr_pairs; i++) {
+			struct snvm_user_queue *uq = &g->queues[g->cur_queues + i];
+			uint16_t qid = qids[i];
+
+			uq->qid       = qid;
+			uq->alive     = 1;
+			uq->sq_vaddr  = req->pairs[i].sq_vaddr;
+			uq->cq_vaddr  = req->pairs[i].cq_vaddr;
+
+			req->out_pairs[i].sq_doorbell_offset =
+				(uint32_t)(NVME_REG_DBS + qid * 2 * ndev->db_stride * 4);
+			req->out_pairs[i].cq_doorbell_offset =
+				(uint32_t)(NVME_REG_DBS + (qid * 2 + 1) * ndev->db_stride * 4);
+			req->out_pairs[i].qid = qid;
+		}
+		g->cur_queues += req->nr_pairs;
+
+		mutex_unlock(&own->groups_lock);
+
+		if (copy_to_user(argp, req, sizeof(*req))) {
+			/*
+			 * copy_to_user failed AFTER admin commands
+			 * succeeded.  We must unwind the controller-side
+			 * Create I/O SQ/CQ to keep snvme's view of the
+			 * world consistent with the ioctl's failure
+			 * return.  Take the locks again, walk the slots
+			 * we just committed, and revert.
+			 */
+			mutex_lock(&own->groups_lock);
+			for (i = 0; i < req->nr_pairs; i++) {
+				struct snvm_user_queue *uq =
+					&g->queues[g->cur_queues - req->nr_pairs + i];
+				adapter_delete_sq(ndev, uq->qid);
+				adapter_delete_cq(ndev, uq->qid);
+				uq->alive = 0;
+				mutex_lock(&ctrl->user_qid_lock);
+				snvm_user_qid_free_locked(ctrl, uq->qid);
+				mutex_unlock(&ctrl->user_qid_lock);
+			}
+			g->cur_queues -= req->nr_pairs;
+			mutex_unlock(&own->groups_lock);
+			kfree(req);
+			return -EFAULT;
+		}
+
+		pr_info("snvme: NVM_ADD_USER_QUEUE group=%u created %u queue(s) (qids %u..%u)\n",
+			req->group_id, req->nr_pairs,
+			qids[0], qids[req->nr_pairs - 1]);
+		kfree(req);
+		ret = 0;
+		break;
+
+rollback_unlocked:
+		/*
+		 * `created` SQ+CQ pairs are committed on the controller;
+		 * delete them in reverse order.  Then free ALL allocated
+		 * QIDs (including the one whose Create CQ/SQ failed --
+		 * snvm_user_qid_alloc_locked set its bit unconditionally).
+		 */
+		for (i = created; i > 0; i--) {
+			adapter_delete_sq(ndev, qids[i - 1]);
+			adapter_delete_cq(ndev, qids[i - 1]);
+		}
+		mutex_lock(&ctrl->user_qid_lock);
+		for (i = 0; i < alloc_n; i++)
+			snvm_user_qid_free_locked(ctrl, qids[i]);
+		mutex_unlock(&ctrl->user_qid_lock);
+		mutex_unlock(&own->groups_lock);
+		kfree(req);
+		return rc;
+	}
+
+	case NVM_SET_KERNEL_IOQ_CAP: {
+		/*
+		 * Cap-only update path: stash setup.cap_kernel_ioq without
+		 * touching the legacy NVM_SET_IOQ_NUM state (ctrl->ioq_num,
+		 * use_sreg, on_host, groups[]).  Probe segment 6a copies
+		 * ctrl->setup.cap_kernel_ioq into dev->cap_kernel_ioq at
+		 * SNVM_DEVICE_BIND time, gated on ctrl->setup.valid -- so
+		 * we set .valid here too, but with ioq_num=0 the
+		 * use_user_allocated probe branch stays untaken.
+		 *
+		 * Must run pre-bind to have any effect.  We do not reject
+		 * post-bind calls (the field write is still useful for the
+		 * NEXT bind cycle if the user unbinds/rebinds), but log so
+		 * a misordered userspace is diagnosable from dmesg.
+		 */
+		uint32_t cap;
+
+		if (copy_from_user(&cap, argp, sizeof(cap)))
+			return -EFAULT;
+
+		ctrl->setup.cap_kernel_ioq = cap;
+		ctrl->setup.valid          = 1;
+
+		pr_info("snvme: NVM_SET_KERNEL_IOQ_CAP cap=%u (legacy ioq_num=%u, use_sreg=%u left unchanged)\n",
+			cap, ctrl->ioq_num, ctrl->use_sreg);
+		ret = 0;
+		break;
+	}
 
 	default:
 		/*
@@ -5144,11 +6546,14 @@ static int svm_mmap_registers(struct file *file, struct vm_area_struct *vma)
  * userspace crashes.
  *
  * See PORTING.md section 7.3.1 trap #6 for the full reasoning.
+ *
+ * (`struct snvm_dev_owner`, `struct snvm_qgroup`, and
+ * destroy_qgroup_locked() are defined above snvm_dev_map_ioctl --
+ * the ioctl dispatcher needs them in scope to handle
+ * NVM_CREATE_QUEUE_GROUP / NVM_DESTROY_QUEUE_GROUP.  The bodies
+ * of snvm_dev_open / snvm_dev_release stay here with the rest of
+ * the chrdev fops vtable.)
  */
-struct snvm_dev_owner {
-	struct ctrl		*ctrl;
-	struct task_struct	*owner;
-};
 
 static int snvm_dev_open(struct inode *inode, struct file *file)
 {
@@ -5174,6 +6579,9 @@ static int snvm_dev_open(struct inode *inode, struct file *file)
 	 * key that matches what map.c::create_descriptor recorded.
 	 */
 	own->owner = current;
+	INIT_LIST_HEAD(&own->groups);
+	mutex_init(&own->groups_lock);
+	own->nr_groups = 0;
 	file->private_data = own;
 	return 0;
 }
@@ -5185,14 +6593,49 @@ static int snvm_dev_release(struct inode *inode, struct file *file)
 	struct task_struct *owner;
 	struct list_node *element;
 	struct map *map;
+	struct snvm_qgroup *g, *tmp_g;
 	unsigned int rb_ioq = 0, rb_cq = 0;
 	unsigned long n_host = 0, n_dev = 0, n_devq = 0;
+	unsigned int n_groups = 0;
 
 	if (!own)
 		return 0;
 
 	ctrl  = own->ctrl;
 	owner = own->owner;
+
+	/*
+	 * Pass 0: cascade-destroy any queue groups still attached to
+	 * this fd.  Userspace may have crashed mid-flight, or simply
+	 * closed the fd without calling NVM_DESTROY_QUEUE_GROUP --
+	 * either way every group on this fd's list must be reaped or
+	 * it leaks group_id bits in snvm_queue_group_ida.
+	 *
+	 * IMPORTANT ordering: groups are drained BEFORE the map
+	 * passes below.  Steps B2/B3 will park user IO queues and
+	 * pinned NVMe ring maps inside group descriptors; if the map
+	 * lists were freed first, the Delete I/O SQ/CQ admin commands
+	 * issued during group teardown would see ring physical
+	 * addresses that have already been unmapped from the IOMMU,
+	 * which the controller could DMA into freed pages.
+	 *
+	 * In B1 there are no NVMe-side resources yet, so this loop
+	 * just frees the descriptors and returns the group_ids to
+	 * the IDA.  The pr_info below tracks the count so smoke
+	 * tests can grep dmesg to confirm cascade-cleanup ran.
+	 */
+	mutex_lock(&own->groups_lock);
+	list_for_each_entry_safe(g, tmp_g, &own->groups, link) {
+		list_del(&g->link);
+		destroy_qgroup_locked(g, ctrl);
+		n_groups++;
+	}
+	own->nr_groups = 0;
+	mutex_unlock(&own->groups_lock);
+
+	if (n_groups)
+		pr_info("snvme: snvm_dev_release: cascade-destroyed %u orphan group(s) for pid=%d\n",
+			n_groups, owner ? owner->pid : -1);
 
 	/*
 	 * Pass 1: walk host_list + device_queue_list to compute the
@@ -5254,6 +6697,7 @@ static int snvm_dev_release(struct inode *inode, struct file *file)
 			n_host, n_dev, n_devq, rb_ioq, rb_cq,
 			owner ? owner->pid : -1);
 
+	mutex_destroy(&own->groups_lock);
 	kfree(own);
 	file->private_data = NULL;
 	return 0;
@@ -5461,6 +6905,19 @@ static int __init nvme_init(void)
 	list_init(&device_list);
 	list_init(&device_queue_list);
 
+	/*
+	 * snvm_cdev_init MUST stay the last fallible step here.
+	 * Its own internal goto-chain is the only cleanup path
+	 * for the chrdev / sysfs resources it sets up; nvme_init's
+	 * outer error path only knows how to undo nvfs_nvidia_p2p_init.
+	 *
+	 * If you add a new fallible step AFTER snvm_cdev_init, you
+	 * MUST also call snvm_cdev_release() in the new error label
+	 * before falling through to err_p2p_exit -- otherwise a
+	 * failure there will leak /dev/snvm_control + the sysfs
+	 * class node, exactly the failure mode that requires a
+	 * reboot to recover from.
+	 */
 	ret = snvm_cdev_init();
 	if (ret)
 		goto err_p2p_exit;
@@ -5478,22 +6935,131 @@ err_p2p_exit:
 	return ret;
 }
 
+/*
+ * clear_map_list -- drain a global map list at module-exit time.
+ *
+ * Mirrors snvme-5.15.0/pci.c::clear_map_list.  Each call to
+ * unmap_and_release() does list_remove() on the descriptor it just
+ * freed, so we must re-fetch list_next(&list->head) on every iteration
+ * (saving a "next" pointer up-front would dereference a freed node).
+ *
+ * Returns the number of entries that were still alive on entry; a
+ * non-zero return means userspace forgot to unmap something before
+ * closing fds, and we plugged the leak on its behalf.
+ */
+static unsigned long clear_map_list(struct list *list)
+{
+	unsigned long freed = 0;
+	struct list_node *element;
+
+	if (list == NULL)
+		return 0;
+
+	element = list_next(&list->head);
+	while (element != NULL) {
+		struct map *map = container_of(element, struct map, list);
+
+		unmap_and_release(map);
+		++freed;
+		/* head changed; restart from the new front */
+		element = list_next(&list->head);
+	}
+	return freed;
+}
+
+/*
+ * clear_ctrl_list -- drain ctrl_list at module-exit time.
+ *
+ * The /dev/ssnvme<N> chrdev is created by SNVM_CHRDEV_CREATE and would
+ * normally be torn down by a matching SNVM_CHRDEV_REMOVE.  If userspace
+ * forgets (or aborts mid-flight, as smoke tests sometimes do), the ctrl
+ * stays on ctrl_list and its sysfs/cdev entries persist.  When rmmod
+ * then runs snvm_cdev_release(), class_destroy() walks the class
+ * children and trips over those orphaned devices, leaving the sysfs
+ * tree wedged ("/sys/class/libsnvm helper/" survives) -- which on the
+ * next insmod blows up class_create() with -EEXIST and the standard
+ * advice is "reboot".
+ *
+ * Drain the list here BEFORE snvm_cdev_release() so device_destroy() /
+ * cdev_del() (called inside ctrl_put -> ctrl_chrdev_remove) run while
+ * dev_class is still valid.  ctrl_put removes the ctrl from the list
+ * and kfrees it, so re-fetch list_next(&list->head) on every iteration.
+ *
+ * The minor IDA itself is released wholesale by ida_destroy() inside
+ * snvm_cdev_release(); per-ctrl ida_simple_remove() is unnecessary
+ * here.  ctrl does not hold an extra pci_dev reference, so no
+ * pci_dev_put either.
+ */
+static unsigned long clear_ctrl_list(struct list *list)
+{
+	unsigned long freed = 0;
+	struct list_node *element;
+
+	if (list == NULL)
+		return 0;
+
+	element = list_next(&list->head);
+	while (element != NULL) {
+		struct ctrl *ctrl = container_of(element, struct ctrl, list);
+
+		ctrl_put(ctrl);
+		++freed;
+		element = list_next(&list->head);
+	}
+	return freed;
+}
+
 static void __exit nvme_exit(void)
 {
+	unsigned long leaked;
+
 	/*
-	 * NOTE(snvme-5.4 staged port): the full snvme-5.15 nvme_exit also
-	 * drains pending mapping/ctrl lists via clear_map_list() /
-	 * clear_ctrl_list() / clean_driver().  Those helpers are ported in
-	 * segments 4-5; until then, unloading snvme.ko while libnvm is
-	 * still holding mappings will leak the pinned pages and emit a
-	 * WARN from the kernel's gup refcount audit.  Do not unload in
-	 * that state.
+	 * Step 1: stop accepting new probes / unbind any devices the
+	 * snvme PCI driver currently owns.  After this returns no new
+	 * ctrl can be registered and no in-flight probe is running.
 	 */
 	if (snvm_registered) {
 		snvm_unregister_driver();
 		snvm_registered = 0;
 	}
+
+	/*
+	 * Step 2: drain pinned map descriptors.  These should already
+	 * be empty if every fd closed cleanly (snvm_dev_release runs
+	 * map_purge_by_owner on each fd), but a userspace crash can
+	 * leave stragglers behind -- clean them up rather than leak
+	 * pinned pages and trip the kernel's gup refcount WARN.
+	 *
+	 * Order matters: drain maps BEFORE ctrls because a map's DMA
+	 * unmap path dereferences its owning pdev, which is still
+	 * valid as long as the ctrl that pinned it is alive.
+	 */
+	leaked = clear_map_list(&host_list);
+	if (leaked)
+		pr_notice("snvme: %lu host memory mapping(s) leaked at unload\n", leaked);
+	leaked = clear_map_list(&device_list);
+	if (leaked)
+		pr_notice("snvme: %lu device memory mapping(s) leaked at unload\n", leaked);
+	leaked = clear_map_list(&device_queue_list);
+	if (leaked)
+		pr_notice("snvme: %lu device-queue mapping(s) leaked at unload\n", leaked);
+
+	/*
+	 * Step 3: drain orphaned /dev/ssnvme<N> ctrls.  Must run BEFORE
+	 * snvm_cdev_release() so device_destroy() / cdev_del() inside
+	 * ctrl_put -> ctrl_chrdev_remove see a still-valid dev_class.
+	 * Without this, an unclean test exit leaves ssnvme0 wedged in
+	 * sysfs and the next insmod fails with -EEXIST until reboot.
+	 */
+	leaked = clear_ctrl_list(&ctrl_list);
+	if (leaked)
+		pr_notice("snvme: drained %lu orphan ctrl(s) at unload (userspace forgot SNVM_CHRDEV_REMOVE)\n",
+			  leaked);
+
+	/* Step 4: tear down the singleton /dev/snvm_control + class. */
 	snvm_cdev_release();
+
+	/* Step 5: drop the GPU/p2p notifier registration. */
 	nvfs_nvidia_p2p_exit();
 }
 
