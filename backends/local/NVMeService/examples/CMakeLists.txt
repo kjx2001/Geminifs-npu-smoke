@@ -49,8 +49,10 @@ set_target_properties(nvmeservice_client_example PROPERTIES
 install(TARGETS nvmeservice_daemon_example nvmeservice_client_example
         DESTINATION "bin")
 
-# Copy the example config next to the binaries so users can run them
-# without figuring out a path.
-configure_file("${CMAKE_CURRENT_SOURCE_DIR}/sys_config.yaml"
+# Copy the canonical sys_config.yaml from the repo root next to the
+# binaries so users can run them without figuring out a path. The repo
+# only keeps ONE sys_config.yaml (at the project root) -- the previous
+# per-examples copy was removed to avoid drift.
+configure_file("${CMAKE_SOURCE_DIR}/sys_config.yaml"
                "${CMAKE_BINARY_DIR}/bin/sys_config.yaml"
                COPYONLY)

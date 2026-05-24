@@ -204,6 +204,9 @@ NvmeServiceClient::allocate(int32_t device_id, int32_t cuda_device, int32_t num_
     alloc->queue_start_idx        = resp.queue_start_idx();
     alloc->queue_count            = resp.queue_count();
     alloc->controller             = std::move(ctrl);
+    // GPU-view symlink path the daemon installed for this allocation;
+    // empty when symlink install failed at daemon init time.
+    alloc->mount_path             = resp.mount_path();
     alloc->heartbeat_interval_sec = resp.heartbeat_interval_sec();
     alloc->lease_timeout_sec      = resp.lease_timeout_sec();
     alloc->client_pid             = static_cast<uint32_t>(::getpid());

@@ -186,7 +186,7 @@ public:
     void stop_reaper();
 
     // --- Query ---
-
+    // Todo: Hotplug support would require refreshing this view on demand (e.g. on Allocate with device_id == -1) or on a timer. For now it's static after init.
     std::vector<DeviceSnapshot> list_devices() const;
 
     // --- Allocation lifecycle ---

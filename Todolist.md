@@ -49,10 +49,16 @@ runnable end-to-end:
       entry point (parse `sys_config.yaml`, construct `ServiceState`,
       start gRPC server, start reaper, wait for SIGINT)
 - [x] `backends/local/NVMeService/examples/nvmeservice_client.cpp` — smoke
-      test that connects, lists devices, allocates, sleeps, releases
-- [x] `backends/local/NVMeService/examples/sys_config.yaml` — example config
-      matching the new YAML schema (gpus / nvmes with `queue_groups` for
-      per-NVMe multi-GPU queue split)
+      test that connects, lists devices, allocates, sleeps, releases.
+      Now also runs a hand-off probe: prints `alloc->mount_path`, lists
+      it (verifies the daemon-installed GPU-view symlink resolves from
+      this process), and walks the first few imported QueuePairs to
+      confirm shared SQ/CQ/PRP IPC pointers and doorbell GPU VAs are
+      live before the heartbeat hold.
+- [x] `sys_config.yaml` — single canonical config at the repo root
+      (the per-examples copy was removed; `examples/CMakeLists.txt` now
+      stages the root file into `build/bin/`). Schema annotated with
+      QueuePair-unit conventions; `queue_setup` worked example present.
 - [x] `backends/local/NVMeService/examples/CMakeLists.txt` — build the two
       example executables against the new `nvmeservice` library
 - [x] Update root `CMakeLists.txt` NVMeService section: compile new file
@@ -60,10 +66,11 @@ runnable end-to-end:
       `nvmeservice_server.cpp`, `nvmeservice_client.cpp`) and the new
       `backends/local/nvme/libnvm/src/shared_ctrl.cu`; version-aware
       protoc detection patched (commit `df4f2c8`)
-- [ ] Add `BlockDeviceManager` second constructor that takes a
+- [x] `BlockDeviceManager` second constructor that takes a
       `std::shared_ptr<Controller>` plus mount path (skips own controller
-      init so it can consume a shared Controller from NVMeService)
-      — folded into Slice 4
+      init so it can consume a shared Controller from NVMeService).
+      Lives in `device_manager/include/block_device_manager.cuh` as
+      `BlockDeviceManager(const ControllerPtr&, std::unique_ptr<FileManager>, const std::string&)`.
 - [ ] Verify CUDA IPC works for PRP memory; if not, wire client-side PRP
       allocation fallback (the server already honours `has_prp=false`)
 - [ ] Verify `cudaHostRegister(BAR0, cudaHostRegisterIoMemory)` works in a
@@ -84,50 +91,213 @@ user=1` instead of the silent fallback to `dma_alloc_coherent`.
 The two upper layers were intentionally left for a follow-up so that
 Phase 1 could land cleanly:
 
-- [ ] **Phase 2 — NVMeService daemon: parse `queue_setup` from
+- [x] **Phase 2 — NVMeService daemon: parse `queue_setup` from
       `sys_config.yaml` and feed it to snvme.**
-      Add a `queue_setup` block to the per-NVMe schema in
-      `backends/local/NVMeService/src/nvmeservice_config.{h,cpp}` with
-      these fields (one-to-one mapping to `struct nvm_ioctl_setup`):
-        `kernel_ioq_cap` (uint, required)
-        `user_ioq_total` (uint, required, must equal sum of group counts)
-        `on_host`        (bool, default false)
-        `nr_write`       (uint, default 0 = use module param)
-        `nr_poll`        (uint, default 0 = use module param)
-        `queue_groups: [{ owner_id|gpu_id: uint, count: uint }]`
-                         (size <= 8; sum(count) must equal `user_ioq_total`)
-      Validate at daemon-startup time:
-        - `kernel_ioq_cap + user_ioq_total <= total_queues`
-        - `sum(groups[].count) == user_ioq_total`
-        - `groups.size() <= NVM_MAX_QUEUE_GROUPS`
-      Then in `nvmeservice_state.cu` (or whichever class owns the
-      per-NVMe `Controller`), call `nvm_queue_setup(ctrl, &setup)`
-      from libnvm BEFORE the existing `NVM_MAP_*`/`NVM_SET_SHARE_REG`
-      sequence.  Existing daemon callers that don't set `queue_setup`
-      should keep working (kernel falls back to `cap_kernel_ioq=0` =
-      `num_possible_cpus()` default).
+      Added `QueueSetup` (`kernel_ioq_cap` / `on_host` / `nr_write` /
+      `nr_poll`) plus `queue_groups` to `nvmeservice_config.{h,cpp}`.
+      `validate_config` enforces, in QueuePair units, the local
+      invariant `Σqueue_groups[].count + queue_setup.kernel_ioq_cap <=
+      total_queues`, plus `len(queue_groups) <= NVM_MAX_QUEUE_GROUPS`
+      and the `on_host=false` constraint. `nvmeservice_state.cu::
+      init_device` translates the YAML block into `struct
+      nvm_ioctl_setup` (per-group `count *= 2` for the kernel
+      SQ+CQ-entry unit) and hands it to libnvm's new `Controller(...
+      const nvm_ioctl_setup&)` ctor. libnvm internally calls
+      `nvm_queue_setup(ctrl, &setup)` BEFORE `NVM_MAP_*` /
+      `NVM_SET_SHARE_REG`, mirroring the smoke-gpu reference bring-up.
+      Old single-GPU callers (GeminiFS, BlockDeviceManager) keep the
+      legacy 7-arg ctor signature — internally synthesises a
+      one-group setup with `cap_kernel_ioq=0`, byte-equivalent to the
+      pre-Phase-2 `nvm_queue_set()` submit. The historical hard cap
+      `max_queue=75` in `Controller::init_queues` was removed; the
+      caller's QueuePair count is the source of truth (only
+      `MAX_QUEUES=1024` structural ceiling left).
 
-- [ ] **Phase 3 — Operator documentation.**
-      a. `sys_config.yaml`: add a worked example of `queue_setup` under
-         the `nvmes:` section, with comments explaining when to set
-         `kernel_ioq_cap` (= "the controller's MSI-X count is below
-         host CPU count" rule of thumb) and the per-GPU split.
-      b. `backends/local/kernel_modules/PORTING.md` §8.1: add a row
-         to the troubleshooting cheat sheet for the dmesg signature
-         `queue squeeze: kernel=N user=M (controller granted ...)`,
-         pointing operators at `cap_kernel_ioq` as the tunable.
-      c. `README.md`: add a short "Queue budget tuning" subsection
-         under the existing kernel-module notes that links to the
-         sys_config.yaml example and the PORTING.md cheat-sheet row.
+- [x] **Phase 3 — Operator documentation.**
+      a. `sys_config.yaml`: full `queue_setup` worked example with
+         field-by-field comments; QueuePair-unit conventions stated
+         throughout. The default profile is now NUMA-0 single-NVMe +
+         single-GPU smoke (with TODO markers for the host-specific
+         BDF / GPU id), and the dual-GPU profile is preserved as a
+         commented reference at the bottom.
+      b. `backends/local/kernel_modules/PORTING.md` §8.1: row added
+         for the `queue squeeze: kernel=N user=M (controller granted
+         ...)` dmesg signature, pointing operators at
+         `queue_setup.kernel_ioq_cap` as the tunable.
+      c. `README.md`: "Queue budget tuning" subsection added under the
+         existing kernel-module notes, with a worked YAML example,
+         the MSI-X-vs-vCPU rule of thumb, and the dmesg signature for
+         the silent fallback.
 
-- [ ] **(Optional) snvme_smoke_gpu `--cap-kernel N` flag.**
-      Currently the smoke binaries hard-code `cap_kernel_ioq = 32`,
-      which forces case B (split) on a generous controller.  A
-      `--cap-kernel N` CLI flag would let regression runs explicitly
-      exercise either case A2 (squeeze, `N` >> controller MSI-X) or
-      case A1 (full fallback, `N=0` AND user_cq > grant) without
-      recompiling.  Low priority — case B coverage is what production
-      cares about, A1/A2 are review gates.
+## Share-mode queue recycle gap (NVMeService)
+
+### Problem
+
+`NVMeService::release_range` (and the reaper path) marks a queue
+range as free in `DeviceQueueGroup::queue_allocated`, but does NOT
+reset the underlying NVMe queue state. The next client that
+allocates the same range will:
+
+- Inherit the controller-side `SQHD/SQT/CQH/CQT/phase` from the
+  previous tenant (no Delete/Create I/O SQ/CQ has been issued).
+- See stale SQEs that the previous client wrote into the SQ ring
+  (cudaMalloc'd SQ memory is never re-zeroed on release).
+- See stale CQEs in the CQ ring with the previous tenant's phase
+  bit -- the new client's phase tracking starts at phase=1 and
+  will mis-classify these as fresh completions, or never poll the
+  real new ones because the CID never matches.
+
+Symptoms on hardware: silent data corruption (controller fetches a
+stale SQE from an unexpected SQT position and executes its LBA /
+opcode) or hangs (phase tag mismatch -> `cq_poll` busy-loops
+forever).
+
+`init_gpu_specific_struct` re-allocates the GPU coordination state
+(tickets / cid bitmap / marks / pos_locks) per client, so cross-
+process state pollution is limited to controller-side and DMA-ring
+state. The kernel-side / GPU-coord-side bitmap is fine.
+
+### NVMe spec gives a clean fix
+
+NVMe 1.4 §4.1 + §5.4 / §5.5: `Delete I/O SQ` (opcode 0x00), `Delete
+I/O CQ` (opcode 0x04), `Create I/O CQ` (opcode 0x05), `Create I/O
+SQ` (opcode 0x01) are per-queue admin commands. They:
+
+- Affect only the named qid.
+- Do NOT require Controller Reset (CC.EN=0) -- the rest of the
+  controller (kernel-side queues, other user queues, other clients
+  on the same NVMe) keeps running.
+- Reset `SQHD/SQT/CQH/CQT/phase` to spec defaults on the next
+  Create.
+- Allow PRP1 to point at the same physical pages -- userspace can
+  keep the existing SQ/CQ DMA mappings and just re-issue
+  Create with the same addresses.
+
+snvme already has the kernel-side helpers (`adapter_alloc_cq_user`,
+`adapter_alloc_sq_user`, `adapter_delete_cq`, `adapter_delete_sq`,
+`snvme_disable_user_io_queues`) but only invokes them on probe /
+disable -- there is NO userspace ioctl that triggers per-queue
+recycle.
+
+### Mitigation (until kernel changes land)
+
+**Today's NVMeService MUST NOT actually recycle queues.** The
+reaper detects dead clients and frees the lease metadata, but the
+queue range should stay reserved (excluded from future
+allocations) until the daemon restarts. This avoids the silent
+corruption case while we do the kernel work properly.
+
+Required follow-ups:
+- [ ] `ServiceState::release_range` / `reaper_loop` need a "do not
+      return to pool" path: mark the range as permanently consumed
+      for this daemon lifetime, and log a clear warning that
+      queue pool capacity has dropped.
+- [ ] `NVMeService.md` must document this explicit limitation
+      (operators may run out of queues if clients churn).
+
+### Real fix: kernel + libnvm + daemon
+
+Plan, executed in this order so each step is independently
+testable:
+
+1. [ ] **kernel: `NVM_RAW_ADMIN_CMD` ioctl** -- a generic 64-byte
+       admin SQE forwarder. Userspace fills a `struct nvme_command`
+       and the kernel runs `snvme_submit_sync_cmd(dev->ctrl.admin_q,
+       &c, NULL, 0)`. Returns the CQE status. This is the building
+       block for everything else (Delete/Create I/O, Abort, vendor
+       commands). Touches:
+        - `snvme-5.4.241-1-tlinux4-0017/pci.c` (new ioctl handler)
+        - `backends/local/nvme/libnvm/include/ioctl.h` (UAPI)
+        - PORTING.md (note added)
+
+2. [ ] **smoke T2 (test/snvme_smoke_recycle.c)**: drive a real
+       Delete I/O SQ -> Delete I/O CQ -> Create I/O CQ -> Create
+       I/O SQ sequence via `NVM_RAW_ADMIN_CMD` against a bound
+       controller. Verify (a) the admin commands succeed and (b)
+       a subsequent NVMe read on the recycled queue completes
+       correctly. **This is the empirical proof that NVMe spec
+       per-queue reset works on our target SSD firmware.**
+
+3. [ ] **smoke T1 (test/snvme_smoke_recycle.c)** -- optional
+       counter-test: skip the Delete/Create dance, just re-use
+       the queue with fresh host-side state, run a read, and
+       expect either an NVMe error completion or a hang. This
+       documents what the current NVMeService bug actually
+       looks like on hardware. Run BEFORE T2 in the same binary
+       so the report shows broken-then-fixed.
+
+4. [ ] **kernel: `NVM_RECYCLE_USER_QUEUE` ioctl** -- convenience
+       wrapper that runs the four-command sequence + does the
+       SQ/CQ ring cudaMemset(0) + reset `nvme_dev`'s per-qid
+       bookkeeping. Optional; daemon can equally call T2's path
+       four times. Defer until M1+T2 are green.
+
+5. [ ] **libnvm**: implement the stub declarations in
+       `nvm_admin.h` (`nvm_admin_sq_create`, `nvm_admin_sq_delete`,
+       `nvm_admin_cq_create`, `nvm_admin_cq_delete`,
+       `nvm_admin_abort`). Each is a thin
+       `ioctl(NVM_RAW_ADMIN_CMD, struct nvme_command)` wrapper.
+       Add a single `Controller::recycle_queue(uint16_t qid)`
+       helper that runs the four-command sequence + host-side
+       resets + ring cudaMemset.
+
+6. [ ] **NVMeService daemon**: invoke
+       `controller->recycle_queue(qid)` for every queue in the
+       just-released range, BEFORE returning the range to the
+       pool. Today's "permanent consumption" mitigation is
+       removed at this step.
+
+7. [ ] **NVMeService reaper test (`05_reaper.sh`)**: extend to
+       verify that the *recycled* queue range is reusable -- run
+       client B after A dies, check B's IOs complete (currently
+       the test only checks that `avail` returns to its initial
+       count, which the mitigation above already satisfies
+       through a different mechanism).
+
+### Related independent items
+
+- [ ] `init_gpu_specific_struct` (`backends/local/nvme/libnvm/include/queue.h`)
+      should consolidate the 5 separate `BufferPtr` allocations
+      (`sq_tickets`, `sq_tail_mark`, `sq_cid`, `cq_head_mark`,
+      `cq_pos_locks`) into a single contiguous cudaMalloc with
+      segmented offsets, and `cudaMemset(0)` it explicitly.
+      Rationale: (a) reduce GPU heap fragmentation (sq_cid alone
+      is 2 MiB per QP; today 5 allocations per QP); (b) cudaMalloc
+      does NOT guarantee zero-initialised memory, and the cid
+      bitmap MUST start at 0 for `get_cid()`'s `fetch_or(LOCKED)`
+      lock-claim protocol to work. Pure local refactor, no API
+      change. Applies to single-GPU / share / future local modes.
+
+- [ ] `nvm_queue_t::qs_log2` is set via `(uint32_t)std::log2(qs)`
+      which silently loses precision when `qs` is not a power of
+      two (NVMe MQES is `MaxQueueEntries - 1`, often e.g. 1023 ->
+      qs=1024 is fine but a controller reporting odd MQES would
+      break the lock-free ring math). Switch to
+      `__builtin_ctzll(qs)` with an explicit power-of-two assert,
+      same change in `shared_ctrl.cu`.
+
+- [ ] `device.cpp:468` `cudaHostRegister(BAR0, ..., IoMemory)`
+      lacks `cudaHostRegisterPortable`. Single-process multi-GPU
+      smoke (local-mode multi-GPU Controller, future Todolist
+      item) will hit this -- the doorbell GPU VA is only valid on
+      the GPU that was current at register time.
+
+- [ ] **local-mode multi-GPU ctor** -- new
+      `Controller::MultiGpuMode::LOCAL` variant of
+      `init_queues_multi_gpu_*` that does resolve doorbell GPU
+      VAs (per-queue `cudaHostGetDevicePointer` after
+      `cudaSetDevice(per_queue_dev[i])`) and cudaMalloc's d_qps
+      on `deviceId`. Used for single-process multi-GPU smoke
+      tests. SHARE variant (current default) stays unchanged.
+
+- [ ] **per-group d_qps** -- when the local-mode multi-GPU
+      smoke shows cross-GPU `d_qps[queue]` access becomes a
+      bottleneck (P2P / UVA fallback), split `d_qps` into
+      `d_qps_per_group[NVM_MAX_QUEUE_GROUPS]`, each cudaMalloc'd
+      on the matching `groups[g].owner_id`. Today's single-GPU
+      consumers (GeminiFS, BlockDeviceManager) keep reading
+      `d_qps == d_qps_per_group[0]`. Multi-GPU kernels read the
+      group-local array.
 
 ## Discussion Required Before Major Refactor
 

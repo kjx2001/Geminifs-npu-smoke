@@ -8,17 +8,27 @@
  *   - gRPC connectivity
  *   - AllocateQueues end-to-end
  *   - build_shared_controller (BAR0 mmap + IPC import) on the client side
+ *   - GPU-view mount_path symlink is reachable from this process
  *   - Heartbeat stream stays stable for the hold duration
  *   - Release on Allocation dtor
  */
 
 #include "nvmeservice_client.h"
 
+// Include libnvm Controller / QueuePair definitions for the post-allocate
+// hand-off probe (we walk a handful of imported queues to confirm IPC
+// + BAR0 hand-off succeeded). The client library itself only needs the
+// forward declaration.
+#include "ctrl.h"
+#include "queue.h"
+
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <iostream>
 #include <string>
+#include <system_error>
 #include <thread>
 
 static void print_usage(const char* prog) {
@@ -122,10 +132,86 @@ int main(int argc, char** argv) {
               << ", " << (alloc->queue_start_idx + alloc->queue_count) << ")"
               << " count=" << alloc->queue_count << "\n";
     std::cout << "  controller    : " << alloc->controller.get() << "\n";
+    std::cout << "  mount_path    : "
+              << (alloc->mount_path.empty() ? "(empty)" : alloc->mount_path)
+              << "\n";
     std::cout << "  heartbeat     : " << alloc->heartbeat_interval_sec
               << "s interval\n";
     std::cout << "  lease timeout : " << alloc->lease_timeout_sec << "s\n";
     std::cout << "  client_pid    : " << alloc->client_pid << "\n";
+
+    // --- Hand-off validation: prove the client-side bring-up actually
+    //     gives us (1) a usable working directory and (2) live GPU
+    //     queue addresses that came from the daemon's IPC handles. ---
+    std::cout << "\n=== Hand-off validation ===\n";
+
+    // (1) GPU-view filesystem path. The daemon pre-installed a symlink
+    //     under the consuming GPU's mount_path; verify it resolves and
+    //     is enumerable from this process. Empty string means symlink
+    //     install failed at daemon init -- callers can fall back to
+    //     `alloc->controller->dev_mount_path`.
+    if (alloc->mount_path.empty()) {
+        std::cout << "  mount_path  : EMPTY -- daemon symlink install "
+                     "failed; falling back to controller->dev_mount_path='"
+                  << alloc->controller->dev_mount_path << "'\n";
+    } else {
+        std::error_code ec;
+        const auto resolved = std::filesystem::read_symlink(alloc->mount_path, ec);
+        if (ec) {
+            std::cout << "  mount_path  : " << alloc->mount_path
+                      << " (read_symlink failed: " << ec.message()
+                      << ", trying as plain dir)\n";
+        } else {
+            std::cout << "  mount_path  : " << alloc->mount_path
+                      << " -> " << resolved.string() << "\n";
+        }
+
+        size_t entries = 0;
+        for (const auto& it : std::filesystem::directory_iterator(
+                 alloc->mount_path, std::filesystem::directory_options::skip_permission_denied, ec)) {
+            (void)it;
+            ++entries;
+        }
+        if (ec) {
+            std::cout << "  ls          : FAILED (" << ec.message() << ")\n";
+        } else {
+            std::cout << "  ls          : " << entries
+                      << " entries reachable from this process\n";
+        }
+    }
+
+    // (2) Per-queue address sanity. Walk the first few QueuePairs and
+    //     print the GPU pointers the client-side build_shared_controller
+    //     just imported. If any of these are zero we know the IPC handle
+    //     import path went wrong.
+    {
+        Controller* ctrl = alloc->controller.get();
+        const uint16_t n = (ctrl != nullptr) ? ctrl->n_qps : 0;
+        const uint16_t probe = std::min<uint16_t>(n, 4);
+        std::cout << "  queues      : n_qps=" << n
+                  << " (probing first " << probe << ")\n";
+        for (uint16_t i = 0; i < probe; ++i) {
+            const QueuePair* qp = ctrl->h_qps[i];
+            if (qp == nullptr) {
+                std::cout << "    qp[" << i << "] : NULL\n";
+                continue;
+            }
+            std::cout << "    qp[" << i << "] qp_id=" << qp->qp_id
+                      << " is_shared=" << (qp->is_shared ? "true" : "false")
+                      << " sq_gpu=" << qp->shared_sq_ptr
+                      << " cq_gpu=" << qp->shared_cq_ptr
+                      << " prp_gpu=" << qp->shared_prp_ptr
+                      // sq.db / cq.db are `volatile uint32_t*` (BAR0
+                      // doorbell GPU VAs). We only want to print the
+                      // numeric pointer for the hand-off probe; strip
+                      // volatile via const_cast and let the resulting
+                      // uint32_t* decay to void* in operator<<.
+                      << " sq.db=" << static_cast<void*>(const_cast<uint32_t*>(qp->sq.db))
+                      << " cq.db=" << static_cast<void*>(const_cast<uint32_t*>(qp->cq.db))
+                      << "\n";
+        }
+    }
+    std::cout.flush();
 
     // --- Hold the allocation so the heartbeat thread has time to run ---
     if (hold_seconds > 0) {

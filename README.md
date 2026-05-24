@@ -174,9 +174,7 @@ Relevant build/runtime entry points:
 
 - root [`CMakeLists.txt`](CMakeLists.txt)
 - [`filesystems/ext4/README.md`](filesystems/ext4/README.md)
-- [`backends/local/NVMeService/examples/sys_config.yaml`](backends/local/NVMeService/examples/sys_config.yaml)
-- root configuration samples:
-  - [`sys_config.ini`](sys_config.ini)
+- root configuration sample (single source of truth):
   - [`sys_config.yaml`](sys_config.yaml)
 
 Important operational constraint:
@@ -235,6 +233,61 @@ is the canonical signing tool in all three workflows:
 /usr/src/kernels/$(uname -r)/scripts/sign-file \
     sha256 <private_key.pem> <public_key.x509> snvme.ko
 ```
+
+### Queue budget tuning
+
+The snvme kernel module splits each NVMe controller's I/O queue budget
+between the **kernel-side blk-mq path** (so the disk is still mountable
+and `read(2)`/`write(2)` works) and the **user-side share** that
+NVMeService hands to GPU clients via CUDA IPC. The split is operator-
+controlled through one block in [`sys_config.yaml`](sys_config.yaml):
+
+```yaml
+nvmes:
+  - pci_addr: "0000:50:00.0"
+    total_queues: 64                # NVMe IOQ budget the operator commits
+    queue_groups:
+      - { gpu_id: 0, count: 32 }    # user share (per-GPU partitions)
+    queue_setup:
+      kernel_ioq_cap: 32            # kernel-side cap (QueuePair units)
+      on_host: false
+      nr_write: 0
+      nr_poll: 0
+```
+
+All counts are in **QueuePair units** (1 pair = 1 SQ + 1 CQ). The daemon
+enforces the local invariant
+`Σqueue_groups[].count + queue_setup.kernel_ioq_cap <= total_queues`
+at startup; the kernel additionally checks the result against the
+controller's actual `Identify Controller` IOQ ceiling at
+`NVM_SET_IOQ_NUM` time.
+
+**When to set `kernel_ioq_cap` explicitly.** If the controller's MSI-X
+vector count is smaller than `num_possible_cpus()` on the host, the
+kernel's default ask (`nr_io_queues = num_possible_cpus()`) consumes
+every vector and leaves zero room for the user-allocated share. The
+GPU-direct path then silently falls back to `dma_alloc_coherent`, the
+smoke test reports `nr_user_q=0`, and dmesg carries the signature
+
+```
+queue squeeze: kernel=N user=M (controller granted ...)
+```
+
+The fix is to lower `kernel_ioq_cap` so that the controller's MSI-X
+grant has room left for the user share. Verified on HGX H20 + Intel DC
+SSD (MSI-X=136 vs 192 vCPUs): pre-fix smoke shows `nr_user_q=0`;
+post-fix dmesg becomes `queue split: kernel=K user=M` and smoke reports
+the requested user-queue count. The `snvme_smoke_gpu.cu` reference test
+hard-codes `kernel_ioq_cap = 32` for the same reason; production
+callers should match their controller's MSI-X grant.
+
+See:
+
+- [`sys_config.yaml`](sys_config.yaml) — full schema with field-by-field
+  comments.
+- [`backends/local/kernel_modules/PORTING.md`](backends/local/kernel_modules/PORTING.md)
+  §8.1 — troubleshooting cheat sheet row for the `queue squeeze` dmesg
+  signature.
 
 ## Supported Linux Kernels
 

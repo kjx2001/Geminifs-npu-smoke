@@ -2,6 +2,7 @@
 
 #include "ctrl.h"
 #include "queue.h"
+#include "ioctl.h"          // struct nvm_ioctl_setup, NVM_QUEUE_SETUP_F_*
 
 #include <cuda_runtime.h>
 
@@ -92,9 +93,11 @@ ServiceState::ServiceState(const ServiceConfig& cfg) : cfg_(cfg) {
     for (size_t i = 0; i < cfg_.nvmes.size(); ++i) {
         const auto& nvme = cfg_.nvmes[i];
         // Cross-references inside queue_groups (gpu_id known, count > 0,
-        // sums valid) are already enforced by validate_config(). We only
-        // pass the gpus vector here so init_device can look up each
-        // group's mount_path for symlink installation.
+        // sums valid, no all-CPU lists) are already enforced by
+        // validate_config(); the YAML parser also did the QP -> SQ+CQ
+        // unit translation, so nvme.queue_setup is ready to forward to
+        // libnvm verbatim. We pass the gpus vector here so init_device
+        // can look up each YAML group's mount_path for symlink install.
         init_device(cfg_.gpus, nvme, static_cast<int32_t>(i));
     }
 }
@@ -122,36 +125,43 @@ void ServiceState::init_device(const std::vector<GpuEntry>& gpus,
     dev.namespace_id = nvme.namespace_id;
     dev.queue_depth  = static_cast<uint32_t>(nvme.queue_depth);
 
-    // Build per-queue cuda_device targets by concatenating each
-    // queue_group's gpu_id repeated `count` times. validate_config()
-    // already guarantees: queue_groups non-empty, every gpu_id known,
-    // sum(count) <= total_queues, no duplicates within this nvme.
-    std::vector<QueueMemTarget> queue_targets;
-    queue_targets.reserve(nvme.total_queues);
-    for (const auto& qg : nvme.queue_groups) {
-        QueueMemTarget t;
-        t.on_host     = (qg.gpu_id < 0);
-        t.cuda_device = (qg.gpu_id < 0) ? 0u : static_cast<uint32_t>(qg.gpu_id);
-        for (int i = 0; i < qg.count; ++i) {
-            queue_targets.push_back(t);
-        }
-    }
-    // Pad any leftover queues (sum < total_queues) with the first
-    // group's target so the controller still gets total_queues entries.
-    // These tail queues will not show up in dev.groups so they cannot
-    // be allocated -- they simply stay idle. The first group is
-    // guaranteed non-empty by validation.
-    while (queue_targets.size() < nvme.total_queues) {
-        queue_targets.push_back(queue_targets.front());
-    }
-
+    // The YAML parser already populated nvme.queue_setup in kernel ABI
+    // units (groups[].count = 2 * QueuePair count, owner_id = gpu_id,
+    // CPU placeholders dropped). validate_config() guarantees
+    // nr_groups > 0 and the local invariant
+    //   sum(yaml count) + cap_kernel_ioq <= total_queues  (QP units).
+    // libnvm fills setup.ioq_num and setup.flags' on_host bit
+    // authoritatively from groups[] inside
+    // Controller::init_queues_multi_gpu, so we forward this struct
+    // as-is. The multi-GPU ctor (chosen by overload resolution on
+    // the nvm_ioctl_setup argument) deliberately leaves
+    // h_qps[i]->sq.db / cq.db as BAR0 host VAs -- NVMeService clients
+    // re-resolve doorbell GPU VAs locally inside
+    // build_shared_controller().
     dev.controller = std::make_shared<Controller>(
         kSnvmeControlPath,
         nvme.pci_addr.c_str(),
         nvme.mount_path,
         nvme.namespace_id,
-        queue_targets,
-        nvme.queue_depth);
+        nvme.queue_depth,
+        nvme.queue_setup);
+
+    std::fprintf(stderr,
+        "nvmeservice: device=%d pci=%s nvm_ioctl_setup{ioq_num=%u (SQ+CQ) "
+        "cap_kernel_ioq=%u (pairs) nr_write=%u nr_poll=%u nr_groups=%u}\n",
+        device_id, nvme.pci_addr.c_str(),
+        nvme.queue_setup.ioq_num,
+        nvme.queue_setup.cap_kernel_ioq,
+        nvme.queue_setup.nr_write,
+        nvme.queue_setup.nr_poll,
+        nvme.queue_setup.nr_groups);
+    for (uint32_t i = 0; i < nvme.queue_setup.nr_groups; ++i) {
+        std::fprintf(stderr,
+            "nvmeservice:   group[%u] owner_id=%u count=%u SQ+CQ (= %u pairs)\n",
+            i, nvme.queue_setup.groups[i].owner_id,
+            nvme.queue_setup.groups[i].count,
+            nvme.queue_setup.groups[i].count / 2u);
+    }
 
     // Populate fields that come from libnvm Controller/ctrl
     dev.page_size      = dev.controller->page_size;
@@ -162,29 +172,27 @@ void ServiceState::init_device(const std::vector<GpuEntry>& gpus,
     dev.snvme_dev_path = dev.controller->dev_path ? dev.controller->dev_path : "";
     dev.total_queues   = static_cast<int32_t>(dev.controller->n_qps);
 
-    // Build dev.groups in declaration order; queue_start_idx accumulates
-    // so each group covers [start, start+count). Skip groups whose
-    // starting offset would already be past total_queues (defensive --
-    // validate_config rejects this case).
+    // Build dev.groups directly from the kernel-facing groups[]: the
+    // i-th group claims the next groups[i].count/2 QueuePairs (kernel
+    // unit -> QP), pinned to groups[i].owner_id. CPU placeholders were
+    // already filtered by parse_queue_groups, so every entry here is
+    // GPU-resident. Defensive cap against total_queues handles the
+    // edge case where the controller granted fewer queues than
+    // requested (snvme returns the actual count via NVM_GET_DEV_INFO).
     int32_t cursor = 0;
-    dev.groups.reserve(nvme.queue_groups.size());
-    for (const auto& qg : nvme.queue_groups) {
-        if (qg.gpu_id < 0) {
-            // CPU-only group: API placeholder for future host-resident
-            // queues. libnvm currently rejects on_host targets, so we
-            // never reach here in practice (Controller ctor would have
-            // thrown). Skip without registering an allocatable group.
-            cursor += qg.count;
-            continue;
-        }
+    dev.groups.reserve(nvme.queue_setup.nr_groups);
+    for (uint32_t gi = 0; gi < nvme.queue_setup.nr_groups; ++gi) {
+        const int32_t qp = static_cast<int32_t>(
+            nvme.queue_setup.groups[gi].count / 2u);
         DeviceQueueGroup g;
-        g.cuda_device     = qg.gpu_id;
+        g.cuda_device     = static_cast<int32_t>(
+            nvme.queue_setup.groups[gi].owner_id);
         g.queue_start_idx = cursor;
-        g.count           = std::min(qg.count, dev.total_queues - cursor);
+        g.count           = std::min(qp, dev.total_queues - cursor);
         if (g.count <= 0) break;
         g.queue_allocated.assign(g.count, false);
         dev.groups.push_back(std::move(g));
-        cursor += qg.count;
+        cursor += qp;
     }
 
     init_queue_handles(dev);
@@ -218,7 +226,7 @@ void ServiceState::install_gpu_symlinks(DeviceState& dev,
     }
 
     std::unordered_set<int> gpu_ids_seen;
-    for (const auto& qg : nvme.queue_groups) {
+    for (const auto& qg : nvme.yaml_queue_groups) {
         if (qg.gpu_id < 0) continue;                   // CPU placeholder
         if (!gpu_ids_seen.insert(qg.gpu_id).second) continue;  // already linked
 

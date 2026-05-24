@@ -81,6 +81,17 @@ public:
         int32_t                     queue_count;
         std::shared_ptr<Controller> controller;      // libnvm Controller
 
+        // GPU-view filesystem path the daemon installed for this
+        // allocation: a symlink under the consuming GPU's mount_path
+        // that resolves to the per-GPU subdirectory on the NVMe (e.g.
+        // "/mnt/gpu0/snvm_nvme0n1" -> "/mnt/nvme0/GPU0"). Hand this to
+        // BlockDeviceManager (or any FileManager-style consumer) so
+        // file paths stay GPU-isolated. Empty if symlink installation
+        // failed at daemon init time -- callers can fall back to
+        // `controller->dev_mount_path` (libnvm carries the same
+        // string from the AllocResponse).
+        std::string                 mount_path;
+
         // These are filled by the client but exposed for debugging only.
         uint32_t                    heartbeat_interval_sec;
         uint32_t                    lease_timeout_sec;

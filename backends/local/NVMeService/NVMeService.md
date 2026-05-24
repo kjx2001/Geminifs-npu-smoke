@@ -355,7 +355,7 @@ build/lib/libnvm.so
 build/lib/libnvmeservice.so
 build/bin/nvmeservice_daemon       # 由 OUTPUT_NAME 决定
 build/bin/nvmeservice_client
-build/bin/sys_config.yaml          # examples/CMakeLists.txt 自动 copy
+build/bin/sys_config.yaml          # examples/CMakeLists.txt 从仓库根 sys_config.yaml 自动 copy
 ```
 
 ### 增量构建
@@ -412,60 +412,211 @@ ioctl 这些节点。
 
 ## 测试流程
 
-### 最小冒烟测试：daemon + client
+### SNVMe 设备节点生命周期（先看这个，避免误判"卡住"）
 
-**前置**：内核模块已 insmod，`/dev/snvm_*` 存在，`sys_config.yaml` 填好实机 PCI 地址。
+| 节点 | 创建时机 | 销毁时机 |
+|---|---|---|
+| `/dev/snvm_control` | `insmod snvme.ko` 成功后由模块全局创建 | `rmmod snvme` |
+| `/dev/ssnvme<N>` | 某进程对该 BDF 发 `SNVM_CHRDEV_CREATE` ioctl 时由 kernel `ida_alloc` 分配 minor 后创建 | 该进程发 `SNVM_CHRDEV_REMOVE` 或退出时 |
+| `/dev/snvme<N>n1`（block） | `SNVM_DEVICE_BIND` 完成、snvme 从 in-tree nvme 抢绑、`nvme_alloc_ns` 跑完后 | `SNVM_DEVICE_UNBIND` 或模块卸载 |
 
-#### 终端 1 — 启动 daemon
+**关键点**：刚 `insmod` 完只会看到 `/dev/snvm_control` 一个节点。`/dev/ssnvme*` 是 daemon 第一次走 `nvm_controller_init` 才会出现的，**不存在不代表配置有问题**——它就该等到 daemon 起来才有。
 
-```bash
-cd build/bin
+`daemon` 启动序列（`Controller(... &setup)` 内部）：
 
-# 改 sys_config.yaml 里的 nvmes[0].pci_addr 为你实机的地址，例如 0000:01:00.0
-vim sys_config.yaml
-
-./nvmeservice_daemon --config sys_config.yaml
+```
+nvm_controller_init(snvme_control_path, pci_addr)
+  ├─ open("/dev/snvm_control")              ← 必须已存在
+  ├─ ioctl(SNVM_CHRDEV_CREATE, &pci_bdf)    ← 这一步创建 /dev/ssnvme<N>
+  ├─ open("/dev/ssnvme<N>", O_RDWR)
+  └─ mmap(BAR0) + cudaHostRegister(IoMemory)
+nvm_queue_setup(ctrl, &setup)                ← B-2/B-3：NVM_SET_IOQ_NUM (groups[])
+为每个 QueuePair 做 NVM_MAP_DEVICE_QUEUE_MEMORY
+nvm_queue_share                              ← NVM_SET_SHARE_REG
+SNVM_DEVICE_BIND                             ← 从 in-tree nvme.ko 抢绑到 snvme
+NVM_GET_DEV_INFO
+mount(<snvme block dev>, nvme.mount_path)
+对每个 queue_groups[].gpu_id:
+  mkdir <nvme.mount_path>/GPU<gpu_id>
+  symlink <gpu.mount_path>/ssnvme<N> -> <nvme.mount_path>/GPU<gpu_id>
 ```
 
-预期输出：
+调试时按"启动到哪一步就有/还没有什么"反推卡点。
+
+---
+
+### 前置环境检查（每次新机或新 shell）
+
+```bash
+# 1. 编译器：必须 GCC >= 10（项目要求 CMAKE_CXX_STANDARD=20）
+source /opt/rh/gcc-toolset-13/enable      # TencentOS 上的 toolset-13 是 13.1
+gcc --version                              # 期望 13.x；8.x 会在 cmake LibTorch 探测时炸
+
+# 2. SNVMe 内核模块已加载
+lsmod | grep snvme                         # 期望看到 snvme + snvme_core
+ls -la /dev/snvm_control                   # 必须存在（唯一全局节点）
+# 不要在这一步检查 /dev/ssnvme*；它是 daemon 启动后才会出现
+
+# 3. NUMA 拓扑（找一对 NUMA 0 上的 NVMe + GPU 做单卡 smoke）
+sudo /data/home/ryeqiu/Geminifs/scripts/pci_topology_check.sh
+# 看矩阵，挑 distance=0 (同 PCIe switch) 或 1 (同 NUMA) 的 (GPU, NVMe) 对
+# 记下 NVMe BDF (如 0000:50:00.0) 和 GPU index (如 0)
+
+# 4. 挂载点目录（一次性创建）
+sudo mkdir -p /mnt/gpu0 /mnt/gpu1 /mnt/nvme0
+sudo chown $USER:$USER /mnt/gpu0 /mnt/gpu1   # daemon 要在里面 symlink，需要写权限
+# /mnt/nvme0 保持 root 即可，libnvm 用 mount(2)，不需要事先 chown
+# 但 /mnt/nvme0 必须是空目录，否则 mount 失败：
+mount | grep /mnt/nvme0                       # 有挂载？sudo umount /mnt/nvme0
+ls -A /mnt/nvme0                              # 有残留？sudo rm -rf /mnt/nvme0/* 后重建
+```
+
+---
+
+### 改 sys_config.yaml
+
+仓库根 `/data/home/ryeqiu/Geminifs/sys_config.yaml` 是唯一来源（build 时由 examples/CMakeLists.txt 拷到 `build/bin/sys_config.yaml`）。两处 TODO 标记必改：
+
+```yaml
+nvmes:
+  - pci_addr: "0000:50:00.0"        # ← 改成上面 0.3 找到的 NVMe BDF
+    ...
+    queue_groups:
+      - { gpu_id: 0, count: 32 }    # ← gpu_id 改成上面 0.3 找到的 GPU index
+```
+
+---
+
+### 编译
+
+```bash
+cd /data/home/ryeqiu/Geminifs
+rm -rf build                       # 先清干净，避免老 cache
+mkdir build && cd build
+
+cmake ..
+# 关键期望行：
+#   -- CUDA 13+ detected; adding CCCL include dir: /usr/local/cuda-13.0/targets/x86_64-linux/include/cccl
+#   -- Using snvme kernel baseline: 5.4.241-1-tlinux4-0017 (...)
+
+# 分层 build，便于定位
+make -j$(nproc) libnvm
+make -j$(nproc) nvmeservice
+make -j$(nproc) nvmeservice_daemon_example nvmeservice_client_example
+```
+
+产物：
+```
+build/lib/libnvm.so
+build/lib/libnvmeservice.so
+build/bin/nvmeservice_daemon
+build/bin/nvmeservice_client
+build/bin/sys_config.yaml      ← 从仓库根 yaml configure_file 拷过来的副本
+```
+
+注意：daemon 默认读 `build/bin/sys_config.yaml`（CMake copy 时的版本）。如果你想现场改配置且不重新 cmake，**直接改根 yaml 然后 `make` 触发 reconfigure**，或者直接编辑 `build/bin/sys_config.yaml`（这次绕过来源）。
+
+---
+
+### 终端 1：启动 daemon
+
+```bash
+cd /data/home/ryeqiu/Geminifs/build/bin
+
+# 顺手开实时 dmesg 在另一窗口
+# sudo dmesg -wH
+
+sudo ./nvmeservice_daemon --config sys_config.yaml
+```
+
+**daemon 启动期 4 段关键输出**（按时序）：
+
+**(A) YAML 解析摘要**（stdout，daemon main 打的）：
+```
+Parsed NVMe config: pci=0000:XX:00.0 mount=/mnt/nvme0 ns=1 qdepth=1024 total_queues=64 queue_groups=1 queue_setup={kernel_ioq_cap=32 on_host=false nr_write=0 nr_poll=0}
+```
+没看到 = YAML parse / validate 失败，前面 stderr 会有具体 emit() 消息。
+
+**(B) ioctl_setup 翻译摘要**（stderr，`init_device` 在 Controller 构造前打）：
+```
+nvmeservice: device=0 pci=0000:XX:00.0 nvm_ioctl_setup{ioq_num=64 (SQ+CQ) cap_kernel_ioq=32 (pairs) nr_write=0 nr_poll=0 nr_groups=1}
+nvmeservice:   group[0] owner_id=0 count=64 SQ+CQ (= 32 pairs)
+```
+单位换算回去：`32 pair × 2 = 64 SQ+CQ entries`。`Σgroups = ioq_num` 自洽。
+
+**(C) kernel 侧 ack**（`dmesg -wH` 实时窗口）：
+```
+snvme: NVM_SET_IOQ_NUM: ioq_num=64 on_host=0 cap_kernel=32 groups=1
+snvme: ... queue split: kernel=K user=M (controller granted ...)
+```
+**这就是 B 阶段的核心成功信号**。如果看到的是 `queue squeeze:`（不是 split:），说明 `kernel_ioq_cap` 还是太大、被控制器 MSI-X 挤掉了 user 份额——把 `kernel_ioq_cap` 调小到 16 或 8 重试。
+
+**(D) daemon banner**（stdout）：
 ```
 NVMeService daemon listening on 127.0.0.1:50051 (port 50051)
 Registered devices:
-  device_id=0 pci=0000:01:00.0 snvme=/dev/snvm_nvme0n1 gpu=0 ns=1
-  page=4096 blk=512 qdepth=1024 dstrd=0 bar0=16384 queues=128/128
+  device_id=0 pci=0000:XX:00.0 snvme=/dev/ssnvme<N> gpu=0 ns=1 page=4096 blk=512 qdepth=1024 dstrd=0 bar0=16384 queues=32/32
+      group: cuda_device=0 range=[0, 32) avail=32/32
 lease: heartbeat=10s timeout=30s
-queue_pool: default=32 max=128
+queue_pool: default=16 max=32
 ```
+`snvme=/dev/ssnvme<N>` 里的 `<N>` 是 kernel 分配的 minor（一般第一次是 0）。**只有这一刻起，`/dev/ssnvme<N>` 才存在**。
 
-如果卡在 `ServiceState init failed`：
-- 看具体错误，通常是 `nvm_controller_init` 失败 → 内核模块、PCI 地址、权限问题
-- 也可能是 `cudaIpcGetMemHandle failed` → 该 GPU 上 DmaPtr 的内存不是 cudaMalloc 的 → 需要排查 libnvm 里 `create_queue_Dma` 的分配路径
+daemon 保持前台运行；`Ctrl+C` 走优雅退出（SIGINT → server->Shutdown → reaper 停 → 析构 → unmount + SNVM_CHRDEV_REMOVE）。
 
-daemon 保持前台运行。`Ctrl+C` 触发 SIGINT → 优雅关闭。
+**如果 daemon 启动期就崩了，按这张表诊断：**
 
-#### 终端 2 — 测试 client
+| 卡在 | dmesg / stderr 上能看到的 | 可能原因 | 检查 |
+|---|---|---|---|
+| (A) 之前 | `Config parse failed:` / `validation failed:` | YAML 语法或单位约束 | 看 emit() 消息 |
+| (A) 之后 (B) 之前 | `validation failed: ... has no GPU entry` 或 `init_queues_multi_gpu: setup.nr_groups must be > 0` / `groups[].count must be a non-zero even number` | YAML 中 `queue_groups` 全是 `gpu_id < 0` 占位，或某行 count <= 0 | 检查 `nvme.queue_groups`，至少留一项 `gpu_id >= 0` 的 group |
+| (B) 之后 (C) 之前 | `Failed to nvm_controller_init` | `nvm_controller_init` ioctl 失败 | `/dev/snvm_control` 权限？BDF 拼写？模块 `lsmod` 还在吗？ |
+| dmesg `snvme: NVM_SET_IOQ_NUM: ... -EINVAL` | kernel 拒了 setup | `Σgroups[].count != ioq_num`，单位算错；或 `reserved` 字段非 0 | 看 (B) 段 stderr，对比 dmesg 里 kernel 报的 sum/ioq_num |
+| dmesg `queue squeeze:` | kernel 谈判后 user 份额被挤光 | MSI-X 太少 + `kernel_ioq_cap` 太大 | 把 `kernel_ioq_cap` 调小 |
+| dmesg `device's driver is '...nvme', not 'snvme'` | `SNVM_DEVICE_BIND` 抢不到设备 | in-tree `nvme.ko` 仍持有该 BDF；可能 udev 在 race | `lsblk` 看 BDF 当前归属；先 `sudo sh -c 'echo 0000:XX:00.0 > /sys/bus/pci/drivers/nvme/unbind'` 再启动 daemon |
+| (D) banner 出来后 client 连不上 | `Failed to start gRPC server` | 端口被占 / 防火墙 / endpoint 拼错 | `ss -tlnp \| grep 50051` |
+
+---
+
+### 终端 2：跑 client（daemon 已 ready 后）
+
+daemon banner 出现 `Registered devices` 一行**之后**再跑：
 
 ```bash
-cd build/bin
+cd /data/home/ryeqiu/Geminifs/build/bin
 
-# 只查询设备
+# 4.1 先纯查询（不需要 sudo，但需要 CUDA 能用）
 ./nvmeservice_client --list-only
 
-# 申请 32 个队列，hold 15 秒（会触发 1~2 次心跳）
-./nvmeservice_client --device 0 --count 32 --hold 15
+# 4.2 申请 16 个 pair，hold 15s
+./nvmeservice_client --device 0 --cuda 0 --count 16 --hold 15
 ```
 
-预期输出：
+**client 预期输出**（B-4 加的 hand-off 验证段是关键）：
+
 ```
 === Listing devices ===
-  device_id=0 pci=0000:01:00.0 ... avail=128/128
+  device_id=0 pci=0000:XX:00.0 snvme=/dev/ssnvme<N> ns=1 page=4096 ... avail=32/32
+      group: cuda_device=0 range=[0, 32) avail=32/32
 
-=== Allocating 32 queues on device 0 ===
-  allocation_id : <32 字节 hex>
-  queue range   : [0, 32) count=32
-  controller    : 0x7f...
+=== Allocating 16 queues on device 0 (cuda_device=0) ===
+  allocation_id : <32 hex chars>
+  device_id     : 0
+  queue range   : [0, 16) count=16
+  controller    : 0x7fXXX
+  mount_path    : /mnt/gpu0/ssnvme<N>
   heartbeat     : 10s interval
-  ...
+  lease timeout : 30s
+  client_pid    : <pid>
+
+=== Hand-off validation ===
+  mount_path  : /mnt/gpu0/ssnvme<N> -> /mnt/nvme0/GPU0
+  ls          : 0 entries reachable from this process
+  queues      : n_qps=16 (probing first 4)
+    qp[0] qp_id=0 is_shared=true sq_gpu=0x7fXXX cq_gpu=0x7fXXX prp_gpu=0x... sq.db=0x... cq.db=0x...
+    qp[1] ...
+    qp[2] ...
+    qp[3] ...
 
 === Holding allocation for 15s (heartbeat thread running in background) ===
   5s elapsed
@@ -476,64 +627,103 @@ cd build/bin
 Done.
 ```
 
-daemon 侧应无异常日志。再跑 `--list-only` 应看到 `avail=128/128`（释放干净）。
+**两个验收点**（你最初的目标）：
 
-### 租约回收测试（崩溃恢复）
+1. **GPU-view 工作目录权限**：`mount_path` 解析到 `/mnt/nvme0/GPU0`，`ls` 不报错（无内容是正常的，里面还没文件）
+2. **GPU 队列地址**：`sq_gpu`、`cq_gpu`、`sq.db`、`cq.db` 都**不是 nullptr/0**——证明 CUDA IPC 导入和 BAR0 doorbell GPU VA 派生都成功
 
-模拟进程崩溃，验证 reaper 自动回收：
+**client 失败诊断：**
+
+| 症状 | 可能原因 | 检查 |
+|---|---|---|
+| `list_devices()` 返回空 | gRPC 通了但 daemon 没注册设备 | daemon 是否启动失败、`/dev/ssnvme<N>` 是否存在 |
+| `cudaHostRegister(BAR0) failed` | BAR0 已被 daemon mmap 过、本进程再 register 失败 | 这是 Todolist 上 unchecked 那条；如果反复出现，看是否 same-host-different-process 的 cudaHostRegister 兼容性问题 |
+| `cudaIpcOpenMemHandle failed` | CUDA IPC 跨进程不通 | 同一 IPC namespace？docker 容器要 `--ipc=host`；GPU MIG 模式不支持 IPC |
+| client 退出后 daemon 没释放 | dtor 没跑（SIGKILL / abort）| 这是 reaper 测试，见下方"租约回收测试" |
+| `sq_gpu` / `cq_gpu` 为 0 | IPC handle 导入失败但被吞 | 看 daemon stderr 是否打 `cudaIpcGetMemHandle failed`、shared_ctrl.cu 里有没有 silent fallback |
+
+---
+
+### 释放清洁性 + 反复测试
+
+client 退出后回 daemon 看 reaper / release 是否干净：
 
 ```bash
-# 1) client 申请后 SIGKILL 自己（跳过 dtor 里的 ReleaseQueues RPC）
-./nvmeservice_client --device 0 --count 16 --hold 60 &
+./nvmeservice_client --list-only       # 应回到 avail=32/32 和初始一致
+```
+
+反复多跑几次 4.2 验证生命周期：
+
+```bash
+for i in 1 2 3; do
+  ./nvmeservice_client --device 0 --cuda 0 --count 16 --hold 5
+  ./nvmeservice_client --list-only
+done
+```
+
+---
+
+### 租约回收测试（崩溃恢复 reaper）
+
+```bash
+# 1) client 申请后 SIGKILL 自己，跳过 dtor 里的 ReleaseQueues RPC
+./nvmeservice_client --device 0 --cuda 0 --count 8 --hold 60 &
 CLIENT_PID=$!
 sleep 3
-./nvmeservice_client --list-only      # 应看到 avail=112/128
+./nvmeservice_client --list-only        # 应看到 avail=24/32
 kill -9 $CLIENT_PID
 
-# 2) 等超时时长（默认 30s）+ 心跳间隔
+# 2) 等超时（默认 lease.timeout_sec=30 + reaper tick=heartbeat/2=5）
 sleep 45
 
-# 3) daemon 应已检测到 PID 死亡，回收了 16 个队列
-./nvmeservice_client --list-only      # 应回到 avail=128/128
+# 3) daemon 应检测到 PID 死亡后 release_range
+./nvmeservice_client --list-only        # 应回到 avail=32/32
 ```
 
-如果没回收成功，检查：
-- daemon 日志有没有 reaper 相关输出
-- 查配置 `lease.timeout_sec`
-- 若 PID 被快速重用（极少见），daemon 用 `/proc/<pid>/stat` starttime 做二次校验，
-  依然应能识别为死亡
+如果没回收，看 daemon stderr 有没有 reaper 输出。`/proc/<pid>/stat` 读不到 = 进程死了，daemon `is_pid_dead` 应返回 true 触发回收。
 
-### 并发多 client 测试
+---
 
-```bash
-# 两个 client 同时申请不重叠的队列
-./nvmeservice_client --device 0 --count 32 --hold 30 &
-./nvmeservice_client --device 0 --count 32 --hold 30 &
-wait
+### 并发多 client 测试（双 GPU 切换后再做）
 
-./nvmeservice_client --list-only      # 期间 avail=64/128，结束后 128/128
-```
+当前 NUMA 0 单卡 profile 只有一个 group、cuda_device=0；并发测试需要切换到 yaml 末尾注释里的双 GPU profile。先把 NUMA 0 单卡跑通再说。
 
-期间 daemon 侧不应有 error 日志；两个 client 都应正常完成。
+---
 
-### 端到端 IO 测试（需要 BlockDeviceManager 改造）
+### 端到端 IO 测试（暂未启用）
 
-目前只能测 **控制面**（allocate / heartbeat / release）。要验证客户端真能通过
-共享队列发 NVMe IO，还需要：
-- `BlockDeviceManager` 的 shared-mode 构造函数（见 `Todolist.md`）
-- 一个走 `build_shared_controller` 拿到 Controller 后发实际 IO 的例子
+只能测控制面（allocate / heartbeat / release / hand-off 探针）。要让 client 真正过共享队列发 NVMe 读写：
 
-这是下一步工作，不在当前 rewrite 范围内。
+- BlockDeviceManager 的第二 ctor 已经存在（`device_manager/include/block_device_manager.cuh::BlockDeviceManager(const ControllerPtr&, std::unique_ptr<FileManager>, const std::string&)`），构造时跳过自己 init Controller
+- 还需要一个 client examples 走 `alloc->controller` + `alloc->mount_path` 构造 BlockDeviceManager 并发 IO 的最小程序
+
+这条在 Todolist "End-to-end smoke" 那条 unchecked 项里，下一轮做。
+
+---
 
 ### 调试技巧
 
-- `cmake -DCMAKE_BUILD_TYPE=Debug ..` 重新配置，`DEBUG` 宏会打开 `geminifs_debug`
-- daemon 加 `gdb --args ./nvmeservice_daemon --config sys_config.yaml`，崩溃时
-  `thread apply all bt`
-- `strace -f -e trace=openat,mmap,ioctl ./nvmeservice_daemon ...` 看 SNVMe
-  设备访问序列
-- `cuda-memcheck ./nvmeservice_client ...` 检查 GPU 内存越界
-- gRPC 层面出错可加 `GRPC_VERBOSITY=DEBUG GRPC_TRACE=api ./nvmeservice_client ...`
+```bash
+# Debug build
+cd build && cmake -DCMAKE_BUILD_TYPE=Debug .. && make -j
+
+# daemon 崩溃栈
+sudo gdb --args ./nvmeservice_daemon --config sys_config.yaml
+#   (gdb) run
+#   (gdb) thread apply all bt        # 崩溃时
+
+# daemon ioctl 序列
+sudo strace -f -e trace=openat,mmap,ioctl ./nvmeservice_daemon --config sys_config.yaml 2>&1 | head -300
+
+# client GPU 内存检查（CUDA 12+ 用 compute-sanitizer 代替老的 cuda-memcheck）
+sudo compute-sanitizer ./nvmeservice_client --device 0 --cuda 0 --count 16 --hold 5
+
+# gRPC RPC 详情
+GRPC_VERBOSITY=DEBUG GRPC_TRACE=api ./nvmeservice_client --device 0 --cuda 0 --count 16 --hold 5
+
+# 实时 kernel 日志（强烈推荐 daemon 启动时开一窗）
+sudo dmesg -wH
+```
 
 ---
 

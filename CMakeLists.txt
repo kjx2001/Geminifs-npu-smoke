@@ -60,6 +60,43 @@ endif()
 
 message(STATUS "Using CUDA ${CMAKE_CUDA_COMPILER_VERSION}")
 
+# ---------------------------------------------------------------------------
+# CUDA 13+ CCCL header location compatibility shim.
+#
+# Starting with CUDA 13.0 the C++ Core Libraries (libcudacxx + Thrust + CUB,
+# collectively CCCL) were relocated from `<cuda_root>/include/cuda/...` to
+# `<cuda_root>/targets/<triple>/include/cccl/cuda/...`. CUDA's own nvcc
+# driver injects this path automatically when compiling .cu files, but
+# host-only .cpp translation units (e.g. backends/local/nvme/libnvm/src/
+# ctrl.cpp) compiled with g++ still need it on their include path or
+# every `#include <cuda/atomic>` chain breaks at preprocess time.
+#
+# We add it as a *global* include dir because libnvm's headers are
+# distributed across multiple targets (libnvm itself, libgeminifs,
+# nvmeservice, device_manager, io_engine), and every C++ TU that
+# transitively pulls libnvm's nvm_types.h needs the same resolution.
+#
+# Pre-CUDA-13 toolkits do not have this directory; the if(EXISTS ...)
+# guard keeps the shim a no-op there so older bring-up environments
+# (e.g. CUDA 12.6 boxes) still build unchanged.
+# ---------------------------------------------------------------------------
+if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL 13.0)
+    # CMake exposes the per-triple include dir as CUDAToolkit_INCLUDE_DIRS[0];
+    # on x86_64 Linux that resolves to <root>/targets/x86_64-linux/include.
+    # The CCCL relocation lives at the sibling `cccl/` subdir.
+    set(_cccl_include "${CUDAToolkit_TARGET_DIR}/include/cccl")
+    if (EXISTS "${_cccl_include}/cuda/atomic")
+        message(STATUS "CUDA 13+ detected; adding CCCL include dir: ${_cccl_include}")
+        include_directories(SYSTEM "${_cccl_include}")
+    else ()
+        message(WARNING
+            "CUDA ${CUDAToolkit_VERSION} reports CCCL relocation but "
+            "${_cccl_include}/cuda/atomic is missing. Host-only TUs that "
+            "include <cuda/atomic> will fail. Check that "
+            "cuda-cccl-${CUDAToolkit_VERSION_MAJOR}-0 is installed.")
+    endif ()
+endif ()
+
 set(LIBTORCH_LOCAL_PATH "${CMAKE_SOURCE_DIR}/third_pkgs/libtorch")
 list(APPEND CMAKE_PREFIX_PATH "${LIBTORCH_LOCAL_PATH}")
 message(STATUS "Project-local LibTorch path added: ${LIBTORCH_LOCAL_PATH}")
