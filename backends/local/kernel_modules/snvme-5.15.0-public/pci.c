@@ -4173,10 +4173,150 @@ static int svm_mmap_registers(struct file* file, struct vm_area_struct* vma)
 
 }
 
+/*
+ * Per-fd /dev/ssnvme<N> owner descriptor.
+ *
+ * The original snvme-5.15.0 fops table only carried .owner / .unlocked_ioctl
+ * / .mmap -- no .open or .release.  That meant a userspace process dying
+ * between NVM_MAP_* and NVM_UNMAP_* leaked:
+ *   1. pinned host pages on the host_list,
+ *   2. nvidia_p2p_get_pages references on the device_list /
+ *      device_queue_list (rmmod snvme will then refuse with "module in
+ *      use" until reboot),
+ *   3. ctrl->ioq_map_num / ctrl->cq_num accounting counters, leaving
+ *      the next bind in a "ctrl exist, ioq_num=N cq_num=M map_num=K"
+ *      dirty state.
+ *
+ * Capturing the opener at .open time (rather than reading `current` at
+ * .release time) is critical: by the time __fput() invokes .release,
+ * the task may have already exited (or be a different thread-group
+ * member, or a forked child).  map.c::create_descriptor records
+ * map->owner from `current` at the time of the NVM_MAP_* ioctl, so
+ * matching that key at .release time requires we stash it at .open
+ * (when the calling task IS the process that will eventually own
+ * the maps it issues).
+ *
+ * Subsequent chunks (Chunk G: NVM_CREATE/DESTROY_QUEUE_GROUP) will
+ * extend this struct with a per-fd groups list.  For Chunk E the
+ * descriptor is the minimal envelope around (ctrl, opener task).
+ *
+ * See PORTING.md \xc2\xa77.3.1 trap "snvm_dev_fops MUST have .open + .release
+ * hooks" for the full leak-on-crash motivation.
+ */
+struct snvm_dev_owner {
+	struct ctrl		*ctrl;
+	struct task_struct	*owner;
+};
+
+static int snvm_dev_open(struct inode *inode, struct file *file)
+{
+	struct ctrl *ctrl;
+	struct snvm_dev_owner *own;
+
+	ctrl = ctrl_find_by_inode(&ctrl_list, inode);
+	if (!ctrl) {
+		pr_err("snvme: snvm_dev_open: no ctrl for inode\n");
+		return -ENODEV;
+	}
+
+	own = kzalloc(sizeof(*own), GFP_KERNEL);
+	if (!own)
+		return -ENOMEM;
+
+	own->ctrl  = ctrl;
+	own->owner = current;
+	file->private_data = own;
+	return 0;
+}
+
+static int snvm_dev_release(struct inode *inode, struct file *file)
+{
+	struct snvm_dev_owner *own = file->private_data;
+	struct ctrl *ctrl;
+	struct task_struct *owner;
+	struct list_node *element;
+	struct map *m;
+	unsigned int rb_ioq = 0, rb_cq = 0;
+	unsigned long n_host = 0, n_dev = 0, n_devq = 0;
+
+	if (!own)
+		return 0;
+
+	ctrl  = own->ctrl;
+	owner = own->owner;
+
+	/*
+	 * Pass 1: walk host_list + device_queue_list to compute the
+	 * ctrl->ioq_map_num / cq_num rollback for descriptors that the
+	 * dying owner had tagged with ioq_idx >= 0.  We cannot fold
+	 * this into map_purge_by_owner() because map.c does not know
+	 * about struct ctrl's accounting fields.
+	 */
+	for (element = list_next(&host_list.head); element != NULL;
+	     element = list_next(element)) {
+		m = container_of(element, struct map, list);
+		if (m->owner == owner && m->ioq_idx >= 0) {
+			rb_ioq++;
+			if (m->is_cq)
+				rb_cq++;
+		}
+	}
+	for (element = list_next(&device_queue_list.head); element != NULL;
+	     element = list_next(element)) {
+		m = container_of(element, struct map, list);
+		if (m->owner == owner && m->ioq_idx >= 0) {
+			rb_ioq++;
+			if (m->is_cq)
+				rb_cq++;
+		}
+	}
+
+	/* Pass 2: actually free. */
+	n_host = map_purge_by_owner(&host_list,         owner);
+	n_dev  = map_purge_by_owner(&device_list,       owner);
+	n_devq = map_purge_by_owner(&device_queue_list, owner);
+
+	/*
+	 * Apply rollback under the implicit serialisation provided by
+	 * the per-fd nature of release (no other thread holds this fd
+	 * by the time we get here).  Use checked subtraction so a
+	 * buggy userspace path cannot wrap the counters below zero,
+	 * which would silently disable the use_sreg branch on the next
+	 * bind (PORTING.md \xc2\xa77.3.1 ioq_map_num-rollback trap).
+	 */
+	if (ctrl) {
+		if (rb_cq > ctrl->cq_num) {
+			pr_warn("snvme: snvm_dev_release: cq_num underflow (have %u, would subtract %u)\n",
+				ctrl->cq_num, rb_cq);
+			ctrl->cq_num = 0;
+		} else {
+			ctrl->cq_num -= rb_cq;
+		}
+		if (rb_ioq > ctrl->ioq_map_num) {
+			pr_warn("snvme: snvm_dev_release: ioq_map_num underflow (have %u, would subtract %u)\n",
+				ctrl->ioq_map_num, rb_ioq);
+			ctrl->ioq_map_num = 0;
+		} else {
+			ctrl->ioq_map_num -= rb_ioq;
+		}
+	}
+
+	if (n_host || n_dev || n_devq)
+		pr_info("snvme: snvm_dev_release: reclaimed host=%lu dev=%lu devq=%lu (rb ioq=%u cq=%u) for pid=%d\n",
+			n_host, n_dev, n_devq, rb_ioq, rb_cq,
+			owner ? owner->pid : -1);
+
+	kfree(own);
+	file->private_data = NULL;
+	return 0;
+}
+
 /* Define file operations for device file */
-static const struct file_operations snvm_dev_fops = 
+static const struct file_operations snvm_dev_fops =
 {
     .owner = THIS_MODULE,
+    .open = snvm_dev_open,
+    .release = snvm_dev_release,
     .unlocked_ioctl = snvm_dev_map_ioctl,
     .mmap = svm_mmap_registers,
 };
