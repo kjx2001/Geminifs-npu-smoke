@@ -3671,6 +3671,149 @@ static const struct pci_device_id nvme_id_table[] = {
 };
 MODULE_DEVICE_TABLE(pci, nvme_id_table);
 
+/*
+ * Per-fd /dev/ssnvme<N> owner descriptor.
+ *
+ * The original snvme-5.15.0 fops table only carried .owner / .unlocked_ioctl
+ * / .mmap -- no .open or .release.  That meant a userspace process dying
+ * between NVM_MAP_* and NVM_UNMAP_* leaked:
+ *   1. pinned host pages on the host_list,
+ *   2. nvidia_p2p_get_pages references on the device_list /
+ *      device_queue_list (rmmod snvme will then refuse with "module in
+ *      use" until reboot),
+ *   3. ctrl->ioq_map_num / ctrl->cq_num accounting counters, leaving
+ *      the next bind in a "ctrl exist, ioq_num=N cq_num=M map_num=K"
+ *      dirty state.
+ *
+ * Capturing the opener at .open time (rather than reading `current` at
+ * .release time) is critical: by the time __fput() invokes .release,
+ * the task may have already exited (or be a different thread-group
+ * member, or a forked child).  map.c::create_descriptor records
+ * map->owner from `current` at the time of the NVM_MAP_* ioctl, so
+ * matching that key at .release time requires we stash it at .open.
+ *
+ * See PORTING.md \xc2\xa77.3.1 trap "snvm_dev_fops MUST have .open + .release
+ * hooks" for the full leak-on-crash motivation.
+ */
+struct snvm_dev_owner {
+	struct ctrl		*ctrl;
+	struct task_struct	*owner;
+
+	/*
+	 * Per-fd queue group list (NVM_CREATE_QUEUE_GROUP adds entries,
+	 * NVM_DESTROY_QUEUE_GROUP and the fd-close cascade in
+	 * snvm_dev_release drain them).  Protected by groups_lock
+	 * against concurrent ioctl threads on the same fd; release()
+	 * runs after all ioctl handlers have returned (vfs guarantees
+	 * fput happens after the last fd ref drops) so the lock is
+	 * uncontended there, but we still take it for lockdep
+	 * cleanliness.
+	 *
+	 * Groups are not placed on any global list: cascade-cleanup on
+	 * fd-close needs only this fd's groups, and there's no cross-fd
+	 * sharing of group_id (the IDA owns the namespace, descriptors
+	 * are strictly per-fd).
+	 */
+	struct list_head	groups;       /* head of struct snvm_qgroup */
+	struct mutex		groups_lock;  /* serialises group list mutation */
+	unsigned int		nr_groups;    /* current count, for cap check   */
+};
+
+/*
+ * Per-fd queue group descriptor.
+ *
+ * NB: This is the runtime per-fd container introduced for
+ * NVM_CREATE_QUEUE_GROUP / NVM_DESTROY_QUEUE_GROUP.  Do NOT confuse
+ * with struct snvm_queue_group in ctrl.h, which is the bind-time
+ * per-controller GPU partitioning descriptor used by
+ * NVM_SET_IOQ_NUM.  Different problems, different lifetimes; the
+ * _qgroup suffix keeps the namespaces distinct.
+ *
+ * Chunk G fields (B1 + B2): link, group_id, max_queues, maps,
+ * nr_maps.  Chunk H will extend this with the queues[] array and
+ * cur_queues counter once NVM_ADD_USER_QUEUE lands.
+ *
+ * Lifetime:
+ *   - allocated by NVM_CREATE_QUEUE_GROUP, group_id assigned via
+ *     ida_simple_get(&snvm_queue_group_ida, 1, 0, GFP_KERNEL).
+ *   - released by NVM_DESTROY_QUEUE_GROUP or by the fd-close cascade
+ *     in snvm_dev_release.
+ */
+struct snvm_qgroup {
+	struct list_head	link;       /* into snvm_dev_owner.groups */
+	uint32_t		group_id;
+	uint32_t		max_queues; /* echoed NVM_MAX_QUEUES_PER_GROUP */
+
+	/*
+	 * Per-group registered maps (B2).  Each entry is a struct map
+	 * threaded by its group_link member.  Adding a map is done by
+	 * NVM_MAP_HOST_MEMORY / NVM_MAP_DEVICE_MEMORY when the payload's
+	 * group_id != 0 (added in a future chunk); removing happens via
+	 * NVM_UNMAP_* (vaddr lookup) or via destroy_qgroup_locked()
+	 * during NVM_DESTROY_QUEUE_GROUP / fd-close cascade.
+	 */
+	struct list_head	maps;
+	unsigned int		nr_maps;
+};
+
+static DEFINE_IDA(snvm_queue_group_ida);
+
+/*
+ * Destroy a queue group.  Caller MUST hold own->groups_lock and MUST
+ * have already list_del'd g from its parent owner->groups list (or
+ * be calling from a context where no other thread can race on the
+ * owner -- e.g. the fd-close cascade, which holds the only ref).
+ *
+ * Chunk G: drains maps + returns group_id to IDA.  Chunk H will
+ * extend this with a "drain user queues via Delete I/O SQ/CQ" step
+ * before the maps drain (Delete-SQ/CQ admin commands need the
+ * controller still snvme-bound; the maps own the ring physical
+ * addresses the controller is about to forget).
+ */
+static void destroy_qgroup_locked(struct snvm_qgroup *g, struct ctrl *ctrl)
+{
+	struct map *m, *tmp_m;
+	unsigned int n_drained = 0;
+
+	(void)ctrl;  /* unused until Chunk H wires in user-queue drain */
+	if (!g)
+		return;
+
+	/* Drain maps registered into this group via NVM_MAP_* group_id paths. */
+	list_for_each_entry_safe(m, tmp_m, &g->maps, group_link) {
+		/*
+		 * unmap_and_release() list_del's our group_link out as
+		 * part of its global-list-and-group-list teardown, then
+		 * frees the page pins / nvidia p2p refs / etc.  We don't
+		 * list_del here ourselves to keep the cleanup logic in
+		 * one place.
+		 */
+		unmap_and_release(m);
+		n_drained++;
+	}
+	if (n_drained)
+		pr_info("snvme: destroy_qgroup id=%u drained %u map(s)\n",
+			g->group_id, n_drained);
+	g->nr_maps = 0;
+
+	ida_simple_remove(&snvm_queue_group_ida, g->group_id);
+	kfree(g);
+}
+
+static struct snvm_qgroup *find_qgroup_locked(struct snvm_dev_owner *own,
+					      uint32_t group_id)
+{
+	struct snvm_qgroup *g;
+
+	if (!own || group_id == 0)
+		return NULL;
+	list_for_each_entry(g, &own->groups, link) {
+		if (g->group_id == group_id)
+			return g;
+	}
+	return NULL;
+}
+
 static long snvm_dev_map_ioctl(struct file* file, unsigned int cmd, unsigned long arg)
 {
 	int ret = 0;
@@ -4113,6 +4256,146 @@ static long snvm_dev_map_ioctl(struct file* file, unsigned int cmd, unsigned lon
 			ret = 0;
 			break;
 		}
+		case NVM_CREATE_QUEUE_GROUP:
+		{
+			/*
+			 * Allocate a new per-fd queue group.  In B1/B2 the
+			 * group is a kernel-side container for maps; Chunk H
+			 * will hang user IO queues off of it.
+			 *
+			 * We don't require the controller to be bound here:
+			 * the group itself doesn't touch any NVMe state.
+			 * Bind status will be enforced when a child operation
+			 * (NVM_ADD_USER_QUEUE) actually needs admin_q.
+			 *
+			 * Caps:
+			 *   per-fd:           NVM_MAX_GROUPS_PER_FD (default 1)
+			 *   per-group queues: NVM_MAX_QUEUES_PER_GROUP, echoed
+			 *                     back in payload.max_queues so
+			 *                     userspace doesn't have to
+			 *                     hardcode the value.
+			 */
+			struct nvm_ioctl_queue_group req;
+			struct snvm_dev_owner *own = file->private_data;
+			struct snvm_qgroup *g;
+			int new_id;
+
+			if (!own)
+				return -ENODEV;
+
+			if (copy_from_user(&req, (void __user *)arg, sizeof(req)))
+				return -EFAULT;
+			if (req.flags != 0)
+				return -EINVAL;
+			{
+				size_t k;
+				for (k = 0; k < ARRAY_SIZE(req.reserved); k++)
+					if (req.reserved[k] != 0)
+						return -EINVAL;
+			}
+
+			mutex_lock(&own->groups_lock);
+			if (own->nr_groups >= NVM_MAX_GROUPS_PER_FD) {
+				mutex_unlock(&own->groups_lock);
+				return -EBUSY;
+			}
+
+			g = kzalloc(sizeof(*g), GFP_KERNEL);
+			if (!g) {
+				mutex_unlock(&own->groups_lock);
+				return -ENOMEM;
+			}
+
+			/*
+			 * IDA range starts at 1 -- group_id 0 is reserved as
+			 * the "no group" sentinel for userspace.
+			 * ida_simple_get's (start, end) is [start, end);
+			 * end=0 means "no upper bound", which gives us the
+			 * full uint32_t range less id 0.
+			 */
+			new_id = ida_simple_get(&snvm_queue_group_ida, 1, 0, GFP_KERNEL);
+			if (new_id < 0) {
+				kfree(g);
+				mutex_unlock(&own->groups_lock);
+				return new_id;
+			}
+
+			g->group_id   = (uint32_t)new_id;
+			g->max_queues = NVM_MAX_QUEUES_PER_GROUP;
+			INIT_LIST_HEAD(&g->link);
+			INIT_LIST_HEAD(&g->maps);
+			g->nr_maps    = 0;
+			list_add_tail(&g->link, &own->groups);
+			own->nr_groups++;
+			mutex_unlock(&own->groups_lock);
+
+			req.group_id   = g->group_id;
+			req.max_queues = g->max_queues;
+			if (copy_to_user((void __user *)arg, &req, sizeof(req))) {
+				/*
+				 * Rollback: tear the group back down so the
+				 * caller's view (nothing exists) matches the
+				 * kernel's view.
+				 */
+				mutex_lock(&own->groups_lock);
+				list_del(&g->link);
+				own->nr_groups--;
+				destroy_qgroup_locked(g, ctrl);
+				mutex_unlock(&own->groups_lock);
+				return -EFAULT;
+			}
+
+			pr_debug("snvme: NVM_CREATE_QUEUE_GROUP id=%u max_queues=%u pid=%d\n",
+				 g->group_id, g->max_queues, current->pid);
+			ret = 0;
+			break;
+		}
+		case NVM_DESTROY_QUEUE_GROUP:
+		{
+			/*
+			 * Explicit destroy.  Userspace passes the opaque
+			 * group_id (uint32_t); we look it up in the per-fd
+			 * group list and tear it down.  Cross-fd destroy is
+			 * disallowed by construction: the group descriptor
+			 * is only reachable via this fd's owner->groups list,
+			 * so a foreign group_id is invisible and returns
+			 * -ENOENT.
+			 */
+			uint32_t group_id;
+			struct snvm_dev_owner *own = file->private_data;
+			struct snvm_qgroup *g;
+			bool found;
+
+			if (!own)
+				return -ENODEV;
+
+			if (copy_from_user(&group_id, (void __user *)arg, sizeof(group_id)))
+				return -EFAULT;
+			if (group_id == 0)
+				return -EINVAL;     /* sentinel value, never assigned */
+
+			mutex_lock(&own->groups_lock);
+			g = find_qgroup_locked(own, group_id);
+			found = (g != NULL);
+			if (found) {
+				list_del(&g->link);
+				own->nr_groups--;
+				destroy_qgroup_locked(g, ctrl);
+				g = NULL;     /* descriptor freed; null out to avoid use-after-free */
+			}
+			mutex_unlock(&own->groups_lock);
+
+			if (!found) {
+				pr_debug("snvme: NVM_DESTROY_QUEUE_GROUP id=%u not found on fd (pid=%d)\n",
+					 group_id, current->pid);
+				return -ENOENT;
+			}
+
+			pr_debug("snvme: NVM_DESTROY_QUEUE_GROUP id=%u pid=%d\n",
+				 group_id, current->pid);
+			ret = 0;
+			break;
+		}
 		case NVM_SET_KERNEL_IOQ_CAP:
 		{
 			/*
@@ -4173,41 +4456,6 @@ static int svm_mmap_registers(struct file* file, struct vm_area_struct* vma)
 
 }
 
-/*
- * Per-fd /dev/ssnvme<N> owner descriptor.
- *
- * The original snvme-5.15.0 fops table only carried .owner / .unlocked_ioctl
- * / .mmap -- no .open or .release.  That meant a userspace process dying
- * between NVM_MAP_* and NVM_UNMAP_* leaked:
- *   1. pinned host pages on the host_list,
- *   2. nvidia_p2p_get_pages references on the device_list /
- *      device_queue_list (rmmod snvme will then refuse with "module in
- *      use" until reboot),
- *   3. ctrl->ioq_map_num / ctrl->cq_num accounting counters, leaving
- *      the next bind in a "ctrl exist, ioq_num=N cq_num=M map_num=K"
- *      dirty state.
- *
- * Capturing the opener at .open time (rather than reading `current` at
- * .release time) is critical: by the time __fput() invokes .release,
- * the task may have already exited (or be a different thread-group
- * member, or a forked child).  map.c::create_descriptor records
- * map->owner from `current` at the time of the NVM_MAP_* ioctl, so
- * matching that key at .release time requires we stash it at .open
- * (when the calling task IS the process that will eventually own
- * the maps it issues).
- *
- * Subsequent chunks (Chunk G: NVM_CREATE/DESTROY_QUEUE_GROUP) will
- * extend this struct with a per-fd groups list.  For Chunk E the
- * descriptor is the minimal envelope around (ctrl, opener task).
- *
- * See PORTING.md \xc2\xa77.3.1 trap "snvm_dev_fops MUST have .open + .release
- * hooks" for the full leak-on-crash motivation.
- */
-struct snvm_dev_owner {
-	struct ctrl		*ctrl;
-	struct task_struct	*owner;
-};
-
 static int snvm_dev_open(struct inode *inode, struct file *file)
 {
 	struct ctrl *ctrl;
@@ -4225,6 +4473,9 @@ static int snvm_dev_open(struct inode *inode, struct file *file)
 
 	own->ctrl  = ctrl;
 	own->owner = current;
+	INIT_LIST_HEAD(&own->groups);
+	mutex_init(&own->groups_lock);
+	own->nr_groups = 0;
 	file->private_data = own;
 	return 0;
 }
@@ -4236,14 +4487,44 @@ static int snvm_dev_release(struct inode *inode, struct file *file)
 	struct task_struct *owner;
 	struct list_node *element;
 	struct map *m;
+	struct snvm_qgroup *g, *tmp_g;
 	unsigned int rb_ioq = 0, rb_cq = 0;
 	unsigned long n_host = 0, n_dev = 0, n_devq = 0;
+	unsigned int n_groups = 0;
 
 	if (!own)
 		return 0;
 
 	ctrl  = own->ctrl;
 	owner = own->owner;
+
+	/*
+	 * Pass 0: cascade-destroy any queue groups still attached to
+	 * this fd.  Userspace may have crashed mid-flight, or simply
+	 * closed the fd without calling NVM_DESTROY_QUEUE_GROUP --
+	 * either way every group on this fd's list must be reaped or
+	 * it leaks group_id bits in snvm_queue_group_ida.
+	 *
+	 * IMPORTANT ordering: groups are drained BEFORE the map passes
+	 * below.  Future chunks will park user IO queues and pinned
+	 * NVMe ring maps inside group descriptors; if the global map
+	 * lists were freed first, the Delete I/O SQ/CQ admin commands
+	 * issued during group teardown (Chunk H) would see ring
+	 * physical addresses that have already been unmapped from the
+	 * IOMMU, which the controller could DMA into freed pages.
+	 */
+	mutex_lock(&own->groups_lock);
+	list_for_each_entry_safe(g, tmp_g, &own->groups, link) {
+		list_del(&g->link);
+		destroy_qgroup_locked(g, ctrl);
+		n_groups++;
+	}
+	own->nr_groups = 0;
+	mutex_unlock(&own->groups_lock);
+
+	if (n_groups)
+		pr_info("snvme: snvm_dev_release: cascade-destroyed %u orphan group(s) for pid=%d\n",
+			n_groups, owner ? owner->pid : -1);
 
 	/*
 	 * Pass 1: walk host_list + device_queue_list to compute the
@@ -4306,6 +4587,7 @@ static int snvm_dev_release(struct inode *inode, struct file *file)
 			n_host, n_dev, n_devq, rb_ioq, rb_cq,
 			owner ? owner->pid : -1);
 
+	mutex_destroy(&own->groups_lock);
 	kfree(own);
 	file->private_data = NULL;
 	return 0;
