@@ -14,6 +14,12 @@
 #                            (Create I/O CQ + Create I/O SQ + cascade
 #                            destroy through NVM_DESTROY_QUEUE_GROUP).
 #                            Always built; BINDS the controller (destructive).
+#   snvme_smoke_io        -- B3 + IO: same as smoke_addq but additionally
+#                            mmaps BAR0, hand-builds NVMe Read/Write SQEs,
+#                            rings doorbells, and verifies the round-trip
+#                            data integrity LBA-by-LBA on the live disk.
+#                            Always built; BINDS AND WRITES TO LBA
+#                            (destructive -- target disk must be empty).
 #
 # All binaries depend on nothing but the SNVMe UAPI header
 #   ../../nvme/libnvm/include/ioctl.h
@@ -27,6 +33,7 @@
 #   sudo ./snvme_smoke_recycle 0000:50:00.0        # NVM_RAW_ADMIN_CMD (destructive: binds)
 #   sudo ./snvme_smoke_qgroup 0000:50:00.0         # queue-group lifecycle (safe, no bind)
 #   sudo ./snvme_smoke_addq 0000:50:00.0           # B3 ADD_USER_QUEUE (destructive: binds)
+#   sudo ./snvme_smoke_io 0000:50:00.0             # B3 + IO round-trip (destructive: writes LBA)
 #
 # Override knobs:
 #   CC, CFLAGS, NVCC, NVCCFLAGS, CUDA_ARCH
@@ -47,6 +54,7 @@ TARGET_GPU      := snvme_smoke_gpu
 TARGET_RECYCLE  := snvme_smoke_recycle
 TARGET_QGROUP   := snvme_smoke_qgroup
 TARGET_ADDQ     := snvme_smoke_addq
+TARGET_IO       := snvme_smoke_io
 
 UAPI_INC := ../../nvme/libnvm/include
 
@@ -81,16 +89,17 @@ SRC_GPU     := snvme_smoke_gpu.cu
 SRC_RECYCLE := snvme_smoke_recycle.c
 SRC_QGROUP  := snvme_smoke_qgroup.c
 SRC_ADDQ    := snvme_smoke_addq.c
+SRC_IO      := snvme_smoke_io.c
 
 # Build the GPU test only if nvcc is available.
 HAVE_NVCC := $(shell command -v $(NVCC) >/dev/null 2>&1 && echo yes || echo no)
 
-.PHONY: all clean run run-gpu run-recycle run-qgroup run-addq
+.PHONY: all clean run run-gpu run-recycle run-qgroup run-addq run-io
 
 ifeq ($(HAVE_NVCC),yes)
-all: $(TARGET) $(TARGET_GPU) $(TARGET_RECYCLE) $(TARGET_QGROUP) $(TARGET_ADDQ)
+all: $(TARGET) $(TARGET_GPU) $(TARGET_RECYCLE) $(TARGET_QGROUP) $(TARGET_ADDQ) $(TARGET_IO)
 else
-all: $(TARGET) $(TARGET_RECYCLE) $(TARGET_QGROUP) $(TARGET_ADDQ)
+all: $(TARGET) $(TARGET_RECYCLE) $(TARGET_QGROUP) $(TARGET_ADDQ) $(TARGET_IO)
 	@echo "[i] nvcc not found; skipping $(TARGET_GPU)."
 	@echo "    Install CUDA Toolkit (or set NVCC=...) and re-run make to enable it."
 endif
@@ -111,8 +120,11 @@ $(TARGET_QGROUP): $(SRC_QGROUP)
 $(TARGET_ADDQ): $(SRC_ADDQ)
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
 
+$(TARGET_IO): $(SRC_IO)
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+
 clean:
-	rm -f $(TARGET) $(TARGET_GPU) $(TARGET_RECYCLE) $(TARGET_QGROUP) $(TARGET_ADDQ)
+	rm -f $(TARGET) $(TARGET_GPU) $(TARGET_RECYCLE) $(TARGET_QGROUP) $(TARGET_ADDQ) $(TARGET_IO)
 
 # Convenience: PCI=0000:50:00.0 make run [BIND=1]
 run: $(TARGET)
@@ -160,3 +172,12 @@ run-addq: $(TARGET_ADDQ)
 	    echo "usage: PCI=DDDD:BB:DD.F make run-addq"; exit 1; \
 	fi; \
 	sudo ./$(TARGET_ADDQ) $(PCI)
+
+# Convenience: PCI=0000:50:00.0 make run-io
+# (B3 + IO round-trip smoke; BINDS the controller AND WRITES TO LBA --
+#  destructive, target disk must be empty.)
+run-io: $(TARGET_IO)
+	@if [ -z "$(PCI)" ]; then \
+	    echo "usage: PCI=DDDD:BB:DD.F make run-io"; exit 1; \
+	fi; \
+	sudo ./$(TARGET_IO) $(PCI)

@@ -299,6 +299,55 @@ testable:
       `d_qps == d_qps_per_group[0]`. Multi-GPU kernels read the
       group-local array.
 
+- [ ] **NVM_ADD_USER_QUEUE map-type discrimination** -- today the
+      ADD_USER_QUEUE handler resolves `(sq_vaddr, cq_vaddr)` to
+      maps by `vaddr & PAGE_MASK` lookup against `g->maps`, with
+      NO type tag on the map.  Means: if userspace accidentally
+      passes a data-buffer vaddr where it meant an SQ/CQ ring
+      vaddr, the kernel will happily Create I/O SQ with PRP1 =
+      that data buffer's dma_addr; the controller then reads
+      garbage as SQEs and the failure mode is silent corruption /
+      controller hang rather than a clean -EINVAL.
+      Fix sketch: add `uint8_t map_type` to `struct map`
+      (RING_SQ / RING_CQ / DATA), set at NVM_MAP_HOST_MEMORY time
+      via a new flag in `struct nvm_ioctl_map`; ADD_USER_QUEUE
+      then rejects mismatched types up front.
+
+- [x] **NVM_ADD_USER_QUEUE vaddr-mask alignment hazard for GPU maps.**
+      pci.c:6279 used to mask with the host PAGE_MASK (4 KiB)
+      regardless of whether the map was created via
+      `NVM_MAP_HOST_MEMORY` (vaddr aligned to PAGE_SIZE) or
+      `NVM_MAP_DEVICE_MEMORY` (vaddr aligned to GPU_PAGE_SIZE,
+      64 KiB).  Host smoke worked by accident because page-aligned
+      stayed page-aligned; GPU smoke would have miss-matched.
+      Fixed by deriving the lookup mask from `cursor->page_size`
+      so both routings work.
+
+- [ ] **Decouple data-buffer maps from the queue group lifecycle.**
+      Right now the only well-supported NVM_MAP_HOST_MEMORY mode
+      is "bind to a queue group" (group_id != 0).  The legacy
+      group_id == 0 path exists but had a sibling-fd reaping bug
+      (fixed by limiting purge_by_owner to group_id == 0) and is
+      best treated as deprecated.  For data buffers that outlive
+      the queues they're submitted on (typical: client allocates
+      a 4 MiB DMA pool once, sends a million IOs through it,
+      eventually destroys the queue group) we want a third mode:
+      "bind to fd, NOT to a queue group".
+      Three implementation options to evaluate:
+        a) Reserve a sentinel group_id (e.g. UINT32_MAX) meaning
+           "fd-scoped".  Smallest ABI delta.
+        b) Add a per-fd implicit default group, allocated at
+           open(), destroyed at close().  Cleanest semantics; data
+           buffers go there by default if user passes group_id=0.
+        c) Add a `map_kind` field to struct nvm_ioctl_map
+           (RING / DATA), and route DATA maps to a per-fd list
+           regardless of group_id.  Pairs naturally with the
+           map-type discrimination Todolist item above.
+      Smoke note: snvme_smoke_io.c currently registers data
+      buffers under the same queue group as the rings.  This works
+      but couples lifecycles -- it's a smoke-correctness shortcut,
+      not a recommendation for NVMeService production use.
+
 ## Discussion Required Before Major Refactor
 
 - [x] Decide the future runtime/product name — `Tutti`, recorded in

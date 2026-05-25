@@ -194,54 +194,158 @@ For every translation unit in `nvme/host/` that SNVMe carries
 When porting to a newer kernel, do the renames mechanically first,
 then re-apply the surgical changes from §3.2.
 
-### 3.2 User-driven bring-up: the `snvm_control` interface
+### 3.2 User-driven bring-up: the **B3 queue-group flow**
 
-This is the only **functional** change. The intuition:
+> **Status note (2026-05-25, baseline `snvme-5.4.241-1-tlinux4-0017`).**
+> SNVMe now supports **two coexisting** bring-up flows.  The legacy
+> "B0" flow (`NVM_SET_IOQ_NUM` + `NVM_SET_SHARE_REG`, the
+> all-or-nothing pre-bind queue-handover path described in earlier
+> revisions of this document) is kept as a back-compat shim only.
+> All new code, including every smoke test in §8 and the NVMeService
+> daemon, uses the **B3 queue-group flow** described below.  When
+> porting, both must keep working, but the B3 flow is the one that
+> defines the data-plane and is what the §7.4 verification gate
+> exercises end-to-end.
 
-- Stock NVMe: bind PCI device → `nvme_probe()` → `nvme_alloc_queue()`
-  uses `dma_alloc_coherent` for SQ/CQ → `nvme_setup_io_queues()` is
-  done before `nvme_probe()` returns.
-- SNVMe: PCI device is **explicitly bound** by user-space request,
-  *after* user-space has already published its own queue memory.
-  `s_nvme_setup_io_queues()` then uses the IO addresses the user
-  supplied instead of calling `dma_alloc_coherent`.
+The intuition behind B3:
 
-The state machine lives in the per-controller `struct ctrl`
-(`snvme/ctrl.h`). The salient fields are:
+- **Stock NVMe**: bind PCI device → `nvme_probe()` → `nvme_alloc_queue()`
+  uses `dma_alloc_coherent` for every SQ/CQ →
+  `nvme_setup_io_queues()` is done before `nvme_probe()` returns.
+  Number of IO queues = `num_possible_cpus()`, no headroom for any
+  user-allocated share.
+- **SNVMe B0** (legacy): PCI device is bound *after* user-space
+  pre-registered every IO queue ring.  Probe consumed all of them
+  in one shot (`use_sreg && ioq_num == ioq_map_num` gate).  This
+  required userspace to know how many queues it wanted before bind
+  and made dynamic add/remove impossible.
+- **SNVMe B3** (current): PCI device is bound **first**, with the
+  controller running plain in-tree-style probe (admin queue +
+  kernel IO queues all from `dma_alloc_coherent`).  The kernel IOQ
+  count is **capped** by `NVM_SET_KERNEL_IOQ_CAP` *before* bind so
+  the controller's MSI-X grant has headroom for a user-side share.
+  Then, while the controller is `NVME_CTRL_LIVE` and serving the
+  block device normally, userspace can **dynamically allocate and
+  release** user IO queues via three new ioctls:
+  `NVM_CREATE_QUEUE_GROUP` → `NVM_MAP_*` → `NVM_ADD_USER_QUEUE` and
+  the matching `NVM_DESTROY_QUEUE_GROUP` (cascades through every
+  user queue + every map registered against the group).
+
+The B3 state machine lives in **two** places:
+
+1.  Per-controller `struct ctrl` (`snvme/ctrl.h`) — bind-level fields
+    that survive across queue groups:
+
+    ```c
+    unsigned int ioq_num;            /* legacy B0; 0 in B3 flow                */
+    unsigned int cq_num;             /* legacy B0; 0 in B3 flow                */
+    unsigned int ioq_map_num;        /* legacy B0; 0 in B3 flow                */
+    unsigned int use_sreg;           /* legacy B0 gate; 0 in B3 flow           */
+
+    unsigned int ctrl_max_io_queues; /* B3: real controller grant after        */
+                                     /* MSI-X negotiation; bound on user pool  */
+    struct setup setup;              /* setup.cap_kernel_ioq written by        */
+                                     /*   NVM_SET_KERNEL_IOQ_CAP               */
+
+    /* Per-fd queue groups (one fd may own up to NVM_MAX_GROUPS_PER_FD).      */
+    struct list_head groups;         /* protected by ctrl->groups_lock         */
+    struct mutex     groups_lock;
+
+    /* User QID pool (qids in [start_cq_idx, ctrl_max_io_queues]).            */
+    DECLARE_BITMAP(user_qid_bitmap, NVME_MAX_USER_QIDS);
+    struct mutex   user_qid_lock;
+    unsigned int   user_qid_pool_initialised;
+    ```
+
+2.  Per-fd queue group (created on demand by `NVM_CREATE_QUEUE_GROUP`,
+    file `snvme/qgroup.c`):
+
+    ```c
+    struct queue_group {
+        uint32_t           group_id;          /* opaque to userspace          */
+        struct nvme_ctrl  *ctrl;
+        struct file       *owning_fd;
+        struct list_head   maps;              /* every NVM_MAP_* of this gid  */
+        struct list_head   queues;            /* every NVM_ADD_USER_QUEUE pair*/
+        unsigned int       cur_queues;
+        unsigned int       max_queues;        /* = NVM_MAX_QUEUES_PER_GROUP   */
+    };
+    ```
+
+The B3 hook into the upstream probe path is intentionally minimal:
+**no probe-time branch, no `use_sreg` check, no copy out of a map
+list during probe.**  The only thing the kernel must do at probe
+time is honor `setup.cap_kernel_ioq`:
 
 ```c
-unsigned int ioq_num;       /* number of IO queues the user promised */
-unsigned int cq_num;        /* of those, how many are completion queues */
-unsigned int ioq_map_num;   /* how many user pages have been registered so far */
-unsigned int use_sreg;      /* "share registers" flag — when set, probe()
-                             * must consume user pages instead of dma_alloc */
-```
+/* Inside nvme_setup_io_queues, AFTER MSI-X negotiation.            */
+nr_io_queues = pci_alloc_irq_vectors_affinity(...);  /* upstream    */
+dev->ctrl_max_io_queues = nr_io_queues;              /* B3: record  */
 
-The flag `use_sreg` plus the equality `ioq_num == ioq_map_num` is what
-gates the deviation from the upstream probe path. See `pci.c:3227`:
-
-```c
-if (ctrl && ctrl->ioq_num == ctrl->ioq_map_num && ctrl->use_sreg) {
-    dev->nr_user_allocated_queues = ctrl->ioq_num;
-    dev->nr_user_allocated_cq     = ctrl->cq_num;
-    /* ...skip dma_alloc, use ctrl->user pages... */
+if (ctrl->setup.cap_kernel_ioq &&
+    nr_io_queues > ctrl->setup.cap_kernel_ioq) {
+    pr_info("snvme: capping kernel-side IOQ count from %u to %u "
+            "(ctrl_max=%u, user pool gets [%u..%u])\n",
+            nr_io_queues, ctrl->setup.cap_kernel_ioq,
+            dev->ctrl_max_io_queues,
+            ctrl->setup.cap_kernel_ioq + 1,
+            dev->ctrl_max_io_queues);
+    nr_io_queues = ctrl->setup.cap_kernel_ioq;
 }
+/* ... rest of upstream nvme_setup_io_queues runs unchanged.        */
 ```
+
+That is the entire probe-side delta.  Everything else (Create I/O
+SQ/CQ admin commands, queue tear-down via Delete I/O SQ/CQ, doorbell
+indexing, MSI-X routing) is reused from upstream by issuing
+**`NVM_RAW_ADMIN_CMD`-equivalent** admin SQEs from the kernel side
+of `NVM_ADD_USER_QUEUE` / `NVM_DESTROY_QUEUE_GROUP`.
 
 When porting to a newer kernel:
 
-1. Find the upstream equivalents of `nvme_alloc_queue` /
-   `nvme_setup_io_queues` / `nvme_create_io_queues`.
-2. Inject a branch at the same logical points: if the per-controller
-   `ctrl` sentinel says "user already published queues", skip
-   `dma_alloc_coherent` and copy the pre-registered IO addresses out
-   of the controller's `map` list (`snvme/map.c`) into the SQ/CQ
-   descriptors instead.
-3. Leave the admin queue path on `dma_alloc_coherent`. Only the IO
-   queues are user-supplied.
-4. Make sure `nvme_dev_add()` / `nvme_alloc_admin_tags()` continue to
-   produce a regular `/dev/snvme<X>n<Y>` block device — the user-space
-   side relies on it for `mount()` (`Host_file_system_int`).
+1.  **Find the post-MSI-X-negotiation point in `nvme_setup_io_queues`.**
+    This is the only place the cap branch goes.  Don't apply the cap
+    earlier (you'll skew the MSI-X allocation) or later (the kernel
+    has already allocated tagsets sized for `nr_io_queues`).  In 5.4
+    this is between `pci_alloc_irq_vectors_affinity()` and the
+    `nvme_set_queue_count()` call; in 5.15+ the helper layout
+    changed but the *logical* point is identical — between IRQ
+    allocation and tagset sizing.
+
+2.  **Add the `ctrl_max_io_queues` field to `struct nvme_dev` and
+    record `nr_io_queues` into it BEFORE applying the cap.** This is
+    the value the user QID pool's upper bound is derived from, NOT
+    the post-cap `nr_io_queues`.  Skipping this step makes the user
+    QID pool empty on hosts where the controller's MSI-X budget is
+    smaller than `num_possible_cpus()` (every Intel DC SSD on a
+    192-vCPU host hits this), and `NVM_ADD_USER_QUEUE` returns
+    `-EAGAIN` from `snvm_user_qid_alloc_locked`.
+
+3.  **Leave the admin queue path on `dma_alloc_coherent`.** Only IO
+    queues created via `NVM_ADD_USER_QUEUE` use user-supplied
+    memory; the kernel-side IO queues stay on coherent DMA, just
+    capped.
+
+4.  **Verify `nvme_dev_add()` / `nvme_alloc_admin_tags()` still produce
+    `/dev/snvme<X>n<Y>`.** B3 keeps the disk visible for mount;
+    losing it (e.g. by accidentally setting `nr_io_queues = 0` or
+    by skipping `nvme_dev_add`) regresses the §2 namespace
+    contract.
+
+5.  **Carry the `cursor->page_size` mask in `NVM_ADD_USER_QUEUE`'s
+    vaddr lookup.**  The lookup matches a (sq_vaddr, cq_vaddr) pair
+    against the group's map list.  Host pages are 4 KiB,
+    GPU/p2p pages are 64 KiB, so a single mask cannot cover both —
+    use the map's own `page_size` to compute it (see §7.3.1 trap
+    "vaddr mask must be page-size adaptive").
+
+6.  **Keep the legacy `use_sreg` branch behind its existing
+    `ctrl->ioq_num == ctrl->ioq_map_num && ctrl->use_sreg` gate.**
+    B0 callers still exist (older NVMeService binaries during
+    rolling upgrade); breaking them gains nothing.  Once both flows
+    coexist, the rule "`NVM_SET_KERNEL_IOQ_CAP` is for B3,
+    `NVM_SET_IOQ_NUM` is for B0" is what disambiguates which one a
+    given `SNVM_DEVICE_BIND` activates.
 
 ---
 
@@ -280,8 +384,13 @@ Semantics:
   field is reused as an out-parameter — see `pci.c:4204`).
 - **`SNVM_DEVICE_BIND`**: detaches whatever PCI driver currently owns
   the BDF (typically the in-tree `nvme`), registers `snvme_driver` if
-  not already registered, and force-attaches it. Triggers
-  `s_nvme_probe()`, which honours the per-controller `use_sreg` flag.
+  not already registered, and force-attaches it via
+  `driver_attach(&snvme_driver.driver)` (NOT `device_attach()`; see
+  §7.3.1).  Triggers `s_nvme_probe()`.  In the **B3 flow** probe
+  honours `setup.cap_kernel_ioq` (see §3.2); in the **B0 flow**
+  probe additionally honours the `use_sreg` flag and consumes
+  pre-registered queue rings.  After this returns, the controller
+  is `NVME_CTRL_LIVE` and `/dev/snvme<X>n<Y>` exists.
 - **`SNVM_DEVICE_UNBIND`**: counterpart; only succeeds if the device
   is currently bound to `snvme`.
 
@@ -289,118 +398,513 @@ Semantics:
 
 ```c
 enum nvm_ioctl_type {
-    NVM_MAP_HOST_MEMORY             = _IOW(0x80, 1, struct nvm_ioctl_map),
-    NVM_MAP_DEVICE_MEMORY           = _IOW(0x80, 2, struct nvm_ioctl_map),
-    NVM_MAP_DEVICE_QUEUE_MEMORY     = _IOW(0x80, 3, struct nvm_ioctl_map),
-    NVM_UNMAP_HOST_MEMORY           = _IOW(0x80, 4, uint64_t),
-    NVM_UNMAP_DEVICE_MEMORY         = _IOW(0x80, 5, uint64_t),
-    NVM_UNMAP_DEVICE_QUEUE_MEMORY   = _IOW(0x80, 6, uint64_t),
-    NVM_SET_IOQ_NUM                 = _IOW(0x80, 7, struct nvm_ioctl_dev),
-    NVM_SET_SHARE_REG               = _IOW(0x80, 8, struct nvm_ioctl_dev),
-    NVM_GET_DEV_INFO                = _IOR(0x80, 9, struct nvm_ioctl_dev),
-    NVM_CLEAR_IOQ_NUM               = _IOW(0x80, 10, struct nvm_ioctl_dev),
+    /* memory map / unmap (host pages, GPU p2p pages, GPU queue pages) */
+    NVM_MAP_HOST_MEMORY             = _IOW (0x80,  1, struct nvm_ioctl_map),
+    NVM_MAP_DEVICE_MEMORY           = _IOW (0x80,  2, struct nvm_ioctl_map),
+    NVM_MAP_DEVICE_QUEUE_MEMORY     = _IOW (0x80,  3, struct nvm_ioctl_map),
+    NVM_UNMAP_HOST_MEMORY           = _IOW (0x80,  4, uint64_t),
+    NVM_UNMAP_DEVICE_MEMORY         = _IOW (0x80,  5, uint64_t),
+    NVM_UNMAP_DEVICE_QUEUE_MEMORY   = _IOW (0x80,  6, uint64_t),
+
+    /* legacy B0 bring-up path (still supported for back-compat) */
+    NVM_SET_IOQ_NUM                 = _IOW (0x80,  7, struct nvm_ioctl_setup),
+    NVM_SET_SHARE_REG               = _IOW (0x80,  8, struct nvm_ioctl_dev),
+    NVM_GET_DEV_INFO                = _IOR (0x80,  9, struct nvm_ioctl_dev),
+    NVM_CLEAR_IOQ_NUM               = _IOW (0x80, 10, struct nvm_ioctl_dev),
+
+    /* generic admin SQE forwarder (Delete + Create I/O SQ/CQ recycle,
+     * Get Log Page, vendor admin, etc.) */
+    NVM_RAW_ADMIN_CMD               = _IOWR(0x80, 11, struct nvm_ioctl_raw_admin),
+
+    /* === B3 queue-group flow (the recommended path) === */
+    NVM_CREATE_QUEUE_GROUP          = _IOWR(0x80, 12, struct nvm_ioctl_queue_group),
+    NVM_DESTROY_QUEUE_GROUP         = _IOW (0x80, 13, uint32_t),
+    NVM_ADD_USER_QUEUE              = _IOWR(0x80, 14, struct nvm_ioctl_add_user_queue),
+    NVM_SET_KERNEL_IOQ_CAP          = _IOW (0x80, 15, uint32_t),
 };
 ```
 
-`NVM_MAP_*` requests carry a `struct nvm_ioctl_map`:
+#### 4.3.1 `NVM_MAP_*` — pin user/GPU pages and report IO addresses
 
 ```c
 struct nvm_ioctl_map {
-    uint64_t  vaddr_start;   /* userspace VA of the queue buffer */
-    size_t    n_pages;
-    uint64_t* ioaddrs;       /* OUT: kernel writes IO addresses here */
-    int       ioq_idx;       /* >=0: this page belongs to IO queue ioq_idx */
-    int       is_cq;         /* 1 = completion queue ring, 0 = submission */
+    uint64_t  vaddr_start;   /* userspace VA of the buffer (page-aligned)   */
+    size_t    n_pages;       /* host-page count for HOST, GPU-page count    */
+                             /*   for DEVICE/DEVICE_QUEUE                   */
+    uint64_t *ioaddrs;       /* OUT: kernel writes IO addresses here        */
+    int       ioq_idx;       /* legacy B0: >=0 = queue ring, <0 = PRP/data  */
+                             /*   B3: pass -1 (queue role recovered later   */
+                             /*   from NVM_ADD_USER_QUEUE)                  */
+    int       is_cq;         /* legacy B0: 1=CQ ring, 0=SQ ring; B3: -1     */
+    uint32_t  group_id;      /* B3: register against this queue group       */
+                             /*   (0 = legacy / no group)                   */
 };
 ```
 
 The kernel pins the pages (via `get_user_pages_fast` for HOST, via
-`nvidia_p2p_get_pages` for DEVICE) and either records IO addresses
-(when `ioq_idx >= 0` ⇒ "this is a queue ring") or sets up a generic
-DMA mapping (when `ioq_idx < 0` ⇒ "this is a PRP buffer").
+`nvidia_p2p_get_pages` for DEVICE/DEVICE_QUEUE), records the IO
+addresses into the user-supplied `ioaddrs[]` array, and links the
+resulting descriptor onto **two** lists:
 
-Each `MAP_*` call increments `ctrl->ioq_map_num` when `ioq_idx >= 0`;
-`NVM_SET_IOQ_NUM` declared the target value upfront, and
-`NVM_SET_SHARE_REG` flips `use_sreg=1` so that the next
-`SNVM_DEVICE_BIND` / `nvme_probe()` consumes the user pages.
+- the per-controller `host_list` / `device_list` /
+  `device_queue_list` (for legacy B0 lookup), and
+- the per-queue-group `g->maps` list (B3) when `group_id != 0`,
+  so that `NVM_DESTROY_QUEUE_GROUP` / fd close cascade-cleanup
+  can release every page automatically without the user having
+  to call `NVM_UNMAP_*`.
+
+> **B3 alignment rule.** Host pages are 4 KiB (PAGE_SIZE);
+> GPU pages are 64 KiB (`GPU_PAGE_SHIFT=16` in `snvme/map.c`).
+> `vaddr_start` must be aligned to whichever of those applies.
+> The kernel preserves both alignments by storing each map's own
+> `page_size`; `NVM_ADD_USER_QUEUE`'s vaddr lookup masks with
+> `cursor->page_size` so the same code path can resolve a host
+> SQ vaddr in one byte and a GPU SQ vaddr in the next (see §7.3.1).
+
+#### 4.3.2 `NVM_GET_DEV_INFO` — query controller capabilities
+
+```c
+struct nvm_ioctl_dev {
+    /* legacy fields (semantics unchanged) */
+    uint32_t nr_user_q;          /* B0: total user queue count;           */
+                                 /* B3: 0 (queues are dynamic post-bind)  */
+    uint32_t start_cq_idx;       /* first user-allocatable QID            */
+                                 /*   = cap_kernel_ioq + 1 in B3 flow     */
+    uint8_t  dstrd;              /* CAP.DSTRD doorbell stride exponent    */
+    size_t   max_data_size;      /* CTRL.MDTS in bytes                    */
+    size_t   block_size;         /* 1 << ns->lba_shift                    */
+    char     disk_name[32];      /* e.g. "snvme0n1"                       */
+
+    /* B3 additions */
+    uint16_t q_depth;            /* NVMe CAP.MQES + 1, clamped (per-      */
+                                 /*   queue depth; same for every user    */
+                                 /*   queue; snvme does not support per-  */
+                                 /*   queue depth at B3)                  */
+    uint16_t reserved0;
+    uint32_t bar0_size;          /* IORESOURCE_MEM #0 length (mmap arg)   */
+    uint32_t max_user_qid;       /* upper bound of user QID pool          */
+                                 /*   = ctrl_max_io_queues                */
+    uint32_t sgl_supported;      /* echo of dev->ctrl.sgls (Identify      */
+                                 /*   Controller offset 536, NVMe 1.4)    */
+                                 /* bit 0:1 -- transport SGL supported    */
+                                 /* bit 1   -- transport SGL with align   */
+                                 /* bit 16  -- byte-aligned SGL           */
+                                 /* bit 17  -- SGL bit-bucket descriptor  */
+                                 /* bit 18  -- SGL MPTR descriptor        */
+                                 /* bit 19  -- SGL larger than data xfer  */
+                                 /* bit 20  -- transport SGL data block   */
+                                 /* bit 21  -- keyed SGL data block       */
+                                 /* sgls=0x0 means PRP-only controller    */
+    uint32_t reserved1[5];       /* MBZ; future extension                  */
+};
+```
+
+#### 4.3.3 `NVM_SET_KERNEL_IOQ_CAP` — split MSI-X budget pre-bind (B3)
+
+```c
+uint32_t cap = 36;
+ioctl(fd, NVM_SET_KERNEL_IOQ_CAP, &cap);
+```
+
+Pre-bind, declares an upper bound on how many IO queues the kernel
+side may consume from the controller's granted IOQ count.  Whatever
+the controller actually grants above this cap becomes the **user
+QID pool** that subsequent `NVM_ADD_USER_QUEUE` calls draw from.
+
+This is a **cap-only** path:
+
+- `ctrl->setup.cap_kernel_ioq` is set to the requested value;
+- `ctrl->ioq_num`, `ctrl->cq_num`, `ctrl->use_sreg` stay at 0;
+- the probe path runs as plain in-tree-style nvme.
+
+Use this when userspace plans to allocate IOQs dynamically post-bind
+via `NVM_ADD_USER_QUEUE`, instead of declaring them upfront.  The
+cap MUST be issued *before* `SNVM_DEVICE_BIND`; calls after bind
+update the field but have no probe to apply it to.
+
+> **MSI-X budget rule.**  Pick `cap` such that
+> `cap + Σ(post-bind queue groups)` ≤ controller's MSI-X grant.
+> For a 192-vCPU host with an Intel DC SSD (MSI-X = 136), `cap=36`
+> leaves `[37..135]` (99 QIDs) for user queue groups; the smoke
+> tests use `cap=36`.
+
+#### 4.3.4 `NVM_CREATE_QUEUE_GROUP` / `NVM_DESTROY_QUEUE_GROUP` (B3)
+
+```c
+struct nvm_ioctl_queue_group {
+    uint32_t group_id;       /* OUT: kernel-assigned, opaque cookie  */
+    uint32_t flags;          /* MBZ                                  */
+    uint32_t max_queues;     /* OUT: per-group queue cap (= 16)      */
+    uint32_t reserved[5];    /* MBZ                                  */
+};
+```
+
+A "queue group" is the runtime resource container that subsequent
+`NVM_ADD_USER_QUEUE` calls hang off of.  It is the kernel-side dual
+of "one logical client" — typically one process binding to one GPU
+on one NVMe controller.
+
+Lifecycle / ownership:
+
+- Created with `NVM_CREATE_QUEUE_GROUP` on an open `/dev/ssnvme<N>`
+  fd.  The kernel returns an opaque, globally unique `group_id`.
+  The group is bound to `(file, ctrl)`; **fd close cascades
+  destroy automatically**.
+- Destroyed with `NVM_DESTROY_QUEUE_GROUP(&group_id)` (the payload
+  is just a `uint32_t`).  Cascade order: every (CQ, SQ) pair in
+  `g->queues` LIFO → Delete I/O SQ → Delete I/O CQ → free QID;
+  then every map in `g->maps` LIFO → `unmap_and_release()`.  At
+  group-destroy time the kernel emits:
+
+    ```
+    snvme: destroy_qgroup id=N drained K user queue(s)
+    snvme: destroy_qgroup id=N drained M map(s)
+    ```
+
+  Use these as the cleanup-correctness signature in dmesg.
+
+- Up to `NVM_MAX_GROUPS_PER_FD` groups per fd (currently 1).
+- `group_id == 0` is invalid (sentinel meaning "no group").
+
+Why a separate ioctl from `NVM_SET_IOQ_NUM`: the legacy ioctl is a
+**bind-time, per-controller** pre-declaration of the entire user
+budget.  Queue groups are the **post-bind, per-fd** runtime path:
+groups can be created and destroyed at any time after bind,
+independently of each other.  The two paths coexist; legacy callers
+see no behavioural change.
+
+#### 4.3.5 `NVM_ADD_USER_QUEUE` — create user (SQ, CQ) pairs (B3)
+
+```c
+struct nvm_user_queue_pair_in {
+    uint64_t sq_vaddr;       /* userspace VA of the SQ ring (already   */
+                             /*   registered via NVM_MAP_* against     */
+                             /*   the same group_id)                   */
+    uint64_t cq_vaddr;       /* same, for the CQ ring                  */
+};
+
+struct nvm_user_queue_pair_out {
+    uint32_t sq_doorbell_offset;   /* BAR0 byte offset for SQ tail dbl */
+    uint32_t cq_doorbell_offset;   /* BAR0 byte offset for CQ head dbl */
+    uint32_t qid;                  /* informational; not needed for    */
+                                   /*   SQE submission (SQE has no    */
+                                   /*   SQID field).  Useful for      */
+                                   /*   dmesg correlation.             */
+    uint32_t reserved;
+};
+
+struct nvm_ioctl_add_user_queue {
+    /* in */
+    uint32_t group_id;
+    uint32_t nr_pairs;       /* 1..NVM_MAX_QUEUES_PER_GROUP (=16)      */
+    uint32_t flags;          /* MBZ                                    */
+    uint32_t reserved[5];    /* MBZ                                    */
+    struct nvm_user_queue_pair_in  pairs[NVM_MAX_QUEUES_PER_GROUP];
+    /* out: only pairs[0..nr_pairs-1] populated */
+    struct nvm_user_queue_pair_out out_pairs[NVM_MAX_QUEUES_PER_GROUP];
+};
+```
+
+Submits up to `NVM_MAX_QUEUES_PER_GROUP` (SQ, CQ) pairs in one
+ioctl.  The kernel handles them as an **all-or-nothing batch**:
+either every pair successfully gets a Create I/O CQ + Create I/O SQ
+admin command through the controller, or none do (any pairs already
+created in the same call are unwound via Delete I/O SQ + Delete I/O
+CQ before the ioctl returns the error).
+
+Add operations are incremental: a group may receive multiple
+`NVM_ADD_USER_QUEUE` calls as long as
+`cur_queues + nr_pairs <= max_queues`.
+
+Pre-conditions enforced by the kernel:
+
+1. Controller must be bound (`ctrl.state == NVME_CTRL_LIVE`).  The
+   user QID pool is only populated once `nvme_probe` finishes
+   allocating kernel IOQs — `ADD_USER_QUEUE` before bind returns
+   `-ENODEV`.
+2. `group_id` must belong to the calling fd (cross-fd usage is
+   `-ENOENT`).
+3. `nr_pairs` ∈ `[1, NVM_MAX_QUEUES_PER_GROUP]`.
+4. `flags` / `reserved` MBZ.
+5. Each `(sq_vaddr, cq_vaddr)` must resolve (under the map's own
+   `page_size` mask) to exactly one map already registered against
+   this group.  The kernel rejects with `-ENOENT` otherwise; rings
+   registered against a different group (even on the same fd) are
+   not visible.
+6. `cur_queues + nr_pairs <= max_queues`.  Returns `-EBUSY` if the
+   group is full.
+7. No two pairs in one call may share the same sq_vaddr or cq_vaddr.
+   `-EINVAL`.
+
+Output: `out_pairs[i]` is populated for `i < nr_pairs` only;
+trailing entries are left zero.
+
+Doorbell offset arithmetic (consumed by user/GPU code):
+
+```
+sq_doorbell_offset = NVME_REG_DBS + ((qid * 2 + 0) << dstrd);
+cq_doorbell_offset = NVME_REG_DBS + ((qid * 2 + 1) << dstrd);
+```
+
+Userspace adds these offsets to the `bar0_gpu` / `bar0_cpu` pointer
+returned by `mmap()` and writes the new SQ tail / CQ head as a
+plain `uint32_t` store.
+
+#### 4.3.6 `NVM_RAW_ADMIN_CMD` — generic admin SQE forwarder
+
+```c
+struct nvm_ioctl_raw_admin {
+    uint8_t  sqe[64];        /* in:  one NVMe admin SQE              */
+    uint32_t result_dw0;     /* out: CQE DW0                         */
+    uint32_t result_dw1;     /* out: CQE DW1                         */
+    uint16_t nvme_status;    /* out: CQE DW3[31:17] (SC|SCT|...)     */
+    uint16_t reserved0;      /* MBZ                                  */
+    uint32_t reserved1[4];   /* MBZ; future expansion                */
+};
+```
+
+Used to drive per-queue **recycle** (Delete + Create I/O SQ/CQ
+without dropping the entire group), Abort, Get Log Page, vendor
+admin commands, and any other admin-only command that snvme does
+not need a dedicated ioctl for.  The kernel re-uses the CID by
+handing the SQE to `snvme_submit_sync_cmd`, which manages its own
+tag.
 
 ### 4.4 `mmap()` on `/dev/ssnvme<N>`
 
-`snvm_dev_fops.mmap = svm_mmap_registers` (`pci.c:3931`) maps **BAR0**
-of the bound NVMe controller into the calling process. Userspace then
-uses `cudaHostRegister(..., cudaHostRegisterIoMemory)` so CUDA kernels
-can read/write the doorbells directly. This is the source of the
-`mm_ptr` value flowing through `_nvm_ctrl_init()` and ultimately into
-each `QueuePair::sq.db` / `cq.db`.
+`snvm_dev_fops.mmap = svm_mmap_registers` (`pci.c:3931`) maps
+**BAR0** of the bound NVMe controller into the calling process.
+Userspace then uses `cudaHostRegister(..., cudaHostRegisterIoMemory)`
+so CUDA kernels can read/write the doorbells directly — see
+`cudaHostGetDevicePointer` for the GPU VA conversion.  Note that
+`cudaHostRegisterIoMemory` requires a recent CUDA runtime / driver
+(verified on H20 with CUDA 13.0).
+
+This is the source of the `mm_ptr` value flowing through
+`_nvm_ctrl_init()` and ultimately into each `QueuePair::sq.db` /
+`cq.db`.  In B3 the same `mm_ptr` is reused across many
+group-create / group-destroy cycles -- BAR0 mapping survives as
+long as the fd stays open, even though every doorbell offset
+inside it changes when queues are added or destroyed.
 
 ---
 
-## 5. Bring-up sequence (the canonical flow)
+## 5. Bring-up sequences (canonical flows)
 
-This is **the** flow that user-space must implement; it is also the
-flow your port must keep working. Reference implementation:
-`Controller::Controller(...)` ⇢ `nvm_controller_init()` ⇢
-`nvm_device_init()` in `backends/local/nvme/libnvm/`.
+There are **two** canonical flows your port must keep working:
+
+- **§5.1 B3 dynamic queue-group flow** (recommended; what every new
+  caller, every smoke test, and every NVMeService client uses).
+- **§5.2 B0 legacy pre-bind flow** (back-compat shim; older binaries
+  built against pre-B3 libnvm).
+
+### 5.1 B3 dynamic queue-group flow
+
+This is what `snvme_smoke_io.c` (CPU) and `snvme_smoke_gpu.cu` (GPU)
+exercise end-to-end, including a 4-round dynamic alloc/free
+verification loop in the GPU smoke.  Reference implementations:
+
+- CPU rings:  `backends/local/kernel_modules/test/snvme_smoke_io.c`
+- GPU rings:  `backends/local/kernel_modules/test/snvme_smoke_gpu.cu`
+- libnvm path: `backends/local/nvme/libnvm/src/...` (B3 wrapper)
+- daemon:     `backends/local/NVMeService/src/nvmeservice_state.cu`
 
 ```
-  USER (libnvm)                                      KERNEL (snvme.ko)
-  ------------                                       -----------------
-  open("/dev/snvm_control")          ──ioctl──▶
-  SNVM_CHRDEV_CREATE(BDF)                            allocate minor N
-                                     ◀──return──    /dev/ssnvme<N> exists
-                                                   addr.domain := N
+  USER (libnvm / smoke)                              KERNEL (snvme.ko)
+  ---------------------                              -----------------
 
-  open("/dev/ssnvme<N>")
-  mmap(fd, 0, BAR0_size)             ──mmap──▶
-                                     ◀──return──   BAR0 mapped (mm_ptr)
-  cudaHostRegister(mm_ptr, IoMemory)
+  --- Phase 0: chrdev factory ---
+  open("/dev/snvm_control")
+  SNVM_CHRDEV_CREATE(BDF)            ──ioctl──▶      allocate minor N
+                                     ◀──return──     /dev/ssnvme<N> exists
+                                                     addr.domain := N
+  open("/dev/ssnvme<N>")  ⇒ fd_dev
 
-  --- initialise queue rings in user space ---
-  for each IO queue i in 0..n_qps-1:
-      allocate SQ ring   (cudaMalloc or cudaHostAlloc)
-      allocate CQ ring   (cudaMalloc or cudaHostAlloc)
-      allocate PRP list  (cudaMalloc or cudaHostAlloc)
+  --- Phase 1: cap kernel queue share BEFORE bind ---
+  uint32_t cap = 36;
+  ioctl(fd_dev, NVM_SET_KERNEL_IOQ_CAP, &cap)
+                                     ──ioctl──▶     setup.cap_kernel_ioq := 36
 
-  NVM_SET_IOQ_NUM(n_sqs + n_cqs)     ──ioctl──▶    ctrl->ioq_num := N
+  --- Phase 2: bind (regular probe path with cap applied) ---
+  SNVM_DEVICE_BIND(BDF)              ──ioctl──▶     pci_register_driver(snvme)
+                                                    driver_attach(snvme_driver)
+                                                    s_nvme_probe():
+                                                      ↳ admin queue (kernel DMA)
+                                                      ↳ MSI-X negotiation
+                                                      ↳ ctrl_max_io_queues := grant
+                                                      ↳ if cap < grant:
+                                                          nr_io_queues = cap
+                                                      ↳ kernel block-mq tagset
+                                                      ↳ /dev/snvme<X>n<Y> appears
+                                                      ↳ NVME_CTRL_LIVE
+                                     ◀──return──    bind ok
+                                                    dmesg:
+                                                      "capping kernel-side IOQ
+                                                       count from G to C
+                                                       (ctrl_max=G, user pool
+                                                       gets [C+1..G])"
+                                                      "K/0/0/U default/read/poll
+                                                       /user queues"
 
-  for each ring buffer R:
+  --- Phase 3: query controller params ---
+  NVM_GET_DEV_INFO                   ──ioctl──▶
+                                     ◀──return──    fills q_depth, block_size,
+                                                    start_cq_idx (=cap+1),
+                                                    max_user_qid (=ctrl_max),
+                                                    bar0_size, sgl_supported,
+                                                    disk_name ("snvme0n1")
+
+  --- Phase 4: per-process resource container ---
+  NVM_CREATE_QUEUE_GROUP(&req)       ──ioctl──▶     allocate group_id,
+                                                    hang on fd_dev's owner list
+                                     ◀──return──    req.group_id, max_queues=16
+
+  --- Phase 5: BAR0 for doorbells ---
+  void *bar0 = mmap(fd_dev, NULL, bar0_size,
+                    PROT_READ|PROT_WRITE, MAP_SHARED, 0);
+  cudaHostRegister(bar0, bar0_size,
+                   cudaHostRegisterIoMemory)        (only if GPU is the consumer)
+  cudaHostGetDevicePointer(&bar0_gpu, bar0, 0)
+
+  --- Phase 6: allocate ring buffers + data buffers ---
+  for each (sq_buf[i], cq_buf[i]) in 0..nr_qp-1:
+      posix_memalign(..., 4096, q_depth*64)   /* host SQ */
+      posix_memalign(..., 4096, q_depth*16)   /* host CQ */
+      OR
+      cudaMalloc(&sq_buf[i], 65536)           /* GPU SQ, one GPU page */
+      cudaMalloc(&cq_buf[i], 65536)           /* GPU CQ, one GPU page */
+  posix_memalign / cudaMalloc → wbuf, rbuf, prp_list_w, prp_list_r
+
+  --- Phase 7: register every buffer against the group ---
+  for each buffer R:
+      NVM_MAP_HOST_MEMORY {              ──ioctl──▶  pin pages (4 KiB),
+        .vaddr_start = R, .n_pages = ceil(size/4K),                fill ioaddrs[],
+        .ioq_idx = -1, .is_cq = -1, .group_id = group_id }         link onto g->maps
+        OR
+      NVM_MAP_DEVICE_MEMORY {            ──ioctl──▶  nvidia_p2p_get_pages
+        ... .group_id = group_id }                                  (64 KiB pages),
+                                                                    fill ioaddrs[],
+                                                                    link onto g->maps
+
+  --- Phase 8: create user IO queues for those rings ---
+  struct nvm_ioctl_add_user_queue add_req = {
+      .group_id = group_id, .nr_pairs = N,
+      .pairs[i] = { .sq_vaddr = sq_buf[i], .cq_vaddr = cq_buf[i] },
+  };
+  NVM_ADD_USER_QUEUE(&add_req)         ──ioctl──▶   for each pair i:
+                                                      lookup map by vaddr
+                                                        (mask with map's
+                                                         own page_size)
+                                                      alloc qid from user pool
+                                                      Create I/O CQ via admin q
+                                                      Create I/O SQ via admin q
+                                                    (atomic batch)
+                                     ◀──return──   add_req.out_pairs[i]:
+                                                     qid, sq_db_offset,
+                                                     cq_db_offset
+
+  --- Phase 9: data plane (CPU or GPU) ---
+  /* user fills SQE in user-allocated SQ ring,
+   * writes (uint32_t*)(bar0 + sq_db_offset) := new_tail,
+   * polls cq[head].status phase bit,
+   * writes (uint32_t*)(bar0 + cq_db_offset) := new_head.
+   * GPU variant uses cudaHostGetDevicePointer(bar0_gpu)
+   * + __threadfence_system() between SQE write and doorbell.        */
+
+  --- Phase 10: dynamic teardown (anytime) ---
+  NVM_DESTROY_QUEUE_GROUP(&group_id)  ──ioctl──▶   for each (sq, cq) in g LIFO:
+                                                     Delete I/O SQ via admin q
+                                                     Delete I/O CQ via admin q
+                                                     free qid back to user pool
+                                                   for each map in g LIFO:
+                                                     unmap_and_release()
+                                                     /* host: unpin pages */
+                                                     /* GPU: nvidia_p2p_put_pages */
+                                                   dmesg:
+                                                     "destroy_qgroup id=N
+                                                      drained K user queue(s)"
+                                                     "destroy_qgroup id=N
+                                                      drained M map(s)"
+
+  /* The fd is still open; another CREATE_QUEUE_GROUP / MAP / ADD
+   * cycle can run immediately, drawing the same QIDs back from
+   * the pool.  The smoke `--rounds N` flag verifies this loop.   */
+
+  --- Phase 11: final tear-down ---
+  munmap(bar0, bar0_size)
+  cudaHostUnregister(bar0)
+  SNVM_DEVICE_UNBIND(BDF)             ──ioctl──▶   pci_unregister_driver(snvme)
+                                                   /dev/snvme<X>n<Y> disappears
+  close(fd_dev)
+  SNVM_CHRDEV_REMOVE(BDF)             ──ioctl──▶   release minor N
+  close(fd_ctl)
+```
+
+> **B3 invariants (your port MUST preserve these):**
+>
+> 1. `NVM_SET_KERNEL_IOQ_CAP` is **cap-only**.  It does not enable
+>    `use_sreg`, does not pre-register any queue, does not require a
+>    matching unmap.  Setting it to 0 (or never calling it) MUST
+>    leave the probe path byte-for-byte identical to upstream.
+>
+> 2. `NVM_ADD_USER_QUEUE` MUST resolve `(sq_vaddr, cq_vaddr)`
+>    against `g->maps` only — NOT against the global host_list /
+>    device_list / device_queue_list.  This is the per-fd isolation
+>    rule: one client's group cannot see another client's rings.
+>
+> 3. The vaddr lookup MUST mask each candidate vaddr with
+>    `cursor->page_size`, NOT a single global `PAGE_MASK`.  Host
+>    maps' page_size is `PAGE_SIZE` (4 KiB); device maps' page_size
+>    is `GPU_PAGE_SIZE` (64 KiB).  See §7.3.1 trap "vaddr-mask must
+>    be page-size adaptive".
+>
+> 4. `NVM_DESTROY_QUEUE_GROUP` MUST drain queues BEFORE maps
+>    (the controller still has live SQEs writing to map'd memory
+>    until Delete I/O SQ completes), and within each list MUST go
+>    LIFO (a Create-CQ-then-Create-SQ atomic batch unwinds as
+>    Delete-SQ-then-Delete-CQ).
+>
+> 5. fd close (`__fput()` → `snvm_dev_fops.release`) MUST cascade a
+>    destroy across every group on the closing fd, with the same
+>    Delete-I/O-{SQ,CQ}-then-unmap semantics as explicit destroy.
+>    This is what makes `kill -9 <smoke>` safe.
+
+### 5.2 B0 legacy pre-bind flow (for back-compat only)
+
+Older libnvm binaries pre-register every queue ring **before** bind
+and let probe consume them in one shot.  This still works but is
+not the recommended path; new code should use B3.
+
+```
+  open("/dev/snvm_control") ; SNVM_CHRDEV_CREATE ; open("/dev/ssnvme<N>")
+  mmap BAR0 ; cudaHostRegister
+  for each ring R:
       NVM_MAP_HOST_MEMORY(R, ioq_idx=i, is_cq=…)
-      or NVM_MAP_DEVICE_QUEUE_MEMORY ──ioctl──▶    pin pages, fill ioaddrs[],
-                                                  ctrl->ioq_map_num++
-
-  NVM_SET_SHARE_REG(1)               ──ioctl──▶    ctrl->use_sreg := 1
-
-  --- now ask the kernel to actually start the controller ---
-  SNVM_DEVICE_BIND(BDF)              ──ioctl──▶    pci_register_driver(snvme)
-                                                   force-attach BDF
-                                                   s_nvme_probe():
-                                                     ↳ admin queue (kernel DMA)
-                                                     ↳ IO queues use user pages
-                                                     ↳ /dev/snvme<X>n<Y> appears
-                                     ◀──return──   bind ok
-
-  NVM_GET_DEV_INFO                   ──ioctl──▶    fills nr_user_q,
-                                                   max_data_size, block_size,
-                                                   disk_name (e.g. "snvme0n1")
-                                     ◀──return──
-
-  mount /dev/snvme<X>n<Y> at <mount_path> (regular VFS)
+                                                   /* group_id == 0 → */
+                                                   /*   legacy lists  */
+  NVM_SET_IOQ_NUM(...)                             /* ctrl->ioq_num   */
+  NVM_SET_SHARE_REG(1)                             /* ctrl->use_sreg  */
+  SNVM_DEVICE_BIND(BDF)                            /* probe consumes  */
+                                                   /*   user rings if */
+                                                   /*   ioq_num ==    */
+                                                   /*   ioq_map_num   */
+                                                   /*   && use_sreg   */
+  NVM_GET_DEV_INFO ; mount disk ; ... IO ...
+  NVM_CLEAR_IOQ_NUM ; SNVM_DEVICE_UNBIND ; SNVM_CHRDEV_REMOVE
 ```
 
-Tear-down is the strict reverse; `nvm_ctrl_free()` runs:
+> **Invariant.** `SNVM_DEVICE_BIND` in B0 must only be issued
+> **after** `ioq_map_num == ioq_num` AND `use_sreg == 1`.  Failing
+> this, the kernel still binds, but `s_nvme_probe()` falls back to
+> the upstream `dma_alloc_coherent` path and the user's queue
+> rings are silently ignored — symptom is "everything looks fine
+> but the doorbells don't ring anything".
 
-```
-  NVM_CLEAR_IOQ_NUM        (resets ioq_map_num/cq_num)
-  SNVM_DEVICE_UNBIND       (s_nvme_remove → /dev/snvme<X>n<Y> disappears)
-  SNVM_CHRDEV_REMOVE       (releases minor)
-```
-
-> **Invariant.** `SNVM_DEVICE_BIND` must only be issued **after**
-> `ioq_map_num == ioq_num` AND `use_sreg == 1`. Failing this, the
-> kernel still binds, but `s_nvme_probe()` falls back to the upstream
-> `dma_alloc_coherent` path and the user's queue rings are silently
-> ignored — the symptom is "everything looks fine but the doorbells
-> don't ring anything".
+> **Coexistence rule.** B0 and B3 on the **same fd** are mutually
+> exclusive: `use_sreg=1` makes probe consume rings, leaving no
+> headroom for B3's `NVM_ADD_USER_QUEUE` to allocate from.  Use
+> `NVM_SET_KERNEL_IOQ_CAP` xor `NVM_SET_IOQ_NUM` per fd, never
+> both.
 
 ---
 
@@ -856,6 +1360,99 @@ Re-audit each one after §7.1.
   follow-up `default/read/poll/user queues` line MUST be the
   4-tuple variant (`135/0/0/0`), not 3-tuple.
 
+- **`NVM_ADD_USER_QUEUE` vaddr lookup MUST mask with each map's own
+  `page_size`, NOT a single global `PAGE_MASK`.** (`snvme/pci.c`
+  ADD_USER_QUEUE case.)  When B3 was first added the obvious-looking
+  loop body
+
+  ```c
+  list_for_each_entry(cursor, &g->maps, group_link) {
+      if (cursor->vaddr == (req->pairs[i].sq_vaddr & PAGE_MASK))
+          m_sq = cursor;
+      ...
+  }
+  ```
+
+  worked for CPU smoke (host pages = 4 KiB → `PAGE_MASK = ~0xFFF`)
+  but silently missed every GPU-allocated SQ/CQ ring registered via
+  `NVM_MAP_DEVICE_MEMORY` (GPU pages = 64 KiB; the lower 16 bits of
+  the GPU vaddr are not necessarily zero).  The lookup had to be
+  page-size adaptive — `map_userspace` stores `map->page_size =
+  PAGE_SIZE` while `map_device_memory` stores `map->page_size =
+  GPU_PAGE_SIZE (= 64 KiB)`, so the correct shape is:
+
+  ```c
+  list_for_each_entry(cursor, &g->maps, group_link) {
+      u64 mask = ~((cursor->page_size ?
+                    (u64)cursor->page_size : (u64)PAGE_SIZE) - 1);
+      if (cursor->vaddr == (req->pairs[i].sq_vaddr & mask))
+          m_sq = cursor;
+      if (cursor->vaddr == (req->pairs[i].cq_vaddr & mask))
+          m_cq = cursor;
+      if (m_sq && m_cq) break;
+  }
+  ```
+
+  Symptom of regression: GPU `snvme_smoke_gpu` fails at `NVM_ADD_USER_QUEUE`
+  with `errno=2 (No such file or directory)` and dmesg shows
+  `snvme: NVM_ADD_USER_QUEUE: lookup miss for sq_vaddr=0x...`; CPU
+  `snvme_smoke_io` continues to pass because it always allocates
+  4 KiB-aligned host buffers.  Re-audit rule: any uplift that
+  changes `struct map`, `map_userspace`, `map_device_memory`, or
+  the alignment guarantees of `nvidia_p2p_get_pages` MUST re-verify
+  this lookup.
+
+- **`NVM_SET_KERNEL_IOQ_CAP` clamp MUST be applied AFTER MSI-X
+  negotiation, not before.** (`snvme/pci.c` `s_nvme_setup_io_queues`.)
+  The tempting shape
+
+  ```c
+  /* WRONG */
+  unsigned int nr_io_queues = num_possible_cpus();
+  if (ctrl->setup.cap_kernel_ioq && cap < nr_io_queues)
+      nr_io_queues = ctrl->setup.cap_kernel_ioq;
+  result = nvme_set_queue_count(&dev->ctrl, &nr_io_queues);
+  ...
+  result = pci_alloc_irq_vectors_affinity(...);
+  ```
+
+  asks the controller for `cap` queues instead of
+  `num_possible_cpus()` and burns the rest of the controller's
+  MSI-X budget needlessly.  The correct order is:
+
+  ```c
+  /* RIGHT */
+  unsigned int nr_io_queues = num_possible_cpus();
+  result = nvme_set_queue_count(&dev->ctrl, &nr_io_queues);
+  ...
+  result = pci_alloc_irq_vectors_affinity(...);
+  dev->ctrl_max_io_queues = nr_io_queues;        /* what controller granted */
+  if (ctrl->setup.cap_kernel_ioq &&
+      ctrl->setup.cap_kernel_ioq < nr_io_queues)
+      nr_io_queues = ctrl->setup.cap_kernel_ioq; /* user pool gets the rest */
+  /* ... rest of setup_io_queues runs on the capped value ... */
+  ```
+
+  Two distinct things matter here: (1) the controller must be asked
+  for its full grant first (so `ctrl_max_io_queues` is the real
+  ceiling, not the cap), and (2) the cap must apply BEFORE
+  tagset allocation (so the kernel block-mq layer sizes its tagset
+  to the kernel-only share, not the controller grant).  Symptom of
+  regression: `NVM_GET_DEV_INFO` reports `start_cq_idx=cap+1,
+  max_user_qid=cap`, which makes the user QID pool empty and every
+  `NVM_ADD_USER_QUEUE` returns `-EAGAIN`.
+
+- **`NVM_GET_DEV_INFO` MUST populate `bar0_size`, `q_depth`,
+  `max_user_qid`, AND `sgl_supported` for B3 callers to function.**
+  (`snvme/pci.c` GET_DEV_INFO case.)  Adding fields at the tail of
+  `struct nvm_ioctl_dev` after a kernel uplift is harmless ABI-wise
+  (size grows; old userspace ignores the extra bytes), but the
+  kernel side MUST actually fill them or B3 callers segfault on
+  `mmap(BAR0_size=0)` and skip Tier 4 even on SGL-capable
+  controllers.  Verify with: after `NVM_GET_DEV_INFO`, every field
+  in §4.3.2 must be non-zero except `nr_user_q` (legacy, 0 in B3
+  flow).
+
 None of these are detected by the smoke tests as written — the
 smoke tests run the happy path. They are detected by (a) reading
 this list during the merge, and (b) the **reset + stress** workload
@@ -863,24 +1460,62 @@ described in §7.4.
 
 ### 7.4 Phase 4 — Verification (the mandatory gate)
 
-- [ ] `snvme_smoke` returns 0. *Necessary, not sufficient.*
-- [ ] `snvme_smoke_gpu` returns 0 (with `--bind` on a throw-away
-      NVMe). Exercises the `NVM_MAP_DEVICE_*` paths that Phase 3
-      lock-order bugs manifest in.
+The full verification gate runs four binaries.  All four must
+return 0 against a freshly-loaded `snvme.ko` on a throw-away NVMe
+SSD.  Kernel **MUST be rebuilt and `.ko` reloaded** between any
+porting change and these runs; the smoke binaries embed
+`_IOC_SIZE`-derived ioctl numbers and a stale .ko returns
+`-ENOTTY` on otherwise-valid requests.
+
+- [ ] **`snvme_smoke`** returns 0 (UAPI-only, no bind).  Exercises
+      `SNVM_CHRDEV_CREATE` / `_REMOVE`, `NVM_MAP_HOST_MEMORY`,
+      BAR0 mmap.  Necessary, not sufficient.
+- [ ] **`snvme_smoke_gpu`** (no `--bind`, no `--rounds`) returns 0
+      on a host with NVIDIA driver loaded.  Adds the
+      `NVM_MAP_DEVICE_MEMORY` and p2p path; failures here typically
+      live in `snvme/nvfs-p2p.c` or `nvfs-pci.{c,h}`, not the
+      core driver.
+- [ ] **`snvme_smoke_io`** (`--bind`, B3 flow, CPU rings) returns 0.
+      23 phases including PRP1 / PRP1+PRP2 / PRP_List / SGL (auto-
+      skipped on PRP-only controllers) + SQ-tail-wrap stress, with
+      byte-by-byte data verification on every IO.  This is what
+      catches the §7.3.1 vaddr-mask + cap-after-negotiation regressions
+      on the CPU side.
+- [ ] **`snvme_smoke_gpu --bind --rounds 4`** returns 0 on a host
+      with NVIDIA driver loaded.  Repeats the `snvme_smoke_io`
+      phase set 4 times with full GPU-resident rings and data
+      buffers, allocating + freeing the entire (queue group, GPU
+      pages, user IO queues) stack between rounds.  This is the
+      authoritative test for:
+        * dynamic alloc/free of GPU IO queues at runtime,
+        * `NVM_DESTROY_QUEUE_GROUP` cascade through Delete I/O
+          SQ/CQ + nvidia_p2p_put_pages,
+        * user QID pool reclamation across rounds (a successful
+          run shows the same QIDs being returned for round 0..N-1),
+        * GPU SQE submission via `__threadfence_system()` ordering,
+        * GPU CQE polling with phase-bit flips across SQ wraps.
+      Expected dmesg signature is **N pairs** of
+      `NVM_ADD_USER_QUEUE group=G created K queue(s) (qids ...)` +
+      `destroy_qgroup id=G drained K user queue(s)` +
+      `destroy_qgroup id=G drained M map(s)`, with no leak warnings.
 - [ ] **Reset test.** After `snvme_smoke_gpu --bind` succeeds,
       issue `nvme reset-controller` against the resulting
-      `/dev/snvmeXnY`. It must either complete cleanly or fail
-      loudly; **silent fallback to kernel-DMA queues is a bug**.
+      `/dev/snvmeXnY`.  It must either complete cleanly or fail
+      loudly; **silent fallback to kernel-DMA queues for new
+      `NVM_ADD_USER_QUEUE` calls is a bug** (the controller forgot
+      every Create-I/O-{SQ,CQ} after reset, so the user QID pool
+      MUST be torn down and rebuilt by the reset path).
 - [ ] **Co-existence test.** With both `nvme.ko` and `snvme.ko`
       loaded, bind one NVMe to each, mount both, `fio` them
-      simultaneously for ≥5 min. The two drivers use **disjoint**
+      simultaneously for ≥5 min.  The two drivers use **disjoint**
       block-device namespaces (in-tree → `/dev/nvme*`, SNVMe →
-      `/dev/snvme*`), so collisions on the device-node side should not
-      happen — verify that, and watch for kernel oopses or shared
-      workqueue/IRQ name clashes (`s_nvme_wq` vs `nvme_wq`, etc.).
+      `/dev/snvme*`), so collisions on the device-node side should
+      not happen — verify that, and watch for kernel oopses or
+      shared workqueue/IRQ name clashes (`s_nvme_wq` vs `nvme_wq`,
+      etc.).
 - [ ] **Stress test under reset.** Run the co-existence workload
       while looping `nvme reset-controller /dev/snvme0n1` every 30 s
-      for 10 iterations. If this stays clean, you've caught most
+      for 10 iterations.  If this stays clean, you've caught most
       Phase 3 semantic drift.
 
 ### 7.5 How far to go?
@@ -889,32 +1524,53 @@ For a **patch-level** uplift (5.15.x → 5.15.y): Phase 1 + 4 usually
 suffices. For a **minor-version** uplift (5.15 → 5.19): Phase 1–3
 are all required. For a **cross-LTS** uplift (5.15 → 6.6): assume
 Phase 2 and Phase 3 together are a week of work; do NOT skip the
-reset test. If upstream merged a large NVMe refactor (e.g. the
-`queue_limits` transition in 6.0), plan for a rewrite of the
-`use_sreg` branch from scratch, not a patch re-apply.
+reset test or `snvme_smoke_gpu --rounds`. If upstream merged a
+large NVMe refactor (e.g. the `queue_limits` transition in 6.0,
+or the `blk_mq_alloc_disk` switch in 5.14), plan for a rewrite of
+the §3.2 hook from scratch, not a patch re-apply.
 
 ---
 
 ## 8. Sanity test programs
 
-Two end-to-end tests, both self-contained (no Geminifs filesystem, no
-gRPC daemon). They live at:
+Four end-to-end tests, all self-contained (no Geminifs filesystem,
+no gRPC daemon).  They live at:
 
 ```
-backends/local/kernel_modules/test/snvme_smoke.c        # libc-only, no CUDA
-backends/local/kernel_modules/test/snvme_smoke_gpu.cu   # adds the GPU paths
-backends/local/kernel_modules/test/run_snvme_smoke.sh
-backends/local/kernel_modules/test/Makefile
+backends/local/kernel_modules/test/
+├── snvme_smoke.c          # libc-only UAPI smoke (no bind)
+├── snvme_smoke_gpu.cu     # B3 GPU end-to-end + dynamic alloc/free rounds
+├── snvme_smoke_io.c       # B3 CPU end-to-end (PRP1/2/List/SGL + wrap)
+├── snvme_smoke_qgroup.c   # B1 group create/destroy lifecycle
+├── snvme_smoke_recycle.c  # B4 recycle (Delete + Create on the same QID)
+├── snvme_smoke_addq.c     # B3 add/destroy lifecycle, host rings only
+├── run_snvme_smoke.sh     # wrapper that auto-detects --gpu / --bind args
+└── Makefile               # builds whichever binaries `nvcc` is available for
 ```
 
-| Binary             | Covers                                                                  | Built when     |
-| ------------------ | ----------------------------------------------------------------------- | -------------- |
-| `snvme_smoke`      | `NVM_MAP_HOST_MEMORY` path + chrdev create/remove + BAR0 mmap           | always         |
-| `snvme_smoke_gpu`  | adds `NVM_MAP_DEVICE_MEMORY` and `NVM_MAP_DEVICE_QUEUE_MEMORY` (cudaMalloc + nvidia_p2p_get_pages) | when `nvcc` is on `$PATH` |
+| Binary                  | Covers                                                                                               | Built when             |
+| ----------------------- | ---------------------------------------------------------------------------------------------------- | ---------------------- |
+| `snvme_smoke`           | `NVM_MAP_HOST_MEMORY` + chrdev create/remove + BAR0 mmap (no bind)                                   | always                 |
+| `snvme_smoke_qgroup`    | B1: `NVM_CREATE_QUEUE_GROUP` / `NVM_DESTROY_QUEUE_GROUP` lifecycle + fd-close cascade                 | always                 |
+| `snvme_smoke_addq`      | B3 happy path: `NVM_SET_KERNEL_IOQ_CAP` + bind + `NVM_ADD_USER_QUEUE` (host rings)                  | always                 |
+| `snvme_smoke_recycle`   | B4: `NVM_RAW_ADMIN_CMD` driving Delete + Create I/O SQ/CQ on the same QID                            | always                 |
+| `snvme_smoke_io`        | B3 CPU end-to-end: PRP1 / PRP1+PRP2 / PRP_List / SGL (auto-skip if SGLS=0) + SQ-tail-wrap; 23 phases, byte-by-byte verify on every IO | always |
+| `snvme_smoke_gpu`       | B3 GPU end-to-end: same Tier 1..4 + wrap as `_io`, but rings AND data buffers via `NVM_MAP_DEVICE_MEMORY`; supports `--rounds N` to repeat the entire alloc/free cycle | when `nvcc` is on `$PATH` |
 
-Both binaries support a default **UAPI-smoke** mode (does not trigger
-`s_nvme_probe()`, completely safe to run while another NVMe is mounted)
-and a `--bind` mode that additionally runs the destructive bring-up.
+`snvme_smoke_gpu` flags:
+
+```
+--gpu N        select CUDA device N (default 0)
+--rounds N     run N full alloc/free cycles back-to-back (default 4)
+<PCI_BDF>      target controller, e.g. 0000:08:00.0
+```
+
+A successful 4-round GPU smoke goes through **8 distinct queue
+groups, 8 distinct allocations of every GPU page (rings + data +
+PRP_List), and 8 distinct (Create + Delete) admin command pairs**
+on the controller; if anything in the alloc/free lifecycle is
+broken, the second round will fail (see the §7.3.1 trap entries
+for symptoms).
 
 Run via the wrapper:
 
@@ -924,22 +1580,30 @@ cd backends/local/kernel_modules/test
 # host (libc) UAPI smoke -- safe even on production hosts
 ./run_snvme_smoke.sh
 
-# GPU path UAPI smoke -- requires NVIDIA driver loaded, still safe
+# GPU UAPI smoke -- requires NVIDIA driver loaded, still safe (no bind)
 ./run_snvme_smoke.sh --gpu
 ./run_snvme_smoke.sh --gpu --gpu-id 1            # pick CUDA device 1
 
-# full bring-up (destructive: detaches in-tree nvme from the BDF)
-./run_snvme_smoke.sh --bind
-./run_snvme_smoke.sh --gpu --bind
+# full bring-up + B3 lifecycle on a throw-away NVMe (DESTRUCTIVE)
+./run_snvme_smoke.sh --bind                      # B3 host-ring path
+./run_snvme_smoke.sh --gpu --bind                # B3 GPU-ring path
+
+# direct invocation of the post-bind binaries (--bind is implicit):
+sudo ./snvme_smoke_io 0000:08:00.0
+sudo ./snvme_smoke_gpu --gpu 0 --rounds 4 0000:08:00.0
 ```
 
-Either binary exits with code `0` only when every UAPI step round-trips
-cleanly. Any failure prints `[FAIL] step=<N> ... errno=<E>` and stops.
+Every binary exits with code `0` only when every UAPI step round-
+trips cleanly.  Any failure prints `[FAIL] step=<N> ... errno=<E>`
+and stops; the dmesg block for the same time window is the
+authoritative source for the kernel-side cause.
 
-> **Tip.** During a kernel uplift, run `snvme_smoke` first. Only when
-> it passes should you try `snvme_smoke_gpu` — a failure there usually
-> means the NVIDIA driver / `nvfs_nvidia_p2p_*` glue is broken
-> (kernel-side issue lives in `snvme/nvfs-p2p.c`), not the SNVMe core.
+> **Tip.** During a kernel uplift, run `snvme_smoke` first.  Only
+> when it passes should you try `snvme_smoke_io` (CPU B3 path) and
+> only after THAT passes should you try `snvme_smoke_gpu` (GPU B3
+> path).  A failure in `snvme_smoke_gpu` after `_io` passes
+> typically means the NVIDIA driver / `nvfs_nvidia_p2p_*` glue is
+> broken, not the SNVMe core.
 
 ### 8.1 Build/run troubleshooting cheat sheet
 

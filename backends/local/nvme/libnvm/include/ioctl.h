@@ -123,7 +123,21 @@ struct nvm_ioctl_dev
                                     /* NVM_ADD_USER_QUEUE; user pool is          */
                                     /* [start_cq_idx, max_user_qid]              */
     uint32_t    max_queues_per_group;  /* echoes NVM_MAX_QUEUES_PER_GROUP */
-    uint32_t    reserved1[6];       /* MBZ; future extension */
+    /*
+     * Identify Controller SGLS dword (NVMe spec figure 247 byte 536-539).
+     *   bit 0: SGL data block descriptor supported
+     *   bit 1: keyed SGL data block descriptor supported
+     *   bit 2: SGL bit bucket descriptor supported
+     *   bit 16: SGL byte-aligned virtual contiguous data buffer
+     *   bit 17: SGL transport DMA byte-aligned data buffer
+     *   bit 19: SGL address field shall specify offset
+     *   bit 20: transport SGL data block descriptor supported
+     *   bit 21: keyed SGL data block, key>=0
+     * Use SGL only when (sgls & 0x3) != 0 (bit 0 OR 1 set).  0 means
+     * controller is PRP-only.
+     */
+    uint32_t    sgl_supported;      /* echo of dev->ctrl.sgls */
+    uint32_t    reserved1[5];       /* MBZ; future extension */
 };
 
 /*

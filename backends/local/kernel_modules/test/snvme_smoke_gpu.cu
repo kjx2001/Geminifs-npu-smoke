@@ -1,41 +1,73 @@
 /*
- * snvme_smoke_gpu.cu -- SNVMe GPU-path sanity test.
+ * snvme_smoke_gpu.cu -- GPU end-to-end NVMe IO smoke test on B3 user
+ * IO queues, with rings AND data buffers placed in GPU memory and
+ * SQE submission / CQE polling driven from CUDA kernels.
  *
- * Same idea as snvme_smoke.c (sibling file), but additionally exercises the
- * paths that depend on the proprietary NVIDIA driver:
+ * Mirrors snvme_smoke_io.c (same Phase numbering and Tier coverage)
+ * but with the GPU-resident counterparts:
  *
- *     NVM_MAP_DEVICE_QUEUE_MEMORY   <- nvfs_nvidia_p2p_get_pages, queue ring
- *     NVM_MAP_DEVICE_MEMORY         <- nvfs_nvidia_p2p_get_pages, data buffer
- *     NVM_UNMAP_DEVICE_QUEUE_MEMORY
- *     NVM_UNMAP_DEVICE_MEMORY
+ *   * SQ / CQ rings: cudaMalloc'd, registered with snvme via
+ *     NVM_MAP_DEVICE_MEMORY (group-scoped, B2 path).  64 KiB
+ *     GPU-page alignment is enforced by allocating one full GPU page
+ *     per ring -- the q_depth=64 SQ (4 KiB) and CQ (1 KiB) only fill
+ *     the first NVMe page of that 64 KiB allocation; the rest is
+ *     unused but kept registered so the controller's PRP1 lookup
+ *     stays trivial.
  *
- * It also (in --bind mode) drives s_nvme_probe() with GPU-resident SQ/CQ
- * rings so the in-kernel branch
+ *   * Data buffers: same.  The 4 KiB / 8 KiB / 16 KiB tier transfers
+ *     all share a single 64 KiB GPU allocation per direction, sliced
+ *     by NVMe-page (4 KiB) offset.  Lets the same allocation cover
+ *     PRP1, PRP1+PRP2, and PRP1+PRP_List without re-registration.
  *
- *     if (ctrl->ioq_num == ctrl->ioq_map_num && ctrl->use_sreg) ...
+ *   * Doorbells: BAR0 is mmap()d on the CPU side, then registered
+ *     with cudaHostRegister(IoMemory) and translated to a GPU device
+ *     pointer via cudaHostGetDevicePointer.  Submission CUDA kernels
+ *     ring the SQ doorbell via a volatile uint32_t store directly
+ *     from the GPU.
  *
- * is genuinely traversed using nvidia_p2p IO addresses, not host pages.
+ *   * SQE submission: built on the GPU using a one-thread CUDA kernel
+ *     that fills the next slot in the GPU-resident SQ ring, then
+ *     issues __threadfence_system() and rings the doorbell.
  *
- * Two test modes, mirroring snvme_smoke.c:
- *   default ("UAPI smoke")  -- exercise every UAPI entry that does not
- *                              trigger a probe. Safe.
- *   --bind  ("full bring-up") -- additionally bind, NVM_GET_DEV_INFO,
- *                              pread() the resulting block device,
- *                              unbind. DESTRUCTIVE.
+ *   * CQE polling: GPU kernel spins on the phase bit of the next CQ
+ *     slot, then writes the CQ head doorbell to release credit back
+ *     to the controller.  Polling is bounded by an iteration counter
+ *     (similar to the CPU smoke) so a misbehaving controller times
+ *     out instead of hanging.
+ *
+ *   * DYNAMIC ALLOC/FREE LOOP: the entire data-plane (queue group +
+ *     user IO queues + GPU rings + GPU data buffers + GPU PRP_Lists)
+ *     is built up and torn down N times in a row (--rounds N,
+ *     default 4).  Between rounds we cudaFree the GPU allocations
+ *     and call NVM_DESTROY_QUEUE_GROUP, which forces the controller
+ *     to execute Delete I/O SQ + Delete I/O CQ for every user queue
+ *     and snvme to release every NVM_MAP_DEVICE_MEMORY descriptor.
+ *     The next round re-creates everything from scratch.  This
+ *     verifies:
+ *       1. snvme's user QID pool is reclaimed correctly across
+ *          DESTROY_QUEUE_GROUP cycles (no leak after N rounds).
+ *       2. The controller accepts Create I/O SQ/CQ a second/third/...
+ *          time on the same controller bind without misbehaving.
+ *       3. GPU rings registered via NVM_MAP_DEVICE_MEMORY can be
+ *          allocated and released repeatedly without breaking the
+ *          NVIDIA p2p get_pages/put_pages refcount.
  *
  * Pre-conditions:
  *   - snvme-core.ko + snvme.ko loaded.
- *   - The proprietary NVIDIA driver is loaded AND nvfs_nvidia_p2p_init()
- *     succeeded at module-load time (the snvme module logs a fatal error
- *     and refuses to load otherwise -- see pci.c:nvme_init).
+ *   - The proprietary NVIDIA driver loaded AND nvfs_nvidia_p2p_init()
+ *     succeeded at module-load time (snvme refuses to load otherwise).
  *   - At least one GPU visible to CUDA.
- *   - You ran as root (PCI bind requires CAP_SYS_ADMIN).
+ *   - Root (PCI bind requires CAP_SYS_ADMIN).
  *
- * Build:        make           (the parent Makefile compiles this with nvcc)
- * Invoke:       sudo ./snvme_smoke_gpu [--bind] [--gpu N] <PCI_BDF>
+ * DESTRUCTIVE: writes to LBAs starting at TEST_LBA_BASE (default
+ * 2621440 = 10 GiB / 4 KiB).  Each round uses a non-overlapping LBA
+ * window so the verifier can run independently per round.
+ *
+ * Build:        make snvme_smoke_gpu
+ * Invoke:       sudo ./snvme_smoke_gpu [--gpu N] [--rounds N] <PCI_BDF>
  *
  * Exit codes:
- *   0  -- all steps passed; SNVMe GPU paths are healthy on this kernel.
+ *   0  -- all steps passed.
  *   1  -- usage error.
  *   2  -- a smoke step failed; see stderr for which one.
  */
@@ -50,6 +82,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
+#include <sched.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -58,13 +91,83 @@ extern "C" {
 #include "ioctl.h"
 }
 
+/* ------------------------------------------------------------------ */
+/* NVMe spec constants.  Same definitions as snvme_smoke_io.c.        */
+/* ------------------------------------------------------------------ */
+
+#define NVME_OPC_WRITE              0x01u
+#define NVME_OPC_READ               0x02u
+
+#define NVME_SQE_SIZE               64u
+#define NVME_CQE_SIZE               16u
+
+#define TEST_LBA_BASE               2621440ULL   /* 10 GiB / 4 KiB */
+#define TEST_NR_QUEUES              2u
+#define TEST_NR_IO_PER_QUEUE        16u
+#define TEST_DEFAULT_ROUNDS         4u
+/* Per-round LBA window = 64 Ki LBAs = 256 MiB of 4 KiB sectors.
+ * Rounds 0..N-1 occupy disjoint windows starting at TEST_LBA_BASE,
+ * so a per-round verify never collides with another round.        */
+#define TEST_LBA_PER_ROUND          0x10000ULL
+
 /* GPU page size used by the kernel module
- * (snvme/map.c:GPU_PAGE_SHIFT=16). Buffers passed to NVM_MAP_DEVICE_*
- * MUST be aligned to and sized in multiples of this. */
-static constexpr size_t GPU_PAGE_SIZE = 1ULL << 16;   /* 64 KiB */
+ * (snvme/map.c:GPU_PAGE_SHIFT=16).  Buffers passed to NVM_MAP_DEVICE_*
+ * MUST be aligned to and sized in multiples of this.                  */
+static constexpr size_t GPU_PAGE_SIZE = 1ULL << 16;     /* 64 KiB */
+
+/* CDW0 PSDT bits (CDW0[15:14], appearing as bits [7:6] of the SQE
+ * 'flags' byte).  PRP=00b, SGL data block=01b.                       */
+#define NVME_FLAG_PSDT_PRP          (0u << 6)
+#define NVME_FLAG_PSDT_SGL          (1u << 6)
+
+/* SGL Data Block descriptor type|subtype byte.                        */
+#define NVME_SGL_DESC_BYTE15        0x00u
+
+/* Per-byte pattern is a function of (round, qid, ioidx) so a
+ * cross-round byte mismatch is unambiguous in the failure log.    */
+#define WRITE_PATTERN_BYTE(round, qid, ioidx) \
+    ((uint8_t)(0xA5 ^ ((round) & 0xff) ^ ((qid) & 0xff) ^ ((ioidx) & 0xff)))
 
 /* ------------------------------------------------------------------ */
-/* Logging helpers                                                    */
+/* Submission queue entry (Common Format, NVMe 1.4 figure 105).       */
+/* Defined identically on host and device so __device__ kernels can   */
+/* fill the same struct that the controller will then read via DMA.   */
+/* ------------------------------------------------------------------ */
+
+struct nvme_sqe {
+    uint8_t  opcode;
+    uint8_t  flags;
+    uint16_t cid;
+    uint32_t nsid;
+    uint64_t rsvd_2_3;
+    uint64_t metadata;
+    uint64_t prp1;
+    uint64_t prp2;
+    uint32_t cdw10;
+    uint32_t cdw11;
+    uint32_t cdw12;
+    uint32_t cdw13;
+    uint32_t cdw14;
+    uint32_t cdw15;
+} __attribute__((packed));
+
+static_assert(sizeof(nvme_sqe) == NVME_SQE_SIZE,
+              "nvme_sqe must be exactly 64 bytes");
+
+struct nvme_cqe {
+    uint32_t result;
+    uint32_t rsvd;
+    uint16_t sq_head;
+    uint16_t sq_id;
+    uint16_t cid;
+    uint16_t status;
+} __attribute__((packed));
+
+static_assert(sizeof(nvme_cqe) == NVME_CQE_SIZE,
+              "nvme_cqe must be exactly 16 bytes");
+
+/* ------------------------------------------------------------------ */
+/* Logging helpers (host-side).                                       */
 /* ------------------------------------------------------------------ */
 
 static int g_step = 0;
@@ -72,17 +175,7 @@ static int g_step = 0;
 static void step_ok(const char* fmt, ...) {
     va_list ap;
     g_step++;
-    fprintf(stderr, "[ OK ] step=%-2d ", g_step);
-    va_start(ap, fmt);
-    vfprintf(stderr, fmt, ap);
-    va_end(ap);
-    fputc('\n', stderr);
-}
-
-static void step_warn(const char* fmt, ...) {
-    va_list ap;
-    g_step++;
-    fprintf(stderr, "[WARN] step=%-2d ", g_step);
+    fprintf(stderr, "[ OK ] step=%-3d ", g_step);
     va_start(ap, fmt);
     vfprintf(stderr, fmt, ap);
     va_end(ap);
@@ -92,7 +185,7 @@ static void step_warn(const char* fmt, ...) {
 static void __attribute__((noreturn)) step_fail(int err, const char* fmt, ...) {
     va_list ap;
     g_step++;
-    fprintf(stderr, "[FAIL] step=%-2d ", g_step);
+    fprintf(stderr, "[FAIL] step=%-3d ", g_step);
     va_start(ap, fmt);
     vfprintf(stderr, fmt, ap);
     va_end(ap);
@@ -100,24 +193,13 @@ static void __attribute__((noreturn)) step_fail(int err, const char* fmt, ...) {
     exit(2);
 }
 
-#define CUDA_OK(call, what)                                                  \
-    do {                                                                     \
-        cudaError_t _e = (call);                                             \
-        if (_e != cudaSuccess) {                                             \
-            step_fail(0, "%s -> %s", (what), cudaGetErrorString(_e));        \
-        }                                                                    \
+#define CUDA_OK(call_)                                                  \
+    do {                                                                \
+        cudaError_t _e = (call_);                                       \
+        if (_e != cudaSuccess) {                                        \
+            step_fail(0, "CUDA: %s -> %s", #call_, cudaGetErrorString(_e)); \
+        }                                                               \
     } while (0)
-
-/* ------------------------------------------------------------------ */
-/* MMIO helper, BDF parser, ioctl wrapper -- copy of snvme_smoke.c     */
-/* ------------------------------------------------------------------ */
-
-#define NVME_REG_CAP    0x0000
-
-static uint64_t mmio_read64(volatile void* base, size_t off) {
-    volatile uint64_t* p = (volatile uint64_t*)((volatile char*)base + off);
-    return *p;
-}
 
 static int parse_bdf(const char* s, struct pci_device_addr* out) {
     return sscanf(s, "%x:%x:%x.%x",
@@ -134,90 +216,756 @@ static int do_ioctl(int fd, unsigned long req, void* arg, const char* what) {
     return r;
 }
 
-/* ------------------------------------------------------------------ */
-/* Round size up to GPU_PAGE_SIZE and round pointer down               */
-/* ------------------------------------------------------------------ */
-
-static inline size_t round_up_gpu(size_t n) {
-    return (n + GPU_PAGE_SIZE - 1) & ~(GPU_PAGE_SIZE - 1);
-}
-
-/* cudaMalloc returns 256-byte-aligned pointers in practice. The kernel side
- * (nvfs_nvidia_p2p_get_pages) requires GPU-page (64 KiB) alignment, so we
- * over-allocate and align the *user-facing* pointer ourselves. We keep the
- * raw allocation around so we can free it. */
-struct GpuBlock {
-    void*  raw;          /* cudaMalloc'ed, kept for cudaFree */
-    void*  aligned;      /* GPU_PAGE_SIZE-aligned slice handed to the kernel */
-    size_t aligned_size; /* multiple of GPU_PAGE_SIZE */
-    size_t n_pages;      /* aligned_size / GPU_PAGE_SIZE */
-};
-
-static GpuBlock alloc_gpu_block(size_t bytes, const char* label) {
-    GpuBlock b{};
-    b.aligned_size = round_up_gpu(bytes);
-    b.n_pages = b.aligned_size / GPU_PAGE_SIZE;
-
-    /* Over-alloc by one GPU page so we can align inside. */
-    size_t alloc = b.aligned_size + GPU_PAGE_SIZE;
-    CUDA_OK(cudaMalloc(&b.raw, alloc), "cudaMalloc(GpuBlock)");
-    uintptr_t base = reinterpret_cast<uintptr_t>(b.raw);
-    uintptr_t aligned = (base + GPU_PAGE_SIZE - 1) & ~(GPU_PAGE_SIZE - 1);
-    b.aligned = reinterpret_cast<void*>(aligned);
-
-    /* Zero the slice we hand to the kernel so the queue rings start clean. */
-    CUDA_OK(cudaMemset(b.aligned, 0, b.aligned_size), "cudaMemset(GpuBlock)");
-
-    fprintf(stderr, "      %s: raw=%p aligned=%p size=%zu (%zu GPU pages)\n",
-            label, b.raw, b.aligned, b.aligned_size, b.n_pages);
-    return b;
-}
-
-static void free_gpu_block(GpuBlock& b) {
-    if (b.raw) {
-        cudaFree(b.raw);
-        b.raw = nullptr;
-    }
-}
-
-/* ------------------------------------------------------------------ */
-/* CLI                                                                */
-/* ------------------------------------------------------------------ */
-
 static void usage(const char* prog) {
     fprintf(stderr,
-        "Usage: %s [--bind] [--gpu N] <PCI_BDF>\n"
-        "  e.g.: %s 0000:50:00.0                # UAPI + GPU map paths (safe)\n"
-        "        %s --gpu 1 0000:50:00.0        # use cuda device 1\n"
-        "        %s --bind 0000:50:00.0         # full bring-up (destructive)\n",
-        prog, prog, prog, prog);
+        "Usage: %s [--gpu N] [--rounds N] <PCI_BDF>\n"
+        "  e.g.: %s --gpu 0 --rounds 4 0000:08:00.0\n"
+        "\n"
+        "BINDS the target controller and writes/reads via GPU-resident\n"
+        "rings + GPU-resident data buffers, repeated --rounds times\n"
+        "(default %u) with full queue/buffer alloc-free between rounds.\n"
+        "DESTRUCTIVE.\n",
+        prog, prog, TEST_DEFAULT_ROUNDS);
 }
 
-int main(int argc, char** argv) {
-    int do_bind = 0;
-    int cuda_device = 0;
-    const char* bdf_str = nullptr;
+static void format_status(uint16_t status, char* buf, size_t cap) {
+    uint16_t s   = status >> 1;
+    uint8_t  sc  = s & 0xff;
+    uint8_t  sct = (s >> 8) & 0x7;
+    snprintf(buf, cap, "0x%04x (SC=0x%02x SCT=0x%x)", status, sc, sct);
+}
 
-    for (int i = 1; i < argc; ++i) {
-        if (strcmp(argv[i], "--bind") == 0) {
-            do_bind = 1;
-        } else if (strcmp(argv[i], "--gpu") == 0 && i + 1 < argc) {
-            cuda_device = atoi(argv[++i]);
-        } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-            usage(argv[0]);
-            return 0;
-        } else if (bdf_str == nullptr) {
-            bdf_str = argv[i];
-        } else {
-            fprintf(stderr, "Unknown argument: %s\n", argv[i]);
-            usage(argv[0]);
-            return 1;
+/* ------------------------------------------------------------------ */
+/* Per-queue runtime state.  Lives partly in host memory (the         */
+/* `*_dev` device pointers) and partly on the GPU (the rings + the    */
+/* doorbell GPU VA).  Submission/poll kernels receive a copy of the   */
+/* whole struct by value.                                             */
+/* ------------------------------------------------------------------ */
+
+struct test_queue_dev {
+    nvme_sqe*           sq;             /* device VA */
+    nvme_cqe*           cq;             /* device VA */
+    volatile uint32_t*  sq_db;          /* GPU VA into BAR0 */
+    volatile uint32_t*  cq_db;          /* GPU VA into BAR0 */
+    uint16_t            q_depth;
+    uint16_t            qid;
+};
+
+/* ------------------------------------------------------------------ */
+/* GPU kernels for SQE submit / CQE poll / data fill / data verify.   */
+/* ------------------------------------------------------------------ */
+
+__global__ void k_submit_rw(test_queue_dev qd,
+                            uint16_t* sq_tail_io,
+                            uint16_t cid,
+                            uint8_t opcode,
+                            uint8_t flags,
+                            uint32_t nsid,
+                            uint64_t dptr0,
+                            uint64_t dptr1,
+                            uint64_t slba,
+                            uint16_t nlb_zero_based) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+
+    uint16_t tail = *sq_tail_io;
+    nvme_sqe* slot = &qd.sq[tail];
+
+    /* Zero the 64-byte slot through the same path the controller will
+     * see (memset_d-style writes via CUDA's volatile semantics).     */
+    uint8_t* p = (uint8_t*)slot;
+    #pragma unroll
+    for (int i = 0; i < (int)sizeof(nvme_sqe); i++) p[i] = 0;
+
+    slot->opcode = opcode;
+    slot->flags  = flags;
+    slot->cid    = cid;
+    slot->nsid   = nsid;
+    slot->prp1   = dptr0;
+    slot->prp2   = dptr1;
+    slot->cdw10  = (uint32_t)(slba & 0xffffffffu);
+    slot->cdw11  = (uint32_t)(slba >> 32);
+    slot->cdw12  = (uint32_t)(nlb_zero_based & 0xffffu);
+
+    /* Make the SQE bytes visible to the device DMA engine BEFORE we
+     * ring the doorbell.                                            */
+    __threadfence_system();
+
+    uint16_t new_tail = (uint16_t)((tail + 1) % qd.q_depth);
+    *qd.sq_db = new_tail;
+    *sq_tail_io = new_tail;
+}
+
+/* Polls until either a CQE with the expected phase bit appears, or
+ * `max_iters` iterations elapse without one (reported as
+ * timed_out=1).  On success, copies the CQE out, advances cq_head,
+ * flips cq_phase if the head wraps, and rings the CQ head doorbell.   */
+__global__ void k_poll_one(test_queue_dev qd,
+                           uint16_t* cq_head_io,
+                           uint8_t* cq_phase_io,
+                           nvme_cqe* out_cqe,
+                           int* timed_out,
+                           uint64_t max_iters) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+
+    uint16_t head = *cq_head_io;
+    uint8_t  expected = *cq_phase_io;
+
+    uint64_t i = 0;
+    for (;;) {
+        volatile nvme_cqe* slot = &qd.cq[head];
+        uint16_t status = slot->status;
+        uint8_t phase = status & 0x1u;
+        if (phase == expected) {
+            /* Copy out the full 16-byte CQE before advancing. */
+            nvme_cqe tmp;
+            tmp.result  = slot->result;
+            tmp.rsvd    = slot->rsvd;
+            tmp.sq_head = slot->sq_head;
+            tmp.sq_id   = slot->sq_id;
+            tmp.cid     = slot->cid;
+            tmp.status  = status;
+            *out_cqe = tmp;
+
+            uint16_t new_head = (uint16_t)((head + 1) % qd.q_depth);
+            if (new_head == 0) expected ^= 1u;
+
+            __threadfence_system();
+            *qd.cq_db = new_head;
+            *cq_head_io  = new_head;
+            *cq_phase_io = expected;
+            *timed_out = 0;
+            return;
+        }
+        if (++i >= max_iters) {
+            *timed_out = 1;
+            return;
         }
     }
-    if (bdf_str == nullptr) {
-        usage(argv[0]);
-        return 1;
+}
+
+/* ------------------------------------------------------------------ */
+/* GPU helpers: fill a buffer with a per-byte pattern; verify ditto.  */
+/* ------------------------------------------------------------------ */
+
+__global__ void k_fill_pattern(uint8_t* buf, size_t bytes, uint8_t pat) {
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= bytes) return;
+    buf[idx] = pat ^ (uint8_t)(idx >> 12);
+}
+
+__global__ void k_verify_pattern(const uint8_t* buf, size_t bytes,
+                                 uint8_t pat, int* mismatch_idx) {
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= bytes) return;
+    uint8_t expect = pat ^ (uint8_t)(idx >> 12);
+    if (buf[idx] != expect) {
+        /* Race-tolerant: any thread can win, the first idx written
+         * wins for the host-side error report.  We just need ANY
+         * mismatching byte.                                          */
+        atomicCAS(mismatch_idx, -1, (int)idx);
     }
+}
+
+/* ------------------------------------------------------------------ */
+/* Host helpers around the submit / poll kernels.                     */
+/* ------------------------------------------------------------------ */
+
+struct queue_state {
+    test_queue_dev      dev;
+    /* host-side counters; we keep these in unified-pinned memory so
+     * the kernels can read+update them in place without a roundtrip */
+    uint16_t*           sq_tail_um;     /* unified memory, 1 element */
+    uint16_t*           cq_head_um;     /* ditto */
+    uint8_t*            cq_phase_um;    /* ditto */
+    nvme_cqe*           out_cqe_um;     /* unified memory, 1 element */
+    int*                timed_out_um;   /* ditto */
+    uint16_t            next_cid;
+};
+
+static int submit_and_poll(queue_state& qs,
+                           uint8_t opcode, uint8_t flags,
+                           uint32_t nsid,
+                           uint64_t dptr0, uint64_t dptr1,
+                           uint64_t slba, uint16_t nlb_zero_based,
+                           nvme_cqe* cqe_out, uint16_t* cid_out) {
+    uint16_t cid = qs.next_cid++;
+    if (cid_out) *cid_out = cid;
+
+    k_submit_rw<<<1, 1>>>(qs.dev, qs.sq_tail_um, cid,
+                          opcode, flags, nsid, dptr0, dptr1,
+                          slba, nlb_zero_based);
+    cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        fprintf(stderr, "k_submit_rw launch: %s\n", cudaGetErrorString(e));
+        return -EIO;
+    }
+    /* No explicit cudaDeviceSynchronize between submit and poll --
+     * poll kernel will wait for SQE visibility implicitly through
+     * the doorbell write.  But submit has to actually complete
+     * before poll runs; the default stream serialises this. */
+
+    /* 5-second budget at ~10 ns per iteration -> 5e8 iters; be
+     * generous since GPU is slower than CPU on a tight spin loop. */
+    constexpr uint64_t MAX_ITERS = 50000000ULL;
+    k_poll_one<<<1, 1>>>(qs.dev, qs.cq_head_um, qs.cq_phase_um,
+                         qs.out_cqe_um, qs.timed_out_um, MAX_ITERS);
+    e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        fprintf(stderr, "k_poll_one launch: %s\n", cudaGetErrorString(e));
+        return -EIO;
+    }
+    CUDA_OK(cudaDeviceSynchronize());
+
+    if (*qs.timed_out_um) return -ETIMEDOUT;
+    *cqe_out = *qs.out_cqe_um;
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* All per-round resources, allocated/freed by run_one_round().       */
+/* ------------------------------------------------------------------ */
+
+struct round_resources {
+    uint32_t    group_id;
+    void*       sq_dev[TEST_NR_QUEUES];
+    void*       cq_dev[TEST_NR_QUEUES];
+    void*       wbuf_dev;
+    void*       rbuf_dev;
+    void*       prp_list_w_dev;
+    void*       prp_list_r_dev;
+    uint64_t    sq_ioaddr[TEST_NR_QUEUES];
+    uint64_t    cq_ioaddr[TEST_NR_QUEUES];
+    uint64_t    wbuf_ioaddr;
+    uint64_t    rbuf_ioaddr;
+    uint64_t    prp_list_w_ioaddr;
+    uint64_t    prp_list_r_ioaddr;
+    queue_state QS[TEST_NR_QUEUES];
+};
+
+/* Run all the per-round IO phases (formerly Phase 2..10).  Caller
+ * supplies a fresh `rr` (zeroed) and the controller-wide state
+ * (fd_dev, info, bar0_gpu).  Returns 0 on success, exits on error.
+ *
+ * `round_idx` selects a unique LBA window plus the per-byte
+ * pattern stripe.  `kernel_ioq_cap` drives NVM_SET_KERNEL_IOQ_CAP
+ * for the very first round only -- subsequent rounds reuse the cap
+ * already negotiated with the controller (snvme keeps it across
+ * group destroy/create cycles within a single bind).             */
+static void run_one_round(int fd_dev,
+                          const struct nvm_ioctl_dev& info,
+                          void* bar0_gpu,
+                          unsigned round_idx,
+                          round_resources& rr) {
+    /* ============================================================== */
+    /* Phase R.1: queue group.                                        */
+    /* ============================================================== */
+    {
+        struct nvm_ioctl_queue_group req;
+        memset(&req, 0, sizeof(req));
+        if (do_ioctl(fd_dev, NVM_CREATE_QUEUE_GROUP, &req,
+                     "NVM_CREATE_QUEUE_GROUP") < 0)
+            step_fail(errno, "round=%u NVM_CREATE_QUEUE_GROUP", round_idx);
+        rr.group_id = req.group_id;
+        step_ok("round=%u NVM_CREATE_QUEUE_GROUP -> group_id=%u max_queues=%u",
+                round_idx, rr.group_id, req.max_queues);
+    }
+
+    /* ============================================================== */
+    /* Phase R.2: cudaMalloc rings + data buffers (GPU-resident).    */
+    /* ============================================================== */
+    for (unsigned i = 0; i < TEST_NR_QUEUES; i++) {
+        CUDA_OK(cudaMalloc(&rr.sq_dev[i], GPU_PAGE_SIZE));
+        CUDA_OK(cudaMalloc(&rr.cq_dev[i], GPU_PAGE_SIZE));
+        CUDA_OK(cudaMemset(rr.sq_dev[i], 0, GPU_PAGE_SIZE));
+        CUDA_OK(cudaMemset(rr.cq_dev[i], 0, GPU_PAGE_SIZE));
+    }
+    CUDA_OK(cudaMalloc(&rr.wbuf_dev, GPU_PAGE_SIZE));
+    CUDA_OK(cudaMalloc(&rr.rbuf_dev, GPU_PAGE_SIZE));
+    CUDA_OK(cudaMemset(rr.wbuf_dev, 0, GPU_PAGE_SIZE));
+    CUDA_OK(cudaMemset(rr.rbuf_dev, 0, GPU_PAGE_SIZE));
+    CUDA_OK(cudaMalloc(&rr.prp_list_w_dev, GPU_PAGE_SIZE));
+    CUDA_OK(cudaMalloc(&rr.prp_list_r_dev, GPU_PAGE_SIZE));
+    CUDA_OK(cudaMemset(rr.prp_list_w_dev, 0, GPU_PAGE_SIZE));
+    CUDA_OK(cudaMemset(rr.prp_list_r_dev, 0, GPU_PAGE_SIZE));
+    step_ok("round=%u cudaMalloc'd %u SQ + %u CQ + 2 data + 2 PRP_List "
+            "GPU pages (%zu B each)",
+            round_idx, TEST_NR_QUEUES, TEST_NR_QUEUES, GPU_PAGE_SIZE);
+
+    /* ============================================================== */
+    /* Phase R.3: NVM_MAP_DEVICE_MEMORY for every GPU page.          */
+    /* ============================================================== */
+    auto map_dev = [&](void* gpu_va, unsigned long n_pages,
+                       uint64_t* ioaddrs_out, const char* what) {
+        struct nvm_ioctl_map req;
+        memset(&req, 0, sizeof(req));
+        req.vaddr_start = (uint64_t)(uintptr_t)gpu_va;
+        req.n_pages     = n_pages;
+        req.ioaddrs     = ioaddrs_out;
+        req.ioq_idx     = -1;
+        req.is_cq       = -1;
+        req.group_id    = rr.group_id;
+        if (do_ioctl(fd_dev, NVM_MAP_DEVICE_MEMORY, &req, what) < 0)
+            step_fail(errno, "round=%u %s gpu_va=%p", round_idx, what, gpu_va);
+    };
+
+    for (unsigned i = 0; i < TEST_NR_QUEUES; i++) {
+        map_dev(rr.sq_dev[i], 1, &rr.sq_ioaddr[i],
+                "NVM_MAP_DEVICE_MEMORY(SQ)");
+        map_dev(rr.cq_dev[i], 1, &rr.cq_ioaddr[i],
+                "NVM_MAP_DEVICE_MEMORY(CQ)");
+    }
+    map_dev(rr.wbuf_dev, 1, &rr.wbuf_ioaddr,
+            "NVM_MAP_DEVICE_MEMORY(wbuf)");
+    map_dev(rr.rbuf_dev, 1, &rr.rbuf_ioaddr,
+            "NVM_MAP_DEVICE_MEMORY(rbuf)");
+    map_dev(rr.prp_list_w_dev, 1, &rr.prp_list_w_ioaddr,
+            "NVM_MAP_DEVICE_MEMORY(prpl_w)");
+    map_dev(rr.prp_list_r_dev, 1, &rr.prp_list_r_ioaddr,
+            "NVM_MAP_DEVICE_MEMORY(prpl_r)");
+    step_ok("round=%u NVM_MAP_DEVICE_MEMORY x %u rings + 2 data + 2 "
+            "PRP_List (wbuf_ioaddr=0x%llx)",
+            round_idx, TEST_NR_QUEUES * 2,
+            (unsigned long long)rr.wbuf_ioaddr);
+
+    /* ============================================================== */
+    /* Phase R.4: NVM_ADD_USER_QUEUE.                                */
+    /* ============================================================== */
+    struct nvm_ioctl_add_user_queue add_req;
+    memset(&add_req, 0, sizeof(add_req));
+    add_req.group_id = rr.group_id;
+    add_req.nr_pairs = TEST_NR_QUEUES;
+    for (unsigned i = 0; i < TEST_NR_QUEUES; i++) {
+        add_req.pairs[i].sq_vaddr = (uint64_t)(uintptr_t)rr.sq_dev[i];
+        add_req.pairs[i].cq_vaddr = (uint64_t)(uintptr_t)rr.cq_dev[i];
+    }
+    if (do_ioctl(fd_dev, NVM_ADD_USER_QUEUE, &add_req,
+                 "NVM_ADD_USER_QUEUE") < 0)
+        step_fail(errno, "round=%u NVM_ADD_USER_QUEUE", round_idx);
+    step_ok("round=%u NVM_ADD_USER_QUEUE created %u user queue(s)",
+            round_idx, TEST_NR_QUEUES);
+    for (unsigned i = 0; i < TEST_NR_QUEUES; i++)
+        fprintf(stderr, "                pair[%u] qid=%u sq_db=0x%x cq_db=0x%x\n",
+                i, add_req.out_pairs[i].qid,
+                add_req.out_pairs[i].sq_doorbell_offset,
+                add_req.out_pairs[i].cq_doorbell_offset);
+
+    /* Build per-queue test_queue_dev structs (consumed by kernels).  */
+    for (unsigned i = 0; i < TEST_NR_QUEUES; i++) {
+        rr.QS[i].dev.sq      = (nvme_sqe*)rr.sq_dev[i];
+        rr.QS[i].dev.cq      = (nvme_cqe*)rr.cq_dev[i];
+        rr.QS[i].dev.q_depth = info.q_depth;
+        rr.QS[i].dev.qid     = (uint16_t)add_req.out_pairs[i].qid;
+        rr.QS[i].dev.sq_db   = (volatile uint32_t*)
+            ((char*)bar0_gpu + add_req.out_pairs[i].sq_doorbell_offset);
+        rr.QS[i].dev.cq_db   = (volatile uint32_t*)
+            ((char*)bar0_gpu + add_req.out_pairs[i].cq_doorbell_offset);
+
+        /* Unified-memory counters / out-cqe so submit/poll kernels can
+         * read+update them in place; avoids host<->device copies on
+         * every IO.                                                  */
+        CUDA_OK(cudaMallocManaged(&rr.QS[i].sq_tail_um,   sizeof(uint16_t)));
+        CUDA_OK(cudaMallocManaged(&rr.QS[i].cq_head_um,   sizeof(uint16_t)));
+        CUDA_OK(cudaMallocManaged(&rr.QS[i].cq_phase_um,  sizeof(uint8_t)));
+        CUDA_OK(cudaMallocManaged(&rr.QS[i].out_cqe_um,   sizeof(nvme_cqe)));
+        CUDA_OK(cudaMallocManaged(&rr.QS[i].timed_out_um, sizeof(int)));
+        *rr.QS[i].sq_tail_um   = 0;
+        *rr.QS[i].cq_head_um   = 0;
+        *rr.QS[i].cq_phase_um  = 1;
+        *rr.QS[i].timed_out_um = 0;
+        rr.QS[i].next_cid = 0;
+    }
+    step_ok("round=%u per-queue device state ready (%u queues)",
+            round_idx, TEST_NR_QUEUES);
+
+    /* The data buffer's dma_addr lets us derive 4-KiB-grained NVMe
+     * page addresses for tier 2/3.                                  */
+    auto wpage = [&](unsigned npage) -> uint64_t {
+        return rr.wbuf_ioaddr + (uint64_t)npage * info.block_size;
+    };
+    auto rpage = [&](unsigned npage) -> uint64_t {
+        return rr.rbuf_ioaddr + (uint64_t)npage * info.block_size;
+    };
+
+    /* This round's LBA window starts here.  Each tier carves out a
+     * disjoint sub-range.                                            */
+    const uint64_t round_lba_base =
+        TEST_LBA_BASE + (uint64_t)round_idx * TEST_LBA_PER_ROUND;
+
+    /* ============================================================== */
+    /* Phase R.5: Tier 1 -- 4 KiB IO, PRP1 only.                     */
+    /* ============================================================== */
+    {
+        const uint32_t nsid = 1;
+        const uint16_t nlb_zero_based = 0;
+        const size_t io_bytes = info.block_size;
+        queue_state& qw = rr.QS[0];
+        queue_state& qr = rr.QS[1];
+        char status_buf[64];
+
+        int* mismatch_um = nullptr;
+        CUDA_OK(cudaMallocManaged(&mismatch_um, sizeof(int)));
+
+        for (unsigned i = 0; i < TEST_NR_IO_PER_QUEUE; i++) {
+            uint64_t lba = round_lba_base + i;
+            uint8_t pat  = WRITE_PATTERN_BYTE(round_idx, qw.dev.qid, i);
+
+            int threads = 256, blocks = (int)((io_bytes + threads - 1) / threads);
+            k_fill_pattern<<<blocks, threads>>>((uint8_t*)rr.wbuf_dev,
+                                                io_bytes, pat);
+            CUDA_OK(cudaDeviceSynchronize());
+
+            nvme_cqe cqe;
+            uint16_t cid_w;
+            int rc = submit_and_poll(qw, NVME_OPC_WRITE, NVME_FLAG_PSDT_PRP,
+                                     nsid, wpage(0), 0,
+                                     lba, nlb_zero_based, &cqe, &cid_w);
+            if (rc) step_fail(-rc, "round=%u T1 Write %u (qid=%u, lba=%" PRIu64 ")",
+                              round_idx, i, qw.dev.qid, lba);
+            if ((cqe.status >> 1) != 0) {
+                format_status(cqe.status, status_buf, sizeof(status_buf));
+                step_fail(0, "round=%u T1 Write %u: NVMe %s",
+                          round_idx, i, status_buf);
+            }
+            if (cqe.cid != cid_w)
+                step_fail(0, "round=%u T1 Write %u CQE.cid=%u expected %u",
+                          round_idx, i, cqe.cid, cid_w);
+
+            CUDA_OK(cudaMemset(rr.rbuf_dev, 0, io_bytes));
+            uint16_t cid_r;
+            rc = submit_and_poll(qr, NVME_OPC_READ, NVME_FLAG_PSDT_PRP,
+                                 nsid, rpage(0), 0,
+                                 lba, nlb_zero_based, &cqe, &cid_r);
+            if (rc) step_fail(-rc, "round=%u T1 Read %u", round_idx, i);
+            if ((cqe.status >> 1) != 0) {
+                format_status(cqe.status, status_buf, sizeof(status_buf));
+                step_fail(0, "round=%u T1 Read %u: NVMe %s",
+                          round_idx, i, status_buf);
+            }
+
+            *mismatch_um = -1;
+            k_verify_pattern<<<blocks, threads>>>((const uint8_t*)rr.rbuf_dev,
+                                                   io_bytes, pat, mismatch_um);
+            CUDA_OK(cudaDeviceSynchronize());
+            if (*mismatch_um != -1)
+                step_fail(0, "round=%u T1 IO %u: byte %d mismatch (lba=%"
+                          PRIu64 ")", round_idx, i, *mismatch_um, lba);
+        }
+        cudaFree(mismatch_um);
+        step_ok("round=%u Tier 1 (PRP1, 4 KiB) write+verify x %u IOs, "
+                "LBA [%" PRIu64 "..%" PRIu64 "]",
+                round_idx, TEST_NR_IO_PER_QUEUE,
+                round_lba_base,
+                round_lba_base + TEST_NR_IO_PER_QUEUE - 1);
+    }
+
+    /* ============================================================== */
+    /* Phase R.6: Tier 2 -- 8 KiB IO, PRP1 + PRP2.                   */
+    /* ============================================================== */
+    {
+        const uint32_t nsid = 1;
+        const uint16_t nlb_zero_based = 1;          /* 2 LBAs per IO */
+        const size_t   io_bytes = 2 * info.block_size;
+        const uint64_t LBA_BASE = round_lba_base + 100;
+        const unsigned NR = 8;
+        queue_state& qw = rr.QS[0];
+        queue_state& qr = rr.QS[1];
+        char status_buf[64];
+
+        int* mismatch_um = nullptr;
+        CUDA_OK(cudaMallocManaged(&mismatch_um, sizeof(int)));
+
+        for (unsigned i = 0; i < NR; i++) {
+            uint64_t lba = LBA_BASE + 2u * i;
+            uint8_t  pat = WRITE_PATTERN_BYTE(round_idx, qw.dev.qid, 100 + i);
+
+            int threads = 256, blocks = (int)((io_bytes + threads - 1) / threads);
+            k_fill_pattern<<<blocks, threads>>>((uint8_t*)rr.wbuf_dev,
+                                                io_bytes, pat);
+            CUDA_OK(cudaDeviceSynchronize());
+
+            nvme_cqe cqe;
+            uint16_t cid_w;
+            int rc = submit_and_poll(qw, NVME_OPC_WRITE, NVME_FLAG_PSDT_PRP,
+                                     nsid, wpage(0), wpage(1),
+                                     lba, nlb_zero_based, &cqe, &cid_w);
+            if (rc) step_fail(-rc, "round=%u T2 Write %u", round_idx, i);
+            if ((cqe.status >> 1) != 0) {
+                format_status(cqe.status, status_buf, sizeof(status_buf));
+                step_fail(0, "round=%u T2 Write %u: NVMe %s",
+                          round_idx, i, status_buf);
+            }
+
+            CUDA_OK(cudaMemset(rr.rbuf_dev, 0, io_bytes));
+            uint16_t cid_r;
+            rc = submit_and_poll(qr, NVME_OPC_READ, NVME_FLAG_PSDT_PRP,
+                                 nsid, rpage(0), rpage(1),
+                                 lba, nlb_zero_based, &cqe, &cid_r);
+            if (rc) step_fail(-rc, "round=%u T2 Read %u", round_idx, i);
+            if ((cqe.status >> 1) != 0) {
+                format_status(cqe.status, status_buf, sizeof(status_buf));
+                step_fail(0, "round=%u T2 Read %u: NVMe %s",
+                          round_idx, i, status_buf);
+            }
+
+            *mismatch_um = -1;
+            k_verify_pattern<<<blocks, threads>>>((const uint8_t*)rr.rbuf_dev,
+                                                   io_bytes, pat, mismatch_um);
+            CUDA_OK(cudaDeviceSynchronize());
+            if (*mismatch_um != -1)
+                step_fail(0, "round=%u T2 IO %u: byte %d mismatch",
+                          round_idx, i, *mismatch_um);
+        }
+        cudaFree(mismatch_um);
+        step_ok("round=%u Tier 2 (PRP1+PRP2, 8 KiB) x %u IOs, LBA [%"
+                PRIu64 "..%" PRIu64 "]",
+                round_idx, NR, LBA_BASE, LBA_BASE + 2u * (NR - 1) + 1);
+    }
+
+    /* ============================================================== */
+    /* Phase R.7: Tier 3 -- 16 KiB IO, PRP1 + PRP_List.              */
+    /* ============================================================== */
+    {
+        const uint32_t nsid = 1;
+        const uint16_t nlb_zero_based = 3;          /* 4 LBAs per IO */
+        const size_t   io_bytes = 4 * info.block_size;
+        const uint64_t LBA_BASE = round_lba_base + 200;
+        const unsigned NR = 4;
+        queue_state& qw = rr.QS[0];
+        queue_state& qr = rr.QS[1];
+        char status_buf[64];
+
+        uint64_t prp_w_entries[3] = { wpage(1), wpage(2), wpage(3) };
+        uint64_t prp_r_entries[3] = { rpage(1), rpage(2), rpage(3) };
+        CUDA_OK(cudaMemcpy(rr.prp_list_w_dev, prp_w_entries,
+                           sizeof(prp_w_entries), cudaMemcpyHostToDevice));
+        CUDA_OK(cudaMemcpy(rr.prp_list_r_dev, prp_r_entries,
+                           sizeof(prp_r_entries), cudaMemcpyHostToDevice));
+
+        int* mismatch_um = nullptr;
+        CUDA_OK(cudaMallocManaged(&mismatch_um, sizeof(int)));
+
+        for (unsigned i = 0; i < NR; i++) {
+            uint64_t lba = LBA_BASE + 4u * i;
+            uint8_t  pat = WRITE_PATTERN_BYTE(round_idx, qw.dev.qid, 200 + i);
+
+            int threads = 256, blocks = (int)((io_bytes + threads - 1) / threads);
+            k_fill_pattern<<<blocks, threads>>>((uint8_t*)rr.wbuf_dev,
+                                                io_bytes, pat);
+            CUDA_OK(cudaDeviceSynchronize());
+
+            nvme_cqe cqe;
+            uint16_t cid_w;
+            int rc = submit_and_poll(qw, NVME_OPC_WRITE, NVME_FLAG_PSDT_PRP,
+                                     nsid, wpage(0), rr.prp_list_w_ioaddr,
+                                     lba, nlb_zero_based, &cqe, &cid_w);
+            if (rc) step_fail(-rc, "round=%u T3 Write %u", round_idx, i);
+            if ((cqe.status >> 1) != 0) {
+                format_status(cqe.status, status_buf, sizeof(status_buf));
+                step_fail(0, "round=%u T3 Write %u: NVMe %s",
+                          round_idx, i, status_buf);
+            }
+
+            CUDA_OK(cudaMemset(rr.rbuf_dev, 0, io_bytes));
+            uint16_t cid_r;
+            rc = submit_and_poll(qr, NVME_OPC_READ, NVME_FLAG_PSDT_PRP,
+                                 nsid, rpage(0), rr.prp_list_r_ioaddr,
+                                 lba, nlb_zero_based, &cqe, &cid_r);
+            if (rc) step_fail(-rc, "round=%u T3 Read %u", round_idx, i);
+            if ((cqe.status >> 1) != 0) {
+                format_status(cqe.status, status_buf, sizeof(status_buf));
+                step_fail(0, "round=%u T3 Read %u: NVMe %s",
+                          round_idx, i, status_buf);
+            }
+
+            *mismatch_um = -1;
+            k_verify_pattern<<<blocks, threads>>>((const uint8_t*)rr.rbuf_dev,
+                                                   io_bytes, pat, mismatch_um);
+            CUDA_OK(cudaDeviceSynchronize());
+            if (*mismatch_um != -1)
+                step_fail(0, "round=%u T3 IO %u: byte %d mismatch",
+                          round_idx, i, *mismatch_um);
+        }
+        cudaFree(mismatch_um);
+        step_ok("round=%u Tier 3 (PRP1+PRP_List, 16 KiB) x %u IOs, LBA [%"
+                PRIu64 "..%" PRIu64 "]",
+                round_idx, NR, LBA_BASE, LBA_BASE + 4u * (NR - 1) + 3);
+    }
+
+    /* ============================================================== */
+    /* Phase R.8: Tier 4 -- SGL Data Block (skipped on PRP-only).    */
+    /* ============================================================== */
+    if ((info.sgl_supported & 0x3) == 0) {
+        step_ok("round=%u Tier 4: SKIP -- controller advertises SGLS=0x%x "
+                "(PRP-only)", round_idx, info.sgl_supported);
+    } else {
+        const uint32_t nsid = 1;
+        const uint16_t nlb_zero_based = 0;
+        const size_t io_bytes = info.block_size;
+        const uint64_t LBA_BASE = round_lba_base + 300;
+        const unsigned NR = 8;
+        queue_state& qw = rr.QS[0];
+        queue_state& qr = rr.QS[1];
+        char status_buf[64];
+
+        int* mismatch_um = nullptr;
+        CUDA_OK(cudaMallocManaged(&mismatch_um, sizeof(int)));
+
+        for (unsigned i = 0; i < NR; i++) {
+            uint64_t lba = LBA_BASE + i;
+            uint8_t pat = WRITE_PATTERN_BYTE(round_idx, qw.dev.qid, 300 + i);
+
+            int threads = 256, blocks = (int)((io_bytes + threads - 1) / threads);
+            k_fill_pattern<<<blocks, threads>>>((uint8_t*)rr.wbuf_dev,
+                                                io_bytes, pat);
+            CUDA_OK(cudaDeviceSynchronize());
+
+            uint64_t sgl_addr_w = wpage(0);
+            uint64_t sgl_meta_w = ((uint64_t)io_bytes & 0xffffffffu)
+                                | ((uint64_t)NVME_SGL_DESC_BYTE15 << 56);
+            nvme_cqe cqe;
+            uint16_t cid_w;
+            int rc = submit_and_poll(qw, NVME_OPC_WRITE, NVME_FLAG_PSDT_SGL,
+                                     nsid, sgl_addr_w, sgl_meta_w,
+                                     lba, nlb_zero_based, &cqe, &cid_w);
+            if (rc) step_fail(-rc, "round=%u T4 Write %u", round_idx, i);
+            if ((cqe.status >> 1) != 0) {
+                format_status(cqe.status, status_buf, sizeof(status_buf));
+                step_fail(0, "round=%u T4 Write %u: NVMe %s",
+                          round_idx, i, status_buf);
+            }
+
+            CUDA_OK(cudaMemset(rr.rbuf_dev, 0, io_bytes));
+            uint64_t sgl_addr_r = rpage(0);
+            uint64_t sgl_meta_r = ((uint64_t)io_bytes & 0xffffffffu)
+                                | ((uint64_t)NVME_SGL_DESC_BYTE15 << 56);
+            uint16_t cid_r;
+            rc = submit_and_poll(qr, NVME_OPC_READ, NVME_FLAG_PSDT_SGL,
+                                 nsid, sgl_addr_r, sgl_meta_r,
+                                 lba, nlb_zero_based, &cqe, &cid_r);
+            if (rc) step_fail(-rc, "round=%u T4 Read %u", round_idx, i);
+            if ((cqe.status >> 1) != 0) {
+                format_status(cqe.status, status_buf, sizeof(status_buf));
+                step_fail(0, "round=%u T4 Read %u: NVMe %s",
+                          round_idx, i, status_buf);
+            }
+
+            *mismatch_um = -1;
+            k_verify_pattern<<<blocks, threads>>>((const uint8_t*)rr.rbuf_dev,
+                                                   io_bytes, pat, mismatch_um);
+            CUDA_OK(cudaDeviceSynchronize());
+            if (*mismatch_um != -1)
+                step_fail(0, "round=%u T4 IO %u: byte %d mismatch",
+                          round_idx, i, *mismatch_um);
+        }
+        cudaFree(mismatch_um);
+        step_ok("round=%u Tier 4 (SGL Data Block, 4 KiB) x %u IOs, LBA [%"
+                PRIu64 "..%" PRIu64 "]",
+                round_idx, NR, LBA_BASE, LBA_BASE + NR - 1);
+    }
+
+    /* ============================================================== */
+    /* Phase R.9: SQ-tail-wrap stress on QS[0].                      */
+    /* ============================================================== */
+    {
+        const uint32_t nsid = 1;
+        const uint16_t nlb_zero_based = 0;
+        queue_state& qw = rr.QS[0];
+        char status_buf[64];
+
+        unsigned cnt = info.q_depth + 8u;
+        const uint64_t LBA_BASE = round_lba_base + 1000;
+        const size_t io_bytes = info.block_size;
+
+        for (unsigned i = 0; i < cnt; i++) {
+            uint64_t lba = LBA_BASE + i;
+            uint8_t pat = WRITE_PATTERN_BYTE(round_idx, qw.dev.qid, 1000u + i);
+
+            int threads = 256, blocks = (int)((io_bytes + threads - 1) / threads);
+            k_fill_pattern<<<blocks, threads>>>((uint8_t*)rr.wbuf_dev,
+                                                io_bytes, pat);
+            CUDA_OK(cudaDeviceSynchronize());
+
+            nvme_cqe cqe;
+            uint16_t cid;
+            int rc = submit_and_poll(qw, NVME_OPC_WRITE, NVME_FLAG_PSDT_PRP,
+                                     nsid, wpage(0), 0,
+                                     lba, nlb_zero_based, &cqe, &cid);
+            if (rc) step_fail(-rc, "round=%u wrap Write %u", round_idx, i);
+            if ((cqe.status >> 1) != 0) {
+                format_status(cqe.status, status_buf, sizeof(status_buf));
+                step_fail(0, "round=%u wrap Write %u: NVMe %s",
+                          round_idx, i, status_buf);
+            }
+        }
+        step_ok("round=%u SQ-tail-wrap: %u sequential Writes (sq wrapped "
+                "past q_depth=%u, cq_phase flipped)",
+                round_idx, cnt, info.q_depth);
+    }
+}
+
+/* Tear down everything that run_one_round() built up.  Order
+ * matters: free per-queue UM bookkeeping FIRST (those allocs live
+ * outside the snvme map list), then DESTROY_QUEUE_GROUP (cascades
+ * through user queues + every NVM_MAP_DEVICE_MEMORY descriptor),
+ * then cudaFree the GPU pages (snvme has already called nvidia
+ * p2p put_pages on them).                                         */
+static void teardown_one_round(int fd_dev, unsigned round_idx,
+                               round_resources& rr) {
+    for (unsigned i = 0; i < TEST_NR_QUEUES; i++) {
+        cudaFree(rr.QS[i].sq_tail_um);
+        cudaFree(rr.QS[i].cq_head_um);
+        cudaFree(rr.QS[i].cq_phase_um);
+        cudaFree(rr.QS[i].out_cqe_um);
+        cudaFree(rr.QS[i].timed_out_um);
+    }
+
+    {
+        uint32_t gid = rr.group_id;
+        if (do_ioctl(fd_dev, NVM_DESTROY_QUEUE_GROUP, &gid,
+                     "NVM_DESTROY_QUEUE_GROUP") < 0)
+            step_fail(errno, "round=%u NVM_DESTROY_QUEUE_GROUP", round_idx);
+        step_ok("round=%u NVM_DESTROY_QUEUE_GROUP id=%u cascades through %u "
+                "user queue(s) + %u GPU maps",
+                round_idx, rr.group_id, TEST_NR_QUEUES,
+                TEST_NR_QUEUES * 2 + 4);
+    }
+
+    for (unsigned i = 0; i < TEST_NR_QUEUES; i++) {
+        cudaFree(rr.sq_dev[i]);
+        cudaFree(rr.cq_dev[i]);
+    }
+    cudaFree(rr.wbuf_dev);
+    cudaFree(rr.rbuf_dev);
+    cudaFree(rr.prp_list_w_dev);
+    cudaFree(rr.prp_list_r_dev);
+
+    memset(&rr, 0, sizeof(rr));
+}
+
+/* ------------------------------------------------------------------ */
+/* main                                                               */
+/* ------------------------------------------------------------------ */
+
+int main(int argc, char** argv) {
+    int cuda_device = 0;
+    unsigned nr_rounds = TEST_DEFAULT_ROUNDS;
+    const char* bdf_str = nullptr;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--gpu") == 0 && i + 1 < argc) {
+            cuda_device = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--rounds") == 0 && i + 1 < argc) {
+            int n = atoi(argv[++i]);
+            if (n <= 0) { usage(argv[0]); return 1; }
+            nr_rounds = (unsigned)n;
+        } else if (strcmp(argv[i], "--help") == 0) {
+            usage(argv[0]); return 0;
+        } else if (argv[i][0] != '-' && !bdf_str) {
+            bdf_str = argv[i];
+        } else {
+            usage(argv[0]); return 1;
+        }
+    }
+    if (!bdf_str) { usage(argv[0]); return 1; }
 
     struct pci_device_addr orig_bdf;
     if (parse_bdf(bdf_str, &orig_bdf) != 0) {
@@ -225,288 +973,140 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    /* ------------------------------------------------------------------ */
-    /* [G0] Pick the CUDA device. We do this first so a missing/disabled  */
-    /*      GPU fails fast before we touch SNVMe state.                    */
-    /* ------------------------------------------------------------------ */
-    int n_devs = 0;
-    CUDA_OK(cudaGetDeviceCount(&n_devs), "cudaGetDeviceCount");
-    if (cuda_device < 0 || cuda_device >= n_devs)
-        step_fail(0, "cuda device %d out of range (have %d)", cuda_device, n_devs);
-    CUDA_OK(cudaSetDevice(cuda_device), "cudaSetDevice");
-    cudaDeviceProp prop;
-    CUDA_OK(cudaGetDeviceProperties(&prop, cuda_device), "cudaGetDeviceProperties");
-    step_ok("cuda device=%d name='%s' pci=%04x:%02x:%02x.0",
-            cuda_device, prop.name, prop.pciDomainID, prop.pciBusID, prop.pciDeviceID);
+    long psz = sysconf(_SC_PAGESIZE);
+    if (psz <= 0) step_fail(errno, "sysconf(_SC_PAGESIZE)");
 
-    /* ------------------------------------------------------------------ */
-    /* [1] /dev/snvm_control                                              */
-    /* ------------------------------------------------------------------ */
+    CUDA_OK(cudaSetDevice(cuda_device));
+    int n_dev = 0;
+    CUDA_OK(cudaGetDeviceCount(&n_dev));
+    if (cuda_device >= n_dev)
+        step_fail(0, "--gpu %d invalid (CUDA sees %d devices)",
+                  cuda_device, n_dev);
+    cudaDeviceProp prop;
+    CUDA_OK(cudaGetDeviceProperties(&prop, cuda_device));
+    step_ok("CUDA setDevice(%d) name='%s' cap=%d.%d  rounds=%u",
+            cuda_device, prop.name, prop.major, prop.minor, nr_rounds);
+
+    /* ============================================================== */
+    /* Phase 0: control plane + chrdev (lives across all rounds).    */
+    /* ============================================================== */
     int fd_ctl = open("/dev/snvm_control", O_RDWR | O_NONBLOCK);
-    if (fd_ctl < 0)
-        step_fail(errno, "open(/dev/snvm_control)");
+    if (fd_ctl < 0) step_fail(errno, "open(/dev/snvm_control)");
     step_ok("open(/dev/snvm_control) fd=%d", fd_ctl);
 
-    /* ------------------------------------------------------------------ */
-    /* [2] SNVM_CHRDEV_CREATE                                             */
-    /* ------------------------------------------------------------------ */
     struct pci_device_addr addr = orig_bdf;
     if (do_ioctl(fd_ctl, SNVM_CHRDEV_CREATE, &addr, "SNVM_CHRDEV_CREATE") < 0)
         step_fail(errno, "SNVM_CHRDEV_CREATE %s", bdf_str);
     int minor_n = addr.domain;
     step_ok("SNVM_CHRDEV_CREATE minor=%d", minor_n);
 
-    /* ------------------------------------------------------------------ */
-    /* [3] /dev/ssnvme<N>                                                 */
-    /* ------------------------------------------------------------------ */
     char dev_path[64];
     snprintf(dev_path, sizeof(dev_path), "/dev/ssnvme%d", minor_n);
-    int fd_dev = open(dev_path, O_RDWR | O_NONBLOCK);
-    if (fd_dev < 0)
-        step_fail(errno, "open(%s)", dev_path);
+    int fd_dev = open(dev_path, O_RDWR);
+    if (fd_dev < 0) step_fail(errno, "open(%s)", dev_path);
     step_ok("open(%s) fd=%d", dev_path, fd_dev);
 
-    /* ------------------------------------------------------------------ */
-    /* [4] mmap BAR0 (no MAP_LOCKED -- BAR0 is device memory, not pageable) */
-    /* ------------------------------------------------------------------ */
-    const size_t bar0_size = 8192;
-    void* bar0 = mmap(nullptr, bar0_size, PROT_READ | PROT_WRITE,
-                      MAP_SHARED, fd_dev, 0);
-    if (bar0 == MAP_FAILED)
-        step_fail(errno, "mmap(BAR0, %zu)", bar0_size);
-    step_ok("mmap(BAR0, %zu) -> %p", bar0_size, bar0);
-
-    /* ------------------------------------------------------------------ */
-    /* [5] CAP sanity (see snvme_smoke.c for the all-zeros/all-ones logic) */
-    /* ------------------------------------------------------------------ */
-    uint64_t cap = mmio_read64(bar0, NVME_REG_CAP);
-    if (cap == 0)
-        step_fail(EIO, "BAR0 CAP reads as all-zeros "
-                       "(BAR not mapped or pci_resource_start==0)");
-    if (cap == (uint64_t)-1)
-        step_warn("BAR0 CAP=0xFFF..FF -- controller powered down; UAPI-smoke continues");
-    else
-        step_ok("BAR0 CAP=0x%016" PRIx64, cap);
-
-    /* ------------------------------------------------------------------ */
-    /* [6] NVM_SET_IOQ_NUM(2), on_host=0                                   */
-    /*                                                                    */
-    /* Geminifs ABI: NVM_SET_IOQ_NUM now takes struct nvm_ioctl_setup.    */
-    /*   .ioq_num = 2            total user IOQ count (1 SQ + 1 CQ).      */
-    /*   .flags                  ON_HOST flag CLEARED -> queue ring pages */
-    /*                           live on the GPU (we map them via         */
-    /*                           NVM_MAP_DEVICE_QUEUE_MEMORY below).      */
-    /*   .cap_kernel_ioq = 32                                             */
-    /*       Hard-coded smoke-test default; same rationale as             */
-    /*       snvme_smoke.c [6]: small enough to reliably exercise the     */
-    /*       "queue squeeze" Case A2 branch in s_nvme_setup_io_queues,    */
-    /*       large enough to keep blk-mq responsive on a 192-vCPU host.   */
-    /*       Production callers read this from sys_config.yaml's          */
-    /*       queue_setup section via the NVMeService daemon.              */
-    /* ------------------------------------------------------------------ */
+    /* ============================================================== */
+    /* Phase 1: kernel ioq cap + bind + dev info.  These are bind-   */
+    /* level state, NOT per-round; they persist across rounds.       */
+    /* ============================================================== */
     {
-        struct nvm_ioctl_setup setup;
-        memset(&setup, 0, sizeof(setup));
-        setup.ioq_num        = 2;
-        setup.flags          = 0;       /* ON_HOST clear -> device_queue_list */
-        setup.cap_kernel_ioq = 32;
-        if (do_ioctl(fd_dev, NVM_SET_IOQ_NUM, &setup, "NVM_SET_IOQ_NUM") < 0)
-            step_fail(errno, "NVM_SET_IOQ_NUM nr=2");
+        uint32_t cap = 36;
+        if (ioctl(fd_dev, NVM_SET_KERNEL_IOQ_CAP, &cap) != 0)
+            step_fail(errno, "NVM_SET_KERNEL_IOQ_CAP cap=%u failed", cap);
+        step_ok("NVM_SET_KERNEL_IOQ_CAP cap=%u", cap);
     }
-    step_ok("NVM_SET_IOQ_NUM nr=2 on_host=0 cap_kernel=32");
-
-    /* ------------------------------------------------------------------ */
-    /* [7] cudaMalloc + NVM_MAP_DEVICE_QUEUE_MEMORY (SQ ring)              */
-    /*                                                                    */
-    /* GPU queue rings are mapped through nvidia_p2p_get_pages. Both the  */
-    /* base address AND the size must be GPU_PAGE_SIZE-aligned, so we     */
-    /* use alloc_gpu_block() to over-allocate and align inside.            */
-    /* ------------------------------------------------------------------ */
-    GpuBlock sq = alloc_gpu_block(GPU_PAGE_SIZE, "SQ ring");
-    uint64_t sq_ioaddrs[16] = {0};   /* room for up to 16 GPU pages */
-    if (sq.n_pages > 16)
-        step_fail(0, "SQ ring needs %zu GPU pages, bump sq_ioaddrs[]", sq.n_pages);
     {
-        struct nvm_ioctl_map req;
-        memset(&req, 0, sizeof(req));
-        req.vaddr_start = (uint64_t)(uintptr_t)sq.aligned;
-        req.n_pages     = sq.n_pages;
-        req.ioaddrs     = sq_ioaddrs;
-        req.ioq_idx     = 0;        /* user queue #0 (0-based, see snvme_smoke.c [7]) */
-        req.is_cq       = 0;        /* SQ */
-        if (do_ioctl(fd_dev, NVM_MAP_DEVICE_QUEUE_MEMORY, &req,
-                     "NVM_MAP_DEVICE_QUEUE_MEMORY(SQ)") < 0)
-            step_fail(errno,
-                "NVM_MAP_DEVICE_QUEUE_MEMORY SQ -- nvidia_p2p_get_pages failed; "
-                "is the NVIDIA driver loaded and the GPU's BAR1 P2P-capable?");
-    }
-    step_ok("NVM_MAP_DEVICE_QUEUE_MEMORY(SQ) gpu_va=%p ioaddr[0]=0x%016" PRIx64,
-            sq.aligned, sq_ioaddrs[0]);
-
-    /* ------------------------------------------------------------------ */
-    /* [8] NVM_MAP_DEVICE_QUEUE_MEMORY (CQ ring)                           */
-    /* ------------------------------------------------------------------ */
-    GpuBlock cq = alloc_gpu_block(GPU_PAGE_SIZE, "CQ ring");
-    uint64_t cq_ioaddrs[16] = {0};
-    if (cq.n_pages > 16)
-        step_fail(0, "CQ ring needs %zu GPU pages, bump cq_ioaddrs[]", cq.n_pages);
-    {
-        struct nvm_ioctl_map req;
-        memset(&req, 0, sizeof(req));
-        req.vaddr_start = (uint64_t)(uintptr_t)cq.aligned;
-        req.n_pages     = cq.n_pages;
-        req.ioaddrs     = cq_ioaddrs;
-        req.ioq_idx     = 0;        /* user queue #0 (matches SQ above) */
-        req.is_cq       = 1;
-        if (do_ioctl(fd_dev, NVM_MAP_DEVICE_QUEUE_MEMORY, &req,
-                     "NVM_MAP_DEVICE_QUEUE_MEMORY(CQ)") < 0)
-            step_fail(errno, "NVM_MAP_DEVICE_QUEUE_MEMORY CQ");
-    }
-    step_ok("NVM_MAP_DEVICE_QUEUE_MEMORY(CQ) gpu_va=%p ioaddr[0]=0x%016" PRIx64,
-            cq.aligned, cq_ioaddrs[0]);
-
-    /* ------------------------------------------------------------------ */
-    /* [9] Bonus: NVM_MAP_DEVICE_MEMORY (data buffer, ioq_idx<0)           */
-    /*                                                                    */
-    /* This goes through map_device_memory() (not _ioqueue_memory()): it  */
-    /* does NOT increment ioq_map_num and is not part of the SQ/CQ pool.  */
-    /* It's the path libnvm uses for PRP / PRP-list buffers backing       */
-    /* user-side IO requests. Smoke-test it here.                          */
-    /* ------------------------------------------------------------------ */
-    GpuBlock prp = alloc_gpu_block(GPU_PAGE_SIZE, "data/PRP buffer");
-    uint64_t prp_ioaddrs[16] = {0};
-    {
-        struct nvm_ioctl_map req;
-        memset(&req, 0, sizeof(req));
-        req.vaddr_start = (uint64_t)(uintptr_t)prp.aligned;
-        req.n_pages     = prp.n_pages;
-        req.ioaddrs     = prp_ioaddrs;
-        req.ioq_idx     = -1;       /* not a queue ring */
-        req.is_cq       = 0;
-        if (do_ioctl(fd_dev, NVM_MAP_DEVICE_MEMORY, &req,
-                     "NVM_MAP_DEVICE_MEMORY(data)") < 0)
-            step_fail(errno, "NVM_MAP_DEVICE_MEMORY data");
-    }
-    step_ok("NVM_MAP_DEVICE_MEMORY(data) gpu_va=%p ioaddr[0]=0x%016" PRIx64,
-            prp.aligned, prp_ioaddrs[0]);
-
-    /* ------------------------------------------------------------------ */
-    /* [10] NVM_SET_SHARE_REG -- arms the use_sreg gate                    */
-    /* ------------------------------------------------------------------ */
-    {
-        struct nvm_ioctl_map req;
-        memset(&req, 0, sizeof(req));
-        req.ioq_idx = 1;
-        if (do_ioctl(fd_dev, NVM_SET_SHARE_REG, &req, "NVM_SET_SHARE_REG") < 0)
-            step_fail(errno, "NVM_SET_SHARE_REG(1)");
-    }
-    step_ok("NVM_SET_SHARE_REG(1)");
-
-    /* ================================================================== */
-    /*  --bind path                                                       */
-    /* ================================================================== */
-    if (do_bind) {
         struct pci_device_addr bdf = orig_bdf;
         if (do_ioctl(fd_ctl, SNVM_DEVICE_BIND, &bdf, "SNVM_DEVICE_BIND") < 0)
-            step_fail(errno,
-                "SNVM_DEVICE_BIND %s -- the in-tree nvme driver may still own this device, "
-                "or use_sreg/ioq_map_num invariants are off (see PORTING.md §5)",
-                bdf_str);
-
-        /* Poll NVM_GET_DEV_INFO until async probe + namespace scan finish. */
-        struct nvm_ioctl_dev info;
+            step_fail(errno, "SNVM_DEVICE_BIND %s", bdf_str);
+        step_ok("SNVM_DEVICE_BIND %s", bdf_str);
+    }
+    struct nvm_ioctl_dev info;
+    {
         int ok = 0;
-        for (int i = 0; i < 100; i++) {   /* up to ~10 s */
+        for (int i = 0; i < 100; i++) {
             memset(&info, 0, sizeof(info));
             if (ioctl(fd_dev, NVM_GET_DEV_INFO, &info) == 0 &&
-                info.disk_name[0] != '\0') {
-                ok = 1;
-                break;
-            }
+                info.disk_name[0] != '\0') { ok = 1; break; }
             usleep(100 * 1000);
         }
-        if (!ok)
-            step_fail(errno, "NVM_GET_DEV_INFO did not succeed within 10s after bind");
-        step_ok("SNVM_DEVICE_BIND %s (probe done with GPU queues)", bdf_str);
+        if (!ok) step_fail(errno, "NVM_GET_DEV_INFO did not complete in 10s");
+        step_ok("NVM_GET_DEV_INFO disk='%s' block_size=%zu q_depth=%u "
+                "start_cq_idx=%u max_user_qid=%u sgls=0x%x",
+                info.disk_name, info.block_size, info.q_depth,
+                info.start_cq_idx, info.max_user_qid, info.sgl_supported);
+    }
+    if (info.block_size != 4096)
+        step_fail(0, "smoke assumes 4 KiB-LBA controller; got %zu",
+                  info.block_size);
+    if ((size_t)info.q_depth * NVME_SQE_SIZE > GPU_PAGE_SIZE)
+        step_fail(0, "GPU smoke: SQ ring (q_depth=%u * 64 = %zu B) "
+                     "exceeds one GPU page (%zu B); lower io_queue_depth.",
+                  info.q_depth,
+                  (size_t)info.q_depth * NVME_SQE_SIZE,
+                  GPU_PAGE_SIZE);
 
-        char disk_name[DISK_NAME_LEN + 1] = {0};
-        memcpy(disk_name, info.disk_name, DISK_NAME_LEN);
-        step_ok("NVM_GET_DEV_INFO disk='%s' nr_user_q=%u block_size=%zu max_data_size=%zu",
-                disk_name, info.nr_user_q, info.block_size, info.max_data_size);
+    /* ============================================================== */
+    /* Phase 2: BAR0 mmap + cudaHostRegister (one-shot, lives across */
+    /* rounds because doorbell offsets are stable per QID and QIDs   */
+    /* are reused predictably by snvme's user_qid pool).              */
+    /* ============================================================== */
+    void* bar0_cpu = mmap(NULL, info.bar0_size, PROT_READ | PROT_WRITE,
+                          MAP_SHARED, fd_dev, 0);
+    if (bar0_cpu == MAP_FAILED)
+        step_fail(errno, "mmap BAR0 (%u bytes)", info.bar0_size);
+    CUDA_OK(cudaHostRegister(bar0_cpu, info.bar0_size,
+                             cudaHostRegisterIoMemory));
+    void* bar0_gpu = nullptr;
+    CUDA_OK(cudaHostGetDevicePointer(&bar0_gpu, bar0_cpu, 0));
+    step_ok("BAR0 mmap=%p gpu_va=%p (cudaHostRegister + GetDevicePointer)",
+            bar0_cpu, bar0_gpu);
 
-        char blk_path[DISK_NAME_LEN + 8];
-        snprintf(blk_path, sizeof(blk_path), "/dev/%s", disk_name);
-        int fd_blk = open(blk_path, O_RDONLY);
-        if (fd_blk < 0)
-            step_fail(errno, "open(%s)", blk_path);
-        char buf[512];
-        ssize_t got = pread(fd_blk, buf, sizeof(buf), 0);
-        if (got != (ssize_t)sizeof(buf))
-            step_fail(errno, "pread(%s, 512) returned %zd", blk_path, got);
-        close(fd_blk);
-        step_ok("pread(%s, 512) ok", blk_path);
+    /* ============================================================== */
+    /* Phase 3+: rounds.  Each round builds its OWN queue group +    */
+    /* GPU rings + GPU data buffers, runs all 4 tiers + wrap, then   */
+    /* tears the whole stack down.  We re-allocate everything from  */
+    /* scratch every round to exercise the snvme alloc/free path.   */
+    /* ============================================================== */
+    for (unsigned round = 0; round < nr_rounds; round++) {
+        round_resources rr;
+        memset(&rr, 0, sizeof(rr));
 
-        bdf = orig_bdf;
-        if (do_ioctl(fd_ctl, SNVM_DEVICE_UNBIND, &bdf, "SNVM_DEVICE_UNBIND") < 0)
-            step_fail(errno, "SNVM_DEVICE_UNBIND %s", bdf_str);
-        step_ok("SNVM_DEVICE_UNBIND %s", bdf_str);
+        fprintf(stderr, "\n===== ROUND %u / %u BEGIN =====\n",
+                round + 1, nr_rounds);
+        run_one_round(fd_dev, info, bar0_gpu, round, rr);
+        teardown_one_round(fd_dev, round, rr);
+        fprintf(stderr, "===== ROUND %u / %u END   =====\n",
+                round + 1, nr_rounds);
     }
 
-    /* ------------------------------------------------------------------ */
-    /* [F1] Cleanup: unmap rings + data buffer, clear ioq state.           */
-    /*                                                                    */
-    /* Order matters only for ioq_map_num bookkeeping: unmapping the two  */
-    /* queue rings must happen via NVM_UNMAP_DEVICE_QUEUE_MEMORY (not the */
-    /* plain DEVICE variant), because the kernel keeps them on a separate */
-    /* device_queue_list (pci.c case NVM_UNMAP_DEVICE_QUEUE_MEMORY).      */
-    /* ------------------------------------------------------------------ */
-    {
-        uint64_t v;
-        v = (uint64_t)(uintptr_t)sq.aligned;
-        if (do_ioctl(fd_dev, NVM_UNMAP_DEVICE_QUEUE_MEMORY, &v,
-                     "NVM_UNMAP_DEVICE_QUEUE_MEMORY(SQ)") < 0)
-            step_fail(errno, "NVM_UNMAP_DEVICE_QUEUE_MEMORY SQ");
-        v = (uint64_t)(uintptr_t)cq.aligned;
-        if (do_ioctl(fd_dev, NVM_UNMAP_DEVICE_QUEUE_MEMORY, &v,
-                     "NVM_UNMAP_DEVICE_QUEUE_MEMORY(CQ)") < 0)
-            step_fail(errno, "NVM_UNMAP_DEVICE_QUEUE_MEMORY CQ");
-        v = (uint64_t)(uintptr_t)prp.aligned;
-        if (do_ioctl(fd_dev, NVM_UNMAP_DEVICE_MEMORY, &v,
-                     "NVM_UNMAP_DEVICE_MEMORY(data)") < 0)
-            step_fail(errno, "NVM_UNMAP_DEVICE_MEMORY data");
-        struct nvm_ioctl_map req;
-        memset(&req, 0, sizeof(req));
-        if (do_ioctl(fd_dev, NVM_CLEAR_IOQ_NUM, &req,
-                     "NVM_CLEAR_IOQ_NUM") < 0)
-            step_fail(errno, "NVM_CLEAR_IOQ_NUM");
-    }
-    step_ok("NVM_UNMAP_DEVICE_QUEUE_MEMORY x2 + NVM_UNMAP_DEVICE_MEMORY + NVM_CLEAR_IOQ_NUM");
+    /* ============================================================== */
+    /* Final tear-down.                                               */
+    /* ============================================================== */
+    CUDA_OK(cudaHostUnregister(bar0_cpu));
+    if (munmap(bar0_cpu, info.bar0_size) < 0)
+        step_fail(errno, "munmap BAR0");
+    step_ok("munmap BAR0 + cudaHostUnregister");
 
-    /* ------------------------------------------------------------------ */
-    /* [F2] cudaFree + munmap(BAR0) + close(/dev/ssnvme<N>)                */
-    /* ------------------------------------------------------------------ */
-    free_gpu_block(sq);
-    free_gpu_block(cq);
-    free_gpu_block(prp);
-    if (munmap(bar0, bar0_size) < 0)
-        step_fail(errno, "munmap(BAR0)");
-    if (close(fd_dev) < 0)
-        step_fail(errno, "close(%s)", dev_path);
-    step_ok("cudaFree x3 + munmap(BAR0) + close(%s)", dev_path);
-
-    /* ------------------------------------------------------------------ */
-    /* [F3] SNVM_CHRDEV_REMOVE                                              */
-    /* ------------------------------------------------------------------ */
     {
         struct pci_device_addr bdf = orig_bdf;
-        if (do_ioctl(fd_ctl, SNVM_CHRDEV_REMOVE, &bdf,
-                     "SNVM_CHRDEV_REMOVE") < 0)
-            step_fail(errno, "SNVM_CHRDEV_REMOVE %s", bdf_str);
+        if (do_ioctl(fd_ctl, SNVM_DEVICE_UNBIND, &bdf, "SNVM_DEVICE_UNBIND") < 0)
+            step_fail(errno, "SNVM_DEVICE_UNBIND");
+        step_ok("SNVM_DEVICE_UNBIND %s", bdf_str);
     }
-    step_ok("SNVM_CHRDEV_REMOVE %s", bdf_str);
+    if (close(fd_dev) < 0) step_fail(errno, "close(%s)", dev_path);
+    step_ok("close(%s)", dev_path);
 
+    {
+        struct pci_device_addr bdf = orig_bdf;
+        if (do_ioctl(fd_ctl, SNVM_CHRDEV_REMOVE, &bdf, "SNVM_CHRDEV_REMOVE") < 0)
+            step_fail(errno, "SNVM_CHRDEV_REMOVE");
+        step_ok("SNVM_CHRDEV_REMOVE %s", bdf_str);
+    }
     close(fd_ctl);
-    fprintf(stderr, "\nAll %d steps passed. SNVMe GPU paths are healthy%s.\n",
-            g_step, do_bind ? " (full bring-up)" : " (UAPI-smoke)");
+
+    fprintf(stderr, "\n=== snvme_smoke_gpu: all %d steps passed across "
+            "%u round(s) ===\n", g_step, nr_rounds);
     return 0;
 }

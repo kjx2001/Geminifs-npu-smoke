@@ -39,3 +39,4 @@ backends/local/kernel_modules/test/snvme_smoke_gpu
 backends/local/kernel_modules/test/snvme_smoke_addq
 backends/local/kernel_modules/test/snvme_smoke_qgroup
 backends/local/kernel_modules/test/snvme_smoke_recycle
+backends/local/kernel_modules/test/snvme_smoke_io

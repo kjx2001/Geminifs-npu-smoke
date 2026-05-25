@@ -5870,6 +5870,15 @@ static long snvm_dev_map_ioctl(struct file *file, unsigned int cmd,
 		 */
 		drequest.max_user_qid        = ndev->ctrl_max_io_queues;
 		drequest.max_queues_per_group = NVM_MAX_QUEUES_PER_GROUP;
+		/*
+		 * Echo the Identify Controller SGLS dword captured by
+		 * core.c during nvme_init_identify().  Userspace uses
+		 * this to decide whether SGL data pointers are usable
+		 * at all -- many SSDs are PRP-only and report sgls=0,
+		 * in which case attempting CDW0.PSDT=1 returns SC=0x15
+		 * (SGL Not Supported).
+		 */
+		drequest.sgl_supported       = (uint32_t)ndev->ctrl.sgls;
 
 		snvme_put_ns(ns);
 
@@ -6261,15 +6270,35 @@ static long snvm_dev_map_ioctl(struct file *file, unsigned int cmd,
 		 *
 		 * The lookup is O(nr_pairs * group_maps) which is fine:
 		 * both bounds are tiny in practice (16 * a few-dozen).
+		 *
+		 * GPU vs host page-size handling: map_userspace stores
+		 * map->vaddr aligned to PAGE_SIZE (host 4 KiB), while
+		 * map_device_memory stores it aligned to GPU_PAGE_SIZE
+		 * (64 KiB).  We can't rely on a single mask covering
+		 * both, so use the map's own page_size to compute the
+		 * comparison mask -- this lets the same NVM_ADD_USER_QUEUE
+		 * path serve both CPU smoke (host pages) and GPU smoke
+		 * (NVM_MAP_DEVICE_MEMORY rings) without ABI churn.
 		 */
 		for (i = 0; i < req->nr_pairs; i++) {
 			struct map *m_sq = NULL, *m_cq = NULL;
 			struct map *cursor;
 
 			list_for_each_entry(cursor, &g->maps, group_link) {
-				if (cursor->vaddr == (req->pairs[i].sq_vaddr & PAGE_MASK))
+				u64 mask;
+
+				/* page_size is 0 only on the create_descriptor
+				 * stub before the type-specific helper runs;
+				 * by the time the map is on g->maps the
+				 * helper has set page_size to PAGE_SIZE
+				 * (host) or GPU_PAGE_SIZE (device).  Default
+				 * to host PAGE_SIZE for safety.            */
+				mask = ~((cursor->page_size ?
+					  (u64)cursor->page_size : (u64)PAGE_SIZE) - 1);
+
+				if (cursor->vaddr == (req->pairs[i].sq_vaddr & mask))
 					m_sq = cursor;
-				if (cursor->vaddr == (req->pairs[i].cq_vaddr & PAGE_MASK))
+				if (cursor->vaddr == (req->pairs[i].cq_vaddr & mask))
 					m_cq = cursor;
 				if (m_sq && m_cq)
 					break;
