@@ -4414,7 +4414,16 @@ static int snvm_chrdev_helper(struct pci_device_addr* dev_addr, int create){
 	struct pci_dev *pdev;
 	struct ctrl* ctrl;
 
-	int ret = -EFAULT;
+	/*
+	 * Idempotent default: a CHRDEV_CREATE for a BDF already created,
+	 * or a CHRDEV_REMOVE for a BDF already gone, is treated as success.
+	 * The original code initialised ret to -EFAULT here so those two
+	 * fall-through cases silently returned errno=14 to userspace --
+	 * which masquerades as a "Bad address" copy_from_user failure in
+	 * diagnostic output and is what made snvme_smoke_gpu look like a
+	 * pointer/CUDA bug.  See PORTING.md \xc2\xa77.3.1.
+	 */
+	int ret = 0;
 
 	pdev_addr = *dev_addr;
 	pdev = TO_PCI_DEV(pdev_addr);
@@ -4424,14 +4433,28 @@ static int snvm_chrdev_helper(struct pci_device_addr* dev_addr, int create){
 	}
 
 	ctrl = ctrl_find_by_pci_dev(&ctrl_list, pdev);
-	if (create && !ctrl){ // create and chrdev has not been created
+	if (create && !ctrl){ // create: register a fresh chrdev for this BDF
 		ret = snvm_chrdev_create(pdev,PCI_CLASS_STORAGE_EXPRESS);
 		if (!ret){
 			ctrl = ctrl_find_by_pci_dev(&ctrl_list, pdev); // ctrl has been created by default
 			memset(dev_addr, 0, sizeof(struct pci_device_addr));
 			dev_addr->domain = ctrl->number;
 		}
-	}else if(!create && ctrl){ // remove and chrdev has not been removed
+	} else if (create && ctrl){ // create: BDF already has a chrdev -- idempotent
+		/*
+		 * Userspace called CHRDEV_CREATE twice for the same BDF (typical
+		 * shape: smoke test A finished and left its chrdev registered,
+		 * smoke test B starts and calls CHRDEV_CREATE expecting to find
+		 * out which /dev/ssnvme<N> to open).  Report the existing minor
+		 * via dev_addr->domain (same protocol as the fresh-create path)
+		 * and return success.  The cdev / class device / IDA minor are
+		 * already in place from the previous CREATE -- nothing to do
+		 * kernel-side.
+		 */
+		memset(dev_addr, 0, sizeof(struct pci_device_addr));
+		dev_addr->domain = ctrl->number;
+		ret = 0;
+	} else if (!create && ctrl){ // remove: tear down the chrdev for this BDF
 		/*
 		 * Tear down order matters: ctrl_put() calls ctrl_chrdev_remove()
 		 * which device_destroy()/cdev_del() uses ctrl->number to build
@@ -4445,6 +4468,10 @@ static int snvm_chrdev_helper(struct pci_device_addr* dev_addr, int create){
 		ida_simple_remove(&snvm_chrdev_minor_ida, released_minor);
 		ret = 0;
 	}
+	/*
+	 * (!create && !ctrl): remove on a BDF with no chrdev.  Idempotent;
+	 * ret is already 0.
+	 */
 
 	pci_dev_put(pdev);
 	return ret;
