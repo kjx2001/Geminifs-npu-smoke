@@ -42,7 +42,8 @@ process
 Once those steps complete, the same NVMe controller is simultaneously:
 
 - a **regular block device** (`/dev/snvme<X>n<Y>` — note the leading
-  `s`, set in `core.c:3806` / `multipath.c:58`; e.g. `/dev/snvme0n1`),
+  `s`, set by the disk-name `sprintf("snvme%dn%d", ...)` in `core.c`
+  / `multipath.c`; e.g. `/dev/snvme0n1`),
   mounted by the kernel like any other NVMe SSD, and
 - a **direct-IO submission target** for user-space / GPU code, which
   rings the doorbells without round-tripping through the block layer.
@@ -70,8 +71,8 @@ driver named `"nvme"`. To avoid clashes:
 | Functions kept from upstream | rename with `s_` prefix when their semantics changed     |
 | chrdev class name           | `"libsnvm helper"` (`DRIVER_NAME` in `pci.c`)             |
 | Control device              | `/dev/snvm_control` (single-instance, factory)            |
-| Per-controller chrdev       | `/dev/ssnvme<N>` — note the **double 's'** (`ctrl.c:36`); used for BAR0 mmap + queue ioctls |
-| Block device on success     | `/dev/snvme<X>n<Y>` — single 's', set in `core.c:3806` and `multipath.c:58` (e.g. `/dev/snvme0n1`) |
+| Per-controller chrdev       | `/dev/ssnvme<N>` — note the **double 's'** (see `DEV_NAME` / `ctrl_chrdev_create` in `ctrl.c`); used for BAR0 mmap + queue ioctls |
+| Block device on success     | `/dev/snvme<X>n<Y>` — single 's', set by the `sprintf("snvme%dn%d", ...)` sites in `core.c` and `multipath.c` (e.g. `/dev/snvme0n1`) |
 
 > **Naming gotcha.** SNVMe exposes **two** `/dev` objects per bound
 > NVMe controller, and they look superficially similar:
@@ -381,7 +382,8 @@ Semantics:
 - **`SNVM_CHRDEV_CREATE` / `_REMOVE`**: idempotent; (un)registers
   `/dev/ssnvme<N>` for the BDF described by `pci_device_addr`.
   `_CREATE` writes the allocated minor back into `addr.domain` (this
-  field is reused as an out-parameter — see `pci.c:4204`).
+  field is reused as an out-parameter — see `snvm_chrdev_create` in
+  `pci.c`).
 - **`SNVM_DEVICE_BIND`**: detaches whatever PCI driver currently owns
   the BDF (typically the in-tree `nvme`), registers `snvme_driver` if
   not already registered, and force-attaches it via
@@ -672,7 +674,7 @@ tag.
 
 ### 4.4 `mmap()` on `/dev/ssnvme<N>`
 
-`snvm_dev_fops.mmap = svm_mmap_registers` (`pci.c:3931`) maps
+`snvm_dev_fops.mmap = svm_mmap_registers` (in `pci.c`) maps
 **BAR0** of the bound NVMe controller into the calling process.
 Userspace then uses `cudaHostRegister(..., cudaHostRegisterIoMemory)`
 so CUDA kernels can read/write the doorbells directly — see
@@ -1025,20 +1027,33 @@ build tree is used in all signing workflows:
 
 ### 7.1 Phase 1 — Mechanical merge (this is what `diff` gets you)
 
-- [ ] **Anchor the old baseline.** Write down the exact upstream
-      tag SNVMe currently tracks. Grep for it:
-      `git log --grep="nvme: " drivers/nvme/host/ | head` in that tag's
-      tree. Save the three SHAs that touched `pci.c`, `core.c`,
-      `multipath.c` most recently — they're your 3-way-merge left side.
-- [ ] **Sync the new baseline.** Check out `drivers/nvme/host/` from
-      the target kernel tag (`v6.x`). This is the merge right side.
+- [ ] **Anchor the old baseline.** SNVMe carries two reference
+      baselines side-by-side under `backends/local/kernel_modules/`:
+      `snvme-5.4.241-1-tlinux4-0017/` (the production TLinux
+      kernel; upstream tag link is in the repo root `README.md`)
+      and `snvme-5.15.0-public/` (cross-LTS reference, vanilla
+      v5.15-class).  Pick whichever is closer to your target and
+      treat it as the merge **left side**.  The corresponding
+      stock upstream tree (without SNVMe modifications) is your
+      merge **base**: for the TLinux baseline that lives under
+      `temp/kernel-...` in this repo (see README); for the public
+      baseline, check out `v5.15` of the upstream Linux tree.
+- [ ] **Sync the new baseline.** Check out `drivers/nvme/host/`
+      from the target kernel tag.  This is the merge **right side**.
 - [ ] **3-way merge into SNVMe.** For each file SNVMe carries
-      (`core.c`, `pci.c`, `ioctl.c`, `multipath.c`, `zns.c`, `hwmon.c`,
-      `fabrics.c`, `rdma.c`, `tcp.c`, `nvme.h`), run a 3-way merge
-      (old-upstream → new-upstream → SNVMe-fork). **Never** rebase
-      by just applying the `old→new` upstream patch on top of SNVMe
-      — conflict resolution without the fork as the third input hides
-      struct-layout bugs.
+      (`core.c`, `pci.c`, `ioctl.c`, `multipath.c`, `zns.c`,
+      `hwmon.c`, `fabrics.c`, `rdma.c`, `tcp.c`, `nvme.h`), run a
+      3-way merge (stock-old → stock-new → SNVMe-fork). **Never**
+      rebase by just applying the `old→new` upstream patch on top
+      of SNVMe — conflict resolution without the fork as the third
+      input hides struct-layout bugs.
+- [ ] **If you are uplifting from 5.4 to 5.15-class**, the repo
+      already ships `snvme-5.4.241-1-tlinux4-0017/snvme-pci-5.15-incremental.diff`
+      that captures every SNVMe-specific delta the 5.4 fork has on
+      top of the 5.15 fork.  Use it as a sanity reference for which
+      hunks must reappear after the 3-way merge — if a hunk in the
+      diff has no analogue in your merged tree, that is a missed
+      port.
 - [ ] **Re-apply renames (§3.1)** on anything upstream added.
       `grep -n '\bnvme_[a-z_]*\(' snvme/*.c` — any new match that is
       also exported or referenced cross-module gets a `snvm_` /
@@ -1071,12 +1086,15 @@ build tree is used in all signing workflows:
       `user_start_qid`, `online_user_queues`, `max_qid`,
       `use_user_allocated`. If `nvme_setup_io_queues` changed how
       `nr_io_queues` is computed, each arithmetic site must be
-      re-derived from first principles (see `pci.c:2470–2492`).
+      re-derived from first principles (locate the
+      `nvme_set_queue_count` / `pci_alloc_irq_vectors_affinity`
+      block in `s_nvme_setup_io_queues`).
 - [ ] **Verify admin-queue path is untouched.** The user-pages branch
       MUST only apply to IO queues. If upstream merged admin+IO queue
       allocation, split them back out in SNVMe.
 - [ ] **Verify block-device registration still uses
-      `"snvme%dn%d"`** (`core.c:3806`, `multipath.c:58/62`). Upstream
+      `"snvme%dn%d"`** (every `sprintf` / `snprintf` of `disk_name`
+      in `core.c` and `multipath.c`). Upstream
       naming of `disk->disk_name` has been touched by several
       releases; don't let a merge silently revert it to `"nvme..."` —
       that breaks the §2 namespace-separation guarantee.
@@ -1246,8 +1264,10 @@ Re-audit each one after §7.1.
   scan race **more likely** by short-circuiting the probe-side
   delays, but the scan race exists on a fresh module load too.
 
-  Fix (recorded at `snvme-5.4.241-1-tlinux4-0017/pci.c` ~lines
-  4749-4920 and `map.c` `map_purge_by_owner`):
+  Fix (the `snvme-5.4.241-1-tlinux4-0017/` baseline; locate by
+  symbol: `snvm_dev_open` / `snvm_dev_release` in `pci.c`,
+  `map_purge_by_owner` in `map.c`, `struct snvm_dev_owner` in
+  `pci.c` / `ctrl.h`):
 
   - `.open` allocates a `struct snvm_dev_owner { ctrl, owner }` and
     stashes it in `file->private_data`. Capturing the owner at open
