@@ -4256,10 +4256,27 @@ static long snvm_dev_map_ioctl(struct file* file, unsigned int cmd, unsigned lon
     {
         case NVM_MAP_HOST_MEMORY: // 将用户态地址pin住并得到dma地址返回用户态
 		{
+            /*
+             * Pin user pages, hand back DMA addrs.  Two modes coexist
+             * (see ioctl.h struct nvm_ioctl_map):
+             *
+             *   group_id == 0  legacy.  ioq_idx >= 0 counts the map
+             *                  against ctrl->ioq_num / ctrl->cq_num
+             *                  and tags it for the NVM_SET_IOQ_NUM
+             *                  bring-up.  Map is reachable only via
+             *                  the global host_list.
+             *
+             *   group_id != 0  new mode.  Map is registered on the
+             *                  per-fd group's maps list so destroy /
+             *                  cascade can drain it.  ioq_idx /
+             *                  is_cq are ignored.
+             */
             if (copy_from_user(&request, (void __user*) arg, sizeof(request)))
             {
                 return -EFAULT;
             }
+            if (request.reserved != 0)
+                return -EINVAL;     /* MBZ; future compat */
 
             map = map_userspace(&host_list, ctrl, request.vaddr_start, request.n_pages);
             /*
@@ -4273,8 +4290,28 @@ static long snvm_dev_map_ioctl(struct file* file, unsigned int cmd, unsigned lon
                 return IS_ERR(map) ? PTR_ERR(map) : -ENOMEM;
             }
 
-            if (request.ioq_idx >= 0)
-            {
+            if (request.group_id != 0) {
+                /* New mode: attach to per-fd queue group. */
+                struct snvm_dev_owner *own = file->private_data;
+                struct snvm_qgroup *g;
+
+                if (!own) {
+                    unmap_and_release(map);
+                    return -ENODEV;
+                }
+                mutex_lock(&own->groups_lock);
+                g = find_qgroup_locked(own, request.group_id);
+                if (!g) {
+                    mutex_unlock(&own->groups_lock);
+                    unmap_and_release(map);
+                    return -ENOENT;
+                }
+                map->group_id = request.group_id;
+                list_add_tail(&map->group_link, &g->maps);
+                g->nr_maps++;
+                mutex_unlock(&own->groups_lock);
+            } else if (request.ioq_idx >= 0) {
+                /* Legacy mode: account against ctrl budget. */
                 /* Reject overflow *before* bumping the counter so we
                  * don't leave ioq_map_num in a poisoned state. */
                 if (ctrl->ioq_map_num + 1 > ctrl->ioq_num)
@@ -4294,8 +4331,25 @@ static long snvm_dev_map_ioctl(struct file* file, unsigned int cmd, unsigned lon
             if (copy_to_user((void __user*) request.ioaddrs, map->addrs,
                              map->n_addrs * sizeof(uint64_t)))
             {
-                /* Roll back: we already mutated ctrl state above. */
-                if (request.ioq_idx >= 0) {
+                /*
+                 * Roll back every counter we bumped above AND release
+                 * the mapping.  For new-mode (group) maps,
+                 * unmap_and_release will list_del the group_link out
+                 * so g->nr_maps is the only thing to roll back
+                 * manually.
+                 */
+                if (request.group_id != 0) {
+                    struct snvm_dev_owner *own = file->private_data;
+                    struct snvm_qgroup *g;
+
+                    if (own) {
+                        mutex_lock(&own->groups_lock);
+                        g = find_qgroup_locked(own, request.group_id);
+                        if (g)
+                            g->nr_maps--;
+                        mutex_unlock(&own->groups_lock);
+                    }
+                } else if (request.ioq_idx >= 0) {
                     if (map->is_cq) ctrl->cq_num--;
                     ctrl->ioq_map_num -= 1;
                 }
@@ -4304,14 +4358,30 @@ static long snvm_dev_map_ioctl(struct file* file, unsigned int cmd, unsigned lon
             }
             ret = 0;
             break;
-		} 
+		}
 
 		case NVM_MAP_DEVICE_MEMORY: // 将用户态cuda malloc 分配的地址pin住并得到dma地址返回用户态
 		{
+			/*
+			 * Pin GPU pages (NVIDIA p2p) into device_list.  Same
+			 * dual-mode semantics as NVM_MAP_HOST_MEMORY: nonzero
+			 * group_id attaches the map to a per-fd group; zero
+			 * keeps it on the controller-global list only.
+			 *
+			 * Note: the legacy NVM_MAP_DEVICE_MEMORY case did NOT
+			 * touch ctrl->ioq_map_num / cq_num at all (data path
+			 * only).  We preserve that: even with group_id == 0
+			 * and ioq_idx >= 0 we just ignore the ioq tag here,
+			 * matching the historical behaviour.  GPU queue ring
+			 * registration still goes through
+			 * NVM_MAP_DEVICE_QUEUE_MEMORY in legacy mode.
+			 */
 			if (copy_from_user(&request, (void __user*) arg, sizeof(request)))
 			{
 				return -EFAULT;
 			}
+			if (request.reserved != 0)
+				return -EINVAL;
 
 			map = map_device_memory(&device_list, ctrl, request.vaddr_start, request.n_pages, &ctrl_list);
 			if (IS_ERR_OR_NULL(map))
@@ -4319,9 +4389,42 @@ static long snvm_dev_map_ioctl(struct file* file, unsigned int cmd, unsigned lon
 				return IS_ERR(map) ? PTR_ERR(map) : -ENOMEM;
 			}
 
+			if (request.group_id != 0) {
+				struct snvm_dev_owner *own = file->private_data;
+				struct snvm_qgroup *g;
+
+				if (!own) {
+					unmap_and_release(map);
+					return -ENODEV;
+				}
+				mutex_lock(&own->groups_lock);
+				g = find_qgroup_locked(own, request.group_id);
+				if (!g) {
+					mutex_unlock(&own->groups_lock);
+					unmap_and_release(map);
+					return -ENOENT;
+				}
+				map->group_id = request.group_id;
+				list_add_tail(&map->group_link, &g->maps);
+				g->nr_maps++;
+				mutex_unlock(&own->groups_lock);
+			}
+
 			if (copy_to_user((void __user*) request.ioaddrs, map->addrs,
 			                 map->n_addrs * sizeof(uint64_t)))
 			{
+				if (request.group_id != 0) {
+					struct snvm_dev_owner *own = file->private_data;
+					struct snvm_qgroup *g;
+
+					if (own) {
+						mutex_lock(&own->groups_lock);
+						g = find_qgroup_locked(own, request.group_id);
+						if (g)
+							g->nr_maps--;
+						mutex_unlock(&own->groups_lock);
+					}
+				}
 				unmap_and_release(map);
 				return -EFAULT;
 			}
