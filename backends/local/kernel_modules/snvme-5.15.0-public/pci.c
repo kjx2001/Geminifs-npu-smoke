@@ -3675,6 +3675,7 @@ static long snvm_dev_map_ioctl(struct file* file, unsigned int cmd, unsigned lon
 	int ret = 0;
     struct ctrl* ctrl = NULL;
     struct nvm_ioctl_map request;
+    struct nvm_ioctl_setup setup;
     struct map* map = NULL;
 	struct nvme_dev *ndev;
 	struct nvme_ns *ns;
@@ -3879,30 +3880,97 @@ static long snvm_dev_map_ioctl(struct file* file, unsigned int cmd, unsigned lon
             break;
 		}
 		case NVM_SET_IOQ_NUM:
-		{	
-			printk("NVM_SET_IOQ_NUM 1\n");
-            if (copy_from_user(&request, (void __user*) arg, sizeof(request)))
-            {
-                return -EFAULT;
-            }
-			printk("NVM_SET_IOQ_NUM 2\n");
-			if(request.ioq_idx<=0)
-			{
-				printk("NVM_SET_IOQ_NUM Error 1, has reg %d, reg is %d",ctrl->ioq_num,request.ioq_idx);
+		{
+			/*
+			 * Userspace declares its full queue-budget setup in
+			 * one shot: total user IOQ count, on-host vs GPU
+			 * residency, kernel-side IOQ cap, write/poll override,
+			 * and an optional per-owner partition of the user
+			 * share (groups[]).
+			 *
+			 * ABI rev note: this used to carry struct nvm_ioctl_map
+			 * (packed into .ioq_idx / .is_cq).  Geminifs replaced
+			 * that with the explicit nvm_ioctl_setup struct because
+			 * (a) the legacy layout had no room for cap_kernel_ioq
+			 * / groups, and (b) _IOC_SIZE differed from the
+			 * declared ioctl number's size class, which the new
+			 * layout fixes.  Old binaries get -ENOTTY at ioctl
+			 * entry rather than silent misparse.
+			 *
+			 * Validation:
+			 *   - ioq_num must be > 0
+			 *   - downward-only updates: if a previous call set
+			 *     ctrl->ioq_num, the new ioq_num must not exceed it
+			 *   - reserved fields must be zero
+			 *   - nr_groups <= SNVM_MAX_QUEUE_GROUPS
+			 *   - sum(groups[].count) must equal ioq_num when
+			 *     nr_groups > 0
+			 */
+			unsigned int i;
+
+			if (copy_from_user(&setup, (void __user *)arg, sizeof(setup)))
 				return -EFAULT;
+
+			if (setup.ioq_num == 0) {
+				pr_err("snvme: NVM_SET_IOQ_NUM bad request: ioq_num=0 (declared=%u)\n",
+				       ctrl->ioq_num);
+				return -EINVAL;
 			}
-			if(ctrl->ioq_num)
-			{
-				if(request.ioq_idx > ctrl->ioq_num)
-				{
-					printk("NVM_SET_IOQ_NUM Error 2, has reg %d, reg is %d",ctrl->ioq_num,request.ioq_idx);
-					return -EFAULT;
+			if (ctrl->ioq_num && setup.ioq_num > ctrl->ioq_num) {
+				pr_err("snvme: NVM_SET_IOQ_NUM grow attempt: declared=%u, requested=%u\n",
+				       ctrl->ioq_num, setup.ioq_num);
+				return -EINVAL;
+			}
+			if (setup.reserved[0] || setup.reserved[1]) {
+				pr_err("snvme: NVM_SET_IOQ_NUM: reserved fields must be zero\n");
+				return -EINVAL;
+			}
+			if (setup.nr_groups > SNVM_MAX_QUEUE_GROUPS) {
+				pr_err("snvme: NVM_SET_IOQ_NUM: nr_groups=%u > max %u\n",
+				       setup.nr_groups, SNVM_MAX_QUEUE_GROUPS);
+				return -EINVAL;
+			}
+			if (setup.nr_groups) {
+				unsigned int sum = 0;
+				for (i = 0; i < setup.nr_groups; i++) {
+					if (setup.groups[i].reserved) {
+						pr_err("snvme: NVM_SET_IOQ_NUM: group[%u].reserved must be zero\n", i);
+						return -EINVAL;
+					}
+					sum += setup.groups[i].count;
+				}
+				if (sum != setup.ioq_num) {
+					pr_err("snvme: NVM_SET_IOQ_NUM: sum(groups[].count)=%u != ioq_num=%u\n",
+					       sum, setup.ioq_num);
+					return -EINVAL;
 				}
 			}
 
-
-			ctrl->ioq_num = request.ioq_idx;
-			ctrl->on_host = request.is_cq;
+			/*
+			 * Commit to ctrl.  The legacy on_host / ioq_num scalars
+			 * are kept in sync with the new setup snapshot because
+			 * existing in-kernel code (probe segment 6a, queue
+			 * accounting in NVM_MAP_* handlers) still reads those
+			 * specific fields by name.
+			 */
+			ctrl->ioq_num              = setup.ioq_num;
+			ctrl->on_host              = !!(setup.flags & NVM_QUEUE_SETUP_F_ON_HOST);
+			ctrl->setup.valid          = 1;
+			ctrl->setup.ioq_num        = setup.ioq_num;
+			ctrl->setup.flags          = setup.flags;
+			ctrl->setup.cap_kernel_ioq = setup.cap_kernel_ioq;
+			ctrl->setup.nr_write       = setup.nr_write;
+			ctrl->setup.nr_poll        = setup.nr_poll;
+			ctrl->setup.nr_groups      = setup.nr_groups;
+			for (i = 0; i < setup.nr_groups; i++) {
+				ctrl->setup.groups[i].owner_id  = setup.groups[i].owner_id;
+				ctrl->setup.groups[i].count     = setup.groups[i].count;
+				ctrl->setup.groups[i].numa_node = setup.groups[i].numa_node;
+				ctrl->setup.groups[i].reserved  = 0;
+			}
+			pr_info("snvme: NVM_SET_IOQ_NUM: ioq_num=%u on_host=%u cap_kernel=%u groups=%u\n",
+				setup.ioq_num, ctrl->on_host,
+				setup.cap_kernel_ioq, setup.nr_groups);
 			ret = 0;
 			break;
 		}
