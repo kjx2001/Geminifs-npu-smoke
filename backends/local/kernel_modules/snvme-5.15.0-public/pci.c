@@ -4044,34 +4044,114 @@ static void snvm_user_qid_free_locked(struct ctrl *ctrl, uint16_t qid)
 static struct nvme_dev *snvm_ctrl_get_live_ndev(const struct ctrl *ctrl);
 
 /*
- * Destroy a queue group.  Caller MUST hold own->groups_lock and MUST
- * have already list_del'd g from its parent owner->groups list (or
- * be calling from a context where no other thread can race on the
- * owner -- e.g. the fd-close cascade, which holds the only ref).
+ * Free a group descriptor and release its IDA id.  Caller must
+ * hold own->groups_lock and must have already unlinked the group
+ * from own->groups (or be in cascade cleanup where the list is
+ * being walked-and-emptied).
  *
- * Chunk G: drains maps + returns group_id to IDA.  Chunk H will
- * extend this with a "drain user queues via Delete I/O SQ/CQ" step
- * before the maps drain (Delete-SQ/CQ admin commands need the
- * controller still snvme-bound; the maps own the ring physical
- * addresses the controller is about to forget).
+ * Order of operations (matters!):
+ *
+ *   1. Drain user queues (B3): for each alive (qid), issue
+ *      Delete I/O SQ then Delete I/O CQ via the controller's
+ *      admin queue.  NVMe 1.4 §5.4 requires SQ-before-CQ.
+ *      Free the qid back to ctrl->user_qid_bitmap.  This MUST
+ *      happen before maps are freed -- the rings the controller
+ *      DMAs into are owned by maps[]; freeing them while the
+ *      controller still thinks the SQ exists is a use-after-free
+ *      from the DMA engine's perspective.
+ *
+ *   2. Drain maps (B2): unmap_and_release each one.  This frees
+ *      pinned host pages / nvidia_p2p refs, removes the map from
+ *      both the global list and g->maps.
+ *
+ *   3. Release the group_id back to the IDA and kfree(g).
+ *
+ * Failure handling for step 1: NVMe Delete I/O SQ/CQ admin
+ * commands almost never fail in practice (the only documented
+ * failure modes are "queue not found", which is a kernel bug,
+ * and timeout, which means the controller is stuck).  We log a
+ * warning and continue rather than aborting the whole teardown
+ * -- aborting would leave the group descriptor and its maps
+ * leaked, which is strictly worse than a controller-side
+ * residual SQ that the next bind will reset away.
+ *
+ * `ctrl` may be NULL if the caller knows the controller is gone
+ * (e.g. final module exit).  In that case we skip the admin
+ * commands and just reclaim the kernel-side state -- the
+ * controller-side SQs will be reset on the next bind anyway.
  */
 static void destroy_qgroup_locked(struct snvm_qgroup *g, struct ctrl *ctrl)
 {
 	struct map *m, *tmp_m;
+	struct nvme_dev *ndev = NULL;
 	unsigned int n_drained = 0;
+	unsigned int n_queues = 0;
+	unsigned int i;
 
-	(void)ctrl;  /* unused until Chunk H wires in user-queue drain */
 	if (!g)
 		return;
 
-	/* Drain maps registered into this group via NVM_MAP_* group_id paths. */
+	/* ----- Step 1: drain user queues ----- */
+	/*
+	 * Resolve ndev defensively: we may be running on the
+	 * fd-close cascade path AFTER SNVM_DEVICE_UNBIND already
+	 * detached snvme from this BDF, in which case the in-tree
+	 * nvme driver may have already rebound and reset the
+	 * controller.  snvm_ctrl_get_live_ndev returns NULL for
+	 * "not currently owned by snvme", and below we treat NULL
+	 * as "skip the Delete I/O SQ/CQ admin step and just free
+	 * host-side bookkeeping".  This keeps cleanup idempotent
+	 * across unbind/rebind races.
+	 */
+	ndev = snvm_ctrl_get_live_ndev(ctrl);
+
+	/*
+	 * Walk in reverse just for symmetry with creation order;
+	 * NVMe spec doesn't require any particular qid ordering as
+	 * long as Delete-SQ precedes Delete-CQ for the same qid.
+	 */
+	for (i = NVM_MAX_QUEUES_PER_GROUP; i > 0; i--) {
+		struct snvm_user_queue *uq = &g->queues[i - 1];
+
+		if (!uq->alive)
+			continue;
+
+		if (ndev && ndev->ctrl.admin_q) {
+			int rc;
+			rc = adapter_delete_sq(ndev, uq->qid);
+			if (rc)
+				pr_warn("snvme: destroy_qgroup id=%u: "
+					"Delete I/O SQ qid=%u failed: %d\n",
+					g->group_id, uq->qid, rc);
+			rc = adapter_delete_cq(ndev, uq->qid);
+			if (rc)
+				pr_warn("snvme: destroy_qgroup id=%u: "
+					"Delete I/O CQ qid=%u failed: %d\n",
+					g->group_id, uq->qid, rc);
+		}
+
+		if (ctrl) {
+			mutex_lock(&ctrl->user_qid_lock);
+			snvm_user_qid_free_locked(ctrl, uq->qid);
+			mutex_unlock(&ctrl->user_qid_lock);
+		}
+
+		uq->alive = 0;
+		n_queues++;
+	}
+	if (n_queues)
+		pr_info("snvme: destroy_qgroup id=%u drained %u user queue(s)\n",
+			g->group_id, n_queues);
+	g->cur_queues = 0;
+
+	/* ----- Step 2: drain maps ----- */
 	list_for_each_entry_safe(m, tmp_m, &g->maps, group_link) {
 		/*
-		 * unmap_and_release() list_del's our group_link out as
-		 * part of its global-list-and-group-list teardown, then
-		 * frees the page pins / nvidia p2p refs / etc.  We don't
-		 * list_del here ourselves to keep the cleanup logic in
-		 * one place.
+		 * unmap_and_release() will list_del our group_link
+		 * out as part of its global-list-and-group-list
+		 * teardown, then free the page pins / nvidia p2p
+		 * refs / etc.  We don't list_del here ourselves to
+		 * keep the cleanup logic in one place.
 		 */
 		unmap_and_release(m);
 		n_drained++;
@@ -4079,8 +4159,10 @@ static void destroy_qgroup_locked(struct snvm_qgroup *g, struct ctrl *ctrl)
 	if (n_drained)
 		pr_info("snvme: destroy_qgroup id=%u drained %u map(s)\n",
 			g->group_id, n_drained);
+
 	g->nr_maps = 0;
 
+	/* ----- Step 3: release group_id ----- */
 	ida_simple_remove(&snvm_queue_group_ida, g->group_id);
 	kfree(g);
 }
