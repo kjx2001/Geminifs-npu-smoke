@@ -32,6 +32,12 @@ struct ctrl* ctrl_get(struct list* list, struct class* cls, struct pci_dev* pdev
     ctrl->ioq_num = 0;
     ctrl->ioq_map_num = 0;
     ctrl->cq_num = 0;
+    /* B3 queue-budget snapshot + user-QID pool (Chunk A fields). */
+    memset(&ctrl->setup, 0, sizeof(ctrl->setup));
+    ctrl->user_qid_bitmap = NULL;
+    ctrl->user_qid_first  = 0;
+    ctrl->user_qid_last   = 0;
+    mutex_init(&ctrl->user_qid_lock);
     // fixme: cdev name
     snprintf(ctrl->name, sizeof(ctrl->name), "%s%d", "ssnvme", ctrl->number);
     ctrl->name[sizeof(ctrl->name) - 1] = '\0';
@@ -49,6 +55,10 @@ void ctrl_put(struct ctrl* ctrl)
     {
         list_remove(&ctrl->list);
         ctrl_chrdev_remove(ctrl);
+        /* Release B3 user-QID pool state (Chunk A allocs). */
+        kfree(ctrl->user_qid_bitmap);
+        ctrl->user_qid_bitmap = NULL;
+        mutex_destroy(&ctrl->user_qid_lock);
         kfree(ctrl);
     }
 }

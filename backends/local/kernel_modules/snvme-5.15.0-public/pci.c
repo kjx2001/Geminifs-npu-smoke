@@ -224,6 +224,29 @@ struct nvme_dev {
 	unsigned int use_user_allocated;
 	unsigned int queue_on_host;
 	bool attrs_added;
+	/*
+	 * B3 queue-budget fields, copied from ctrl->setup at nvme_probe
+	 * time and consumed in s_nvme_setup_io_queues.
+	 *
+	 *   ctrl_max_io_queues   Captured from snvme_set_queue_count(),
+	 *                        the controller's authoritative IOQ
+	 *                        grant.  This is the upper bound on
+	 *                        legal QIDs for NVM_ADD_USER_QUEUE
+	 *                        (the user QID pool top).  NOT
+	 *                        equivalent to dev->max_qid, which is
+	 *                        the post-MSI-X kernel-used ceiling
+	 *                        and can be smaller on hosts where
+	 *                        MSI-X is the bottleneck.
+	 *
+	 *   cap_kernel_ioq       Mirror of ctrl->setup.cap_kernel_ioq.
+	 *                        0 = no override (kernel takes
+	 *                        num_possible_cpus() IOQs as usual);
+	 *                        N>0 = kernel takes at most N IOQs,
+	 *                        leaving the rest of the controller
+	 *                        grant for NVM_ADD_USER_QUEUE.
+	 */
+	unsigned int ctrl_max_io_queues;
+	unsigned int cap_kernel_ioq;
 };
 
 static int io_queue_depth_set(const char *val, const struct kernel_param *kp)
@@ -2461,9 +2484,17 @@ static int s_nvme_setup_io_queues(struct nvme_dev *dev)
 	/*
 	 * Sample the module parameters once at reset time so that we have
 	 * stable values to work with.
+	 *
+	 * Guard with !cap_kernel_ioq so that a B3 reset-rebind doesn't
+	 * clobber the per-BDF nr_write/nr_poll overrides that nvme_probe
+	 * copied from ctrl->setup.  When cap_kernel_ioq == 0 the user
+	 * has not opted in to B3 budget management, so the legacy
+	 * module-default sampling is correct.
 	 */
-	dev->nr_write_queues = write_queues;
-	dev->nr_poll_queues = poll_queues;
+	if (!dev->cap_kernel_ioq) {
+		dev->nr_write_queues = write_queues;
+		dev->nr_poll_queues = poll_queues;
+	}
 
 	nr_io_queues = dev->nr_allocated_queues - 1;
 	// To add the user_allocated_queues to the total num of queue 
@@ -2474,6 +2505,19 @@ static int s_nvme_setup_io_queues(struct nvme_dev *dev)
 	}
 	
 	result = snvme_set_queue_count(&dev->ctrl, &nr_io_queues);
+
+	/*
+	 * snvme B3: record the controller-granted IOQ ceiling.  This
+	 * is the authoritative bound for legal QID values used by
+	 * NVM_ADD_USER_QUEUE; the user QID pool will be
+	 * [online_queues..ctrl_max_io_queues].  Captured BEFORE any
+	 * downstream code mutates nr_io_queues (the cap-shrink below,
+	 * or the use_user_allocated reconciliation further down) so
+	 * the pool sizer always sees the controller's real grant --
+	 * not whatever value the kernel ends up consuming.
+	 */
+	if (result == 0)
+		dev->ctrl_max_io_queues = nr_io_queues;
 
 	if (dev->use_user_allocated){
 		if (nr_io_queues < dev->nr_allocated_queues - 1){
@@ -2502,6 +2546,34 @@ static int s_nvme_setup_io_queues(struct nvme_dev *dev)
 
 	if (nr_io_queues == 0)
 		return 0;
+
+	/*
+	 * B3 cap-only path (PORTING.md \xc2\xa77.3.1 #11): shrink the
+	 * kernel-side consumption to cap_kernel_ioq AFTER the
+	 * controller negotiation.  The controller already granted up
+	 * to nr_io_queues, but we want QIDs (cap_kernel_ioq+1 ..
+	 * ctrl_max_io_queues] to remain unused by the kernel so
+	 * NVM_ADD_USER_QUEUE can claim them.
+	 *
+	 * Guarded so it only fires when (a) cap_kernel_ioq was set --
+	 * otherwise the comparison is a no-op anyway, AND (b) we are
+	 * not on the legacy use_user_allocated path which has its own
+	 * reconciliation block above with squeeze semantics.  Order
+	 * matters: this must run AFTER nr_io_queues has been finalised
+	 * by snvme_set_queue_count + the use_user_allocated branch,
+	 * and BEFORE nvme_setup_irqs allocates IRQ vectors based on
+	 * the count (we want vectors sized for the kernel-only share,
+	 * not the full grant).
+	 */
+	if (dev->cap_kernel_ioq && !dev->use_user_allocated &&
+	    nr_io_queues > dev->cap_kernel_ioq) {
+		pr_info("snvme: capping kernel-side IOQ count from %u to %u "
+			"(ctrl_max=%u, user pool gets [%u..%u])\n",
+			nr_io_queues, dev->cap_kernel_ioq,
+			dev->ctrl_max_io_queues,
+			dev->cap_kernel_ioq + 1, dev->ctrl_max_io_queues);
+		nr_io_queues = dev->cap_kernel_ioq;
+	}
 
 	/*
 	 * Free IRQ resources as soon as NVMEQ_ENABLED bit transitions
@@ -3264,8 +3336,35 @@ static int nvme_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	else
 		dev->use_user_allocated = 0;
 
-	dev->nr_write_queues = write_queues;
-	dev->nr_poll_queues = poll_queues;
+	/*
+	 * B3 setup snapshot: copy ctrl->setup fields onto the per-dev
+	 * shadow that s_nvme_setup_io_queues consumes.  Gated on
+	 * ctrl->setup.valid because:
+	 *   - valid==0 means userspace never issued NVM_SET_IOQ_NUM
+	 *     /NVM_SET_KERNEL_IOQ_CAP, so keep upstream defaults;
+	 *   - valid==1 means at least one of the new ioctls has run
+	 *     and the snapshot is authoritative.
+	 *
+	 * cap_kernel_ioq=0 acts as "no override" inside
+	 * s_nvme_setup_io_queues, so a setup that left it zero (a
+	 * pure NVM_SET_IOQ_NUM without cap) still gets the upstream
+	 * num_possible_cpus() default for the kernel side.
+	 */
+	if (ctrl && ctrl->setup.valid) {
+		if (ctrl->setup.nr_write)
+			dev->nr_write_queues = ctrl->setup.nr_write;
+		else
+			dev->nr_write_queues = write_queues;
+		if (ctrl->setup.nr_poll)
+			dev->nr_poll_queues = ctrl->setup.nr_poll;
+		else
+			dev->nr_poll_queues = poll_queues;
+		dev->cap_kernel_ioq = ctrl->setup.cap_kernel_ioq;
+	} else {
+		dev->nr_write_queues = write_queues;
+		dev->nr_poll_queues  = poll_queues;
+		dev->cap_kernel_ioq  = 0;
+	}
 	dev->nr_allocated_queues = nvme_max_io_queues(dev) + 1;
 	dev->queues = kcalloc_node(dev->nr_allocated_queues,
 			sizeof(struct nvme_queue), GFP_KERNEL, node);
