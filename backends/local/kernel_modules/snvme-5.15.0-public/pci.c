@@ -9,6 +9,7 @@
 #include <linux/blkdev.h>
 #include <linux/blk-mq.h>
 #include <linux/blk-mq-pci.h>
+#include <linux/delay.h>
 #include <linux/dmi.h>
 #include <linux/init.h>
 #include <linux/interrupt.h>
@@ -3987,34 +3988,120 @@ static long snvm_dev_map_ioctl(struct file* file, unsigned int cmd, unsigned lon
 		}
 		case NVM_GET_DEV_INFO:
 		{
+			/*
+			 * Race fix (PORTING.md \xc2\xa77.3.1 trap "NVM_GET_DEV_INFO vs
+			 * nvme_scan_work"): snvme_start_ctrl() enqueues
+			 * nvme_scan_work asynchronously on s_nvme_wq; the cdev
+			 * /dev/ssnvme<N> is already callable when the caller of
+			 * SNVM_DEVICE_BIND returns, so userspace can legitimately
+			 * reach this ioctl *before* the worker has scanned out
+			 * nsid=1 and list_add_tail()'d it on ctrl->namespaces.
+			 *
+			 * Mitigation: flush_work(&ctrl->scan_work) synchronously
+			 * waits for the in-flight scan to complete, then retry the
+			 * lookup.  flush_work is documented to be safe even when
+			 * the work was never queued (it returns false immediately).
+			 * Bound the total wait at 5 s to preserve userspace EFAULT
+			 * semantics if the controller is genuinely broken (admin
+			 * queue dead, scan never enqueued because state never
+			 * reached NVME_CTRL_LIVE).
+			 */
+			unsigned int wait_ms;
+
 			ndev = pci_get_drvdata(ctrl->pdev);
-			if(ndev == NULL)
-			{
+			if (ndev == NULL) {
 				printk(" pci_get_drvdata error\n");
 				return -EFAULT;
 			}
-			ns = snvme_find_get_ns(&ndev->ctrl,1);
-			if(ns == NULL)
-			{	
-				printk(" s_snvme_find_get_ns error\n");
-				return -EFAULT;
-			}
-			printk("ns disk info: seq %lld, name %s", ns->disk->diskseq, ns->disk->disk_name);
-			
-			memcpy(drequest.disk_name, ns->disk->disk_name, DISK_NAME_LEN * sizeof(char));
-			drequest.start_cq_idx = ndev->user_start_qid;
-			drequest.dstrd        = ndev->db_stride;
-			drequest.nr_user_q    = ndev->nr_user_use_cq;
-			drequest.block_size   = 1 << ns->lba_shift;
-			drequest.max_data_size= ndev->ctrl.max_hw_sectors;
-			if (ns)
-				snvme_put_ns(ns);
 
-			if (copy_to_user((void __user*) arg, &drequest, sizeof(struct nvm_ioctl_dev)))
-			{
-				return -EFAULT;
+			ns = snvme_find_get_ns(&ndev->ctrl, 1);
+			if (!ns) {
+				wait_ms = 0;
+				flush_work(&ndev->ctrl.scan_work);
+				ns = snvme_find_get_ns(&ndev->ctrl, 1);
+				while (!ns && wait_ms < 5000) {
+					msleep(50);
+					wait_ms += 50;
+					flush_work(&ndev->ctrl.scan_work);
+					ns = snvme_find_get_ns(&ndev->ctrl, 1);
+				}
+				if (!ns) {
+					pr_err("snvme: snvme_find_get_ns(nsid=1) failed after %u ms wait (state=%d)\n",
+					       wait_ms, ndev->ctrl.state);
+					return -EFAULT;
+				}
+				pr_info("snvme: NVM_GET_DEV_INFO: nsid=1 ready after %u ms scan wait\n",
+					wait_ms);
 			}
-			
+
+			/*
+			 * Zero the response struct before populating so any
+			 * fields the kernel doesn't fill in are deterministic
+			 * (the prior code returned stack garbage in q_depth /
+			 * max_user_qid / sgl_supported -- now MBZ).
+			 */
+			memset(&drequest, 0, sizeof(drequest));
+			memcpy(drequest.disk_name, ns->disk->disk_name,
+			       DISK_NAME_LEN * sizeof(char));
+			/*
+			 * start_cq_idx: first QID available to user IOQs.
+			 * Old path (NVM_SET_SHARE_REG -> probe -> mix) sets
+			 * user_start_qid = online_queues at the end of mix.
+			 * New path (no SET_SHARE_REG) leaves user_start_qid at
+			 * 0; fall back to online_queues so userspace gets a
+			 * consistent answer regardless of which flow brought
+			 * the controller up.
+			 */
+			drequest.start_cq_idx  = ndev->user_start_qid
+						 ? ndev->user_start_qid
+						 : ndev->online_queues;
+			drequest.dstrd         = ndev->db_stride;
+			drequest.nr_user_q     = ndev->nr_user_use_cq;
+			drequest.block_size    = 1 << ns->lba_shift;
+			drequest.max_data_size = ndev->ctrl.max_hw_sectors;
+
+			/*
+			 * B3 fields.  These are the single source of truth for
+			 * userspace ring sizing and QID allocation:
+			 *
+			 *   q_depth                NVMe CAP.MQES + 1, clamped by
+			 *                          io_queue_depth module param.
+			 *                          Applies to *every* user queue.
+			 *   bar0_size              Full BAR0 region size; userspace
+			 *                          mmaps up to this many bytes
+			 *                          starting at offset 0 to reach
+			 *                          all doorbell registers.
+			 *   max_user_qid           Highest QID kernel will hand out
+			 *                          via NVM_ADD_USER_QUEUE, inclusive.
+			 *                          User QID pool is
+			 *                          [start_cq_idx, max_user_qid].
+			 *                          5.15.0 sources this from
+			 *                          ndev->max_qid (the controller-
+			 *                          granted IOQ ceiling after
+			 *                          MSI-X negotiation; the 5.4.241
+			 *                          baseline uses
+			 *                          ndev->ctrl_max_io_queues, which
+			 *                          5.15.0 does not have).
+			 *   max_queues_per_group   Echoes the kernel-fixed cap
+			 *                          (NVM_MAX_QUEUES_PER_GROUP) so
+			 *                          userspace doesn't have to
+			 *                          hardcode the value.
+			 *   sgl_supported          Identify Controller SGLS dword;
+			 *                          userspace uses this to decide
+			 *                          whether CDW0.PSDT=1 is safe.
+			 */
+			drequest.q_depth              = (uint16_t)ndev->q_depth;
+			drequest.bar0_size            = (uint32_t)pci_resource_len(ctrl->pdev, 0);
+			drequest.max_user_qid         = ndev->max_qid;
+			drequest.max_queues_per_group = NVM_MAX_QUEUES_PER_GROUP;
+			drequest.sgl_supported        = (uint32_t)ndev->ctrl.sgls;
+
+			snvme_put_ns(ns);
+
+			if (copy_to_user((void __user*) arg, &drequest,
+					 sizeof(struct nvm_ioctl_dev)))
+				return -EFAULT;
+
 			ret = 0;
 			break;
 		}
