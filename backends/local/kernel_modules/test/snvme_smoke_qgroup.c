@@ -470,13 +470,17 @@ int main(int argc, char** argv) {
         req.ioq_idx     = -1;
         req.is_cq       = -1;
         req.group_id    = group_d;
-        req.reserved    = 0xdeadbeef;
+        /* B6: `reserved` was renamed to `map_kind` (1 B) +
+         * `reserved0[3]`.  Probe the MBZ check by setting one of
+         * the reserved padding bytes; the kernel must still
+         * reject the request with -EINVAL.                       */
+        req.reserved0[1] = 0xab;
         int r = ioctl(fd_a, NVM_MAP_HOST_MEMORY, &req);
         if (r == 0)
-            step_fail(0, "NVM_MAP_HOST_MEMORY with reserved!=0 unexpectedly "
+            step_fail(0, "NVM_MAP_HOST_MEMORY with reserved0!=0 unexpectedly "
                          "succeeded -- MBZ check missing");
         if (errno != EINVAL)
-            step_fail(errno, "NVM_MAP_HOST_MEMORY with reserved!=0 errno=%d, "
+            step_fail(errno, "NVM_MAP_HOST_MEMORY with reserved0!=0 errno=%d, "
                              "expected EINVAL(%d)", errno, EINVAL);
         munmap(probe_buf, (size_t)psz);
         step_ok("NVM_MAP_HOST_MEMORY reserved-MBZ check returns -EINVAL");

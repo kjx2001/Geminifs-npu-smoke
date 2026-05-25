@@ -429,31 +429,71 @@ enum nvm_ioctl_type {
 #### 4.3.1 `NVM_MAP_*` — pin user/GPU pages and report IO addresses
 
 ```c
+enum nvm_map_kind {
+    NVM_MAP_KIND_UNSPECIFIED = 0,   /* legacy / pre-B6 binary       */
+    NVM_MAP_KIND_RING_SQ     = 1,   /* user IO Submission Queue ring */
+    NVM_MAP_KIND_RING_CQ     = 2,   /* user IO Completion Queue ring */
+    NVM_MAP_KIND_DATA        = 3,   /* PRP / SGL data buffer         */
+};
+
 struct nvm_ioctl_map {
     uint64_t  vaddr_start;   /* userspace VA of the buffer (page-aligned)   */
     size_t    n_pages;       /* host-page count for HOST, GPU-page count    */
                              /*   for DEVICE/DEVICE_QUEUE                   */
     uint64_t *ioaddrs;       /* OUT: kernel writes IO addresses here        */
     int       ioq_idx;       /* legacy B0: >=0 = queue ring, <0 = PRP/data  */
-                             /*   B3: pass -1 (queue role recovered later   */
-                             /*   from NVM_ADD_USER_QUEUE)                  */
-    int       is_cq;         /* legacy B0: 1=CQ ring, 0=SQ ring; B3: -1     */
+                             /*   B3+: pass -1                              */
+    int       is_cq;         /* legacy B0: 1=CQ ring, 0=SQ ring; B3+: -1    */
     uint32_t  group_id;      /* B3: register against this queue group       */
-                             /*   (0 = legacy / no group)                   */
+                             /*   (0 = fd-scoped DATA / legacy)             */
+    uint8_t   map_kind;      /* B6: enum nvm_map_kind                       */
+    uint8_t   reserved0[3];  /* MBZ                                         */
 };
 ```
 
 The kernel pins the pages (via `get_user_pages_fast` for HOST, via
 `nvidia_p2p_get_pages` for DEVICE/DEVICE_QUEUE), records the IO
 addresses into the user-supplied `ioaddrs[]` array, and links the
-resulting descriptor onto **two** lists:
+resulting descriptor onto two lists; **which secondary list it goes
+on depends on `map_kind`**:
 
-- the per-controller `host_list` / `device_list` /
-  `device_queue_list` (for legacy B0 lookup), and
-- the per-queue-group `g->maps` list (B3) when `group_id != 0`,
-  so that `NVM_DESTROY_QUEUE_GROUP` / fd close cascade-cleanup
-  can release every page automatically without the user having
-  to call `NVM_UNMAP_*`.
+| `map_kind`           | secondary list           | lifecycle                                   |
+| -------------------- | ------------------------ | ------------------------------------------- |
+| `RING_SQ` / `RING_CQ`| `g->maps` of `group_id`  | drained by `NVM_DESTROY_QUEUE_GROUP`        |
+| `DATA`               | `own->data_maps` (per-fd)| reaped only on fd close (or `NVM_UNMAP_*`)  |
+| `UNSPECIFIED` (= 0)  | `g->maps` if `group_id`  | back-compat; behaves as B2..B5              |
+|                      | else legacy global only  |                                             |
+
+Plus, in every case, the descriptor is also threaded onto the
+per-controller `host_list` / `device_list` / `device_queue_list`
+so legacy `NVM_UNMAP_*` `vaddr → map` lookups still work.
+
+This decouples long-lived data buffers from short-lived queue
+groups -- the common pattern of "one DMA pool, many groups" needs
+no `NVM_UNMAP_*` between groups:
+
+```
+  open(/dev/ssnvme*)
+  NVM_MAP_HOST_MEMORY(kind=DATA, big DMA pool, group_id=0)   <-- once
+  loop:
+      NVM_CREATE_QUEUE_GROUP -> g
+      NVM_MAP_HOST_MEMORY(kind=RING_SQ/RING_CQ, group_id=g)   <-- per group
+      NVM_ADD_USER_QUEUE
+      ... IO ...
+      NVM_DESTROY_QUEUE_GROUP                                 <-- destroys
+                                                                  rings;
+                                                                  data pool
+                                                                  untouched
+  close(fd)                                                    <-- finally
+                                                                   releases the
+                                                                   data pool
+```
+
+`map_kind` also lets `NVM_ADD_USER_QUEUE` reject mismatched
+buffer roles up front (`-EINVAL`) instead of issuing
+`Create I/O SQ` against a data buffer's DMA address and
+silently corrupting controller state.  See §7.3.1 trap
+"`map_kind` enforcement at `NVM_ADD_USER_QUEUE` lookup".
 
 > **B3 alignment rule.** Host pages are 4 KiB (PAGE_SIZE);
 > GPU pages are 64 KiB (`GPU_PAGE_SHIFT=16` in `snvme/map.c`).
@@ -870,6 +910,14 @@ verification loop in the GPU smoke.  Reference implementations:
 >    destroy across every group on the closing fd, with the same
 >    Delete-I/O-{SQ,CQ}-then-unmap semantics as explicit destroy.
 >    This is what makes `kill -9 <smoke>` safe.
+>
+> 6. `NVM_MAP_KIND_DATA` maps live on the per-fd `own->data_maps`
+>    list, NOT on any `g->maps`, and MUST NOT be touched by
+>    `NVM_DESTROY_QUEUE_GROUP` / `destroy_qgroup_locked`.  They
+>    are reaped only by `snvm_dev_release` (fd close) or by an
+>    explicit `NVM_UNMAP_*` from userspace.  This invariant is
+>    what lets a long-lived data-buffer DMA pool span many
+>    short-lived queue groups without a per-group re-pin (§4.3.1).
 
 ### 5.2 B0 legacy pre-bind flow (for back-compat only)
 
@@ -1472,6 +1520,34 @@ Re-audit each one after §7.1.
   controllers.  Verify with: after `NVM_GET_DEV_INFO`, every field
   in §4.3.2 must be non-zero except `nr_user_q` (legacy, 0 in B3
   flow).
+
+- **`map_kind` enforcement at `NVM_ADD_USER_QUEUE` lookup.**
+  (`snvme/pci.c` ADD_USER_QUEUE case + `snvme/map.h` `struct map`.)
+  Pre-B6 the lookup that resolves `(sq_vaddr, cq_vaddr)` against
+  `g->maps` did **only** a vaddr-mask comparison, with nothing on
+  the kernel side stopping userspace from passing a data-buffer
+  vaddr where a ring vaddr was meant -- the kernel would then
+  Create I/O SQ with PRP1 = data buffer's dma_addr, the controller
+  would read garbage as SQEs, and the failure mode is silent
+  corruption / controller hang rather than a clean `-EINVAL`.
+
+  Fix shape: tag every `struct map` with `enum nvm_map_kind`
+  (`RING_SQ`, `RING_CQ`, `DATA`, or `UNSPECIFIED` for pre-B6
+  callers).  In the lookup, only `RING_SQ` matches `sq_vaddr` and
+  only `RING_CQ` matches `cq_vaddr`; `DATA` maps are skipped
+  outright; `UNSPECIFIED` (back-compat) matches either slot
+  exactly as before.  Mismatch → `-EINVAL` up front.
+
+  Also: `DATA` maps live on `own->data_maps` (per-fd), NOT on
+  `g->maps`, so they survive `NVM_DESTROY_QUEUE_GROUP` and only
+  get reaped on fd close.  This is the lifecycle decoupling
+  documented in §4.3.1.  Re-audit rule: any uplift that touches
+  the ADD_USER_QUEUE handler, `struct map`, or the
+  `snvm_dev_open` / `_release` lifecycle MUST re-verify that
+  `map_purge_by_owner` does not also walk `data_maps` (it would
+  double-free; `snvm_dev_release` already drains `data_maps`
+  separately) AND that destroy_qgroup_locked does NOT touch the
+  fd-scoped `data_maps` list.
 
 None of these are detected by the smoke tests as written — the
 smoke tests run the happy path. They are detected by (a) reading

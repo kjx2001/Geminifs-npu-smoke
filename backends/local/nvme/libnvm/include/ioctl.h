@@ -33,7 +33,17 @@
  *   The project is open-source / pre-stable; we deliberately do
  *   not preserve the legacy layout.
  *
- * Modes (kernel branches on group_id):
+ * ABI rev note (queue-group plan, step B6):
+ *
+ *   `reserved` (uint32_t) split into `map_kind` (1 byte) +
+ *   `reserved0` (3 bytes).  This is a *layout-compatible* change:
+ *   pre-B6 binaries set `reserved = 0`, which maps to
+ *   `map_kind = NVM_MAP_KIND_UNSPECIFIED` and triggers the
+ *   legacy code path (kind-tag is ignored, group_id discriminates
+ *   between legacy global lists and per-fd queue groups exactly
+ *   as in B2..B5).  _IOC_SIZE is unchanged.
+ *
+ * Modes (kernel branches on group_id and map_kind):
  *
  *   group_id == 0   "legacy" mode.  The map is registered against
  *                   the controller-global host_list / device_list /
@@ -61,9 +71,55 @@
  *                   should still set them to -1 / -1 for
  *                   forward-compat with possible future use.
  *
- * `reserved` is MBZ; future revisions may add e.g. NUMA hints
+ * map_kind (B6):
+ *
+ *   When map_kind is non-zero (any of RING_SQ / RING_CQ / DATA),
+ *   the kernel knows what role the buffer plays without having to
+ *   infer it from vaddr alignment or NVM_ADD_USER_QUEUE timing:
+ *
+ *     RING_SQ / RING_CQ:  must carry a non-zero group_id.  The
+ *                         map is linked onto g->maps as in B2.
+ *                         NVM_ADD_USER_QUEUE then enforces that
+ *                         pairs[i].sq_vaddr resolves to a RING_SQ
+ *                         map and pairs[i].cq_vaddr to a RING_CQ
+ *                         map; mismatched kinds are rejected with
+ *                         -EINVAL up front (instead of issuing
+ *                         Create I/O SQ on a data buffer and
+ *                         silently corrupting controller state).
+ *
+ *     DATA:               linked onto a per-fd `data_maps` list,
+ *                         NOT g->maps.  group_id, if supplied, is
+ *                         IGNORED for lifecycle purposes -- DATA
+ *                         maps survive NVM_DESTROY_QUEUE_GROUP and
+ *                         only get released on fd close (or by an
+ *                         explicit NVM_UNMAP_*).  This decouples
+ *                         the data-buffer DMA pool's lifetime from
+ *                         the queue group's, which matches the
+ *                         common usage pattern (one long-lived
+ *                         data pool, many short-lived queue
+ *                         groups).
+ *
+ *     UNSPECIFIED (= 0):  legacy / pre-B6 binary.  The kernel
+ *                         falls back to the B2..B5 behaviour:
+ *                         group_id alone discriminates between
+ *                         per-fd group attachment and the
+ *                         controller-global lists, and
+ *                         NVM_ADD_USER_QUEUE's vaddr lookup does
+ *                         not consult the kind tag.  No new
+ *                         compile-time UAPI users should set this.
+ *
+ * `reserved0` is MBZ; future revisions may add e.g. NUMA hints
  * without another ABI break.
  */
+
+/* Map-kind enum used by struct nvm_ioctl_map::map_kind (B6).        */
+enum nvm_map_kind {
+    NVM_MAP_KIND_UNSPECIFIED = 0,   /* legacy / pre-B6 binary       */
+    NVM_MAP_KIND_RING_SQ     = 1,   /* user IO Submission Queue ring */
+    NVM_MAP_KIND_RING_CQ     = 2,   /* user IO Completion Queue ring */
+    NVM_MAP_KIND_DATA        = 3,   /* PRP / SGL data buffer         */
+};
+
 struct nvm_ioctl_map
 {
     uint64_t    vaddr_start;
@@ -72,7 +128,8 @@ struct nvm_ioctl_map
     int         ioq_idx;        /* legacy mode only; -1 in new mode  */
     int         is_cq;          /* legacy mode only; -1 in new mode  */
     uint32_t    group_id;       /* 0 = legacy; nonzero = new mode    */
-    uint32_t    reserved;       /* MBZ; future extension             */
+    uint8_t     map_kind;       /* enum nvm_map_kind (B6)            */
+    uint8_t     reserved0[3];   /* MBZ; future extension             */
 };
 
 /*

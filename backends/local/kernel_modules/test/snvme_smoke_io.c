@@ -523,6 +523,7 @@ int main(int argc, char** argv) {
         req.ioq_idx     = -1;
         req.is_cq       = -1;
         req.group_id    = group_id;
+        req.map_kind    = NVM_MAP_KIND_RING_SQ;
         if (do_ioctl(fd_dev, NVM_MAP_HOST_MEMORY, &req,
                      "NVM_MAP_HOST_MEMORY(SQ)") < 0)
             step_fail(errno, "NVM_MAP_HOST_MEMORY pair %u SQ", i);
@@ -534,12 +535,16 @@ int main(int argc, char** argv) {
         req.ioq_idx     = -1;
         req.is_cq       = -1;
         req.group_id    = group_id;
+        req.map_kind    = NVM_MAP_KIND_RING_CQ;
         if (do_ioctl(fd_dev, NVM_MAP_HOST_MEMORY, &req,
                      "NVM_MAP_HOST_MEMORY(CQ)") < 0)
             step_fail(errno, "NVM_MAP_HOST_MEMORY pair %u CQ", i);
     }
 
-    /* Data buffers: capture ioaddr for PRP1 use later. */
+    /* Data buffers: capture ioaddr for PRP1 use later.  Registered
+     * with kind=DATA + group_id=0 so they are fd-scoped (B6) -- they
+     * survive NVM_DESTROY_QUEUE_GROUP and only get reaped on close().
+     * This is what Phase 7 below actually verifies.                 */
     {
         struct nvm_ioctl_map req;
         memset(&req, 0, sizeof(req));
@@ -548,7 +553,8 @@ int main(int argc, char** argv) {
         req.ioaddrs     = &wbuf_ioaddr;
         req.ioq_idx     = -1;
         req.is_cq       = -1;
-        req.group_id    = group_id;
+        req.group_id    = 0;
+        req.map_kind    = NVM_MAP_KIND_DATA;
         if (do_ioctl(fd_dev, NVM_MAP_HOST_MEMORY, &req,
                      "NVM_MAP_HOST_MEMORY(wbuf)") < 0)
             step_fail(errno, "NVM_MAP_HOST_MEMORY wbuf");
@@ -561,7 +567,8 @@ int main(int argc, char** argv) {
         req.ioaddrs     = &rbuf_ioaddr;
         req.ioq_idx     = -1;
         req.is_cq       = -1;
-        req.group_id    = group_id;
+        req.group_id    = 0;
+        req.map_kind    = NVM_MAP_KIND_DATA;
         if (do_ioctl(fd_dev, NVM_MAP_HOST_MEMORY, &req,
                      "NVM_MAP_HOST_MEMORY(rbuf)") < 0)
             step_fail(errno, "NVM_MAP_HOST_MEMORY rbuf");
@@ -758,7 +765,8 @@ int main(int argc, char** argv) {
         req.ioaddrs     = wbuf2_ioaddr;
         req.ioq_idx     = -1;
         req.is_cq       = -1;
-        req.group_id    = group_id;
+        req.group_id    = 0;
+        req.map_kind    = NVM_MAP_KIND_DATA;
         if (do_ioctl(fd_dev, NVM_MAP_HOST_MEMORY, &req,
                      "NVM_MAP_HOST_MEMORY(wbuf2 x 2)") < 0)
             step_fail(errno, "NVM_MAP_HOST_MEMORY wbuf2");
@@ -769,7 +777,8 @@ int main(int argc, char** argv) {
         req.ioaddrs     = rbuf2_ioaddr;
         req.ioq_idx     = -1;
         req.is_cq       = -1;
-        req.group_id    = group_id;
+        req.group_id    = 0;
+        req.map_kind    = NVM_MAP_KIND_DATA;
         if (do_ioctl(fd_dev, NVM_MAP_HOST_MEMORY, &req,
                      "NVM_MAP_HOST_MEMORY(rbuf2 x 2)") < 0)
             step_fail(errno, "NVM_MAP_HOST_MEMORY rbuf2");
@@ -888,7 +897,8 @@ int main(int argc, char** argv) {
         req.ioaddrs     = wbuf4_ioaddr;
         req.ioq_idx     = -1;
         req.is_cq       = -1;
-        req.group_id    = group_id;
+        req.group_id    = 0;
+        req.map_kind    = NVM_MAP_KIND_DATA;
         if (do_ioctl(fd_dev, NVM_MAP_HOST_MEMORY, &req,
                      "NVM_MAP_HOST_MEMORY(wbuf4 x 4)") < 0)
             step_fail(errno, "NVM_MAP_HOST_MEMORY wbuf4");
@@ -899,7 +909,8 @@ int main(int argc, char** argv) {
         req.ioaddrs     = rbuf4_ioaddr;
         req.ioq_idx     = -1;
         req.is_cq       = -1;
-        req.group_id    = group_id;
+        req.group_id    = 0;
+        req.map_kind    = NVM_MAP_KIND_DATA;
         if (do_ioctl(fd_dev, NVM_MAP_HOST_MEMORY, &req,
                      "NVM_MAP_HOST_MEMORY(rbuf4 x 4)") < 0)
             step_fail(errno, "NVM_MAP_HOST_MEMORY rbuf4");
@@ -910,7 +921,8 @@ int main(int argc, char** argv) {
         req.ioaddrs     = &prp_list_w_ioaddr;
         req.ioq_idx     = -1;
         req.is_cq       = -1;
-        req.group_id    = group_id;
+        req.group_id    = 0;
+        req.map_kind    = NVM_MAP_KIND_DATA;
         if (do_ioctl(fd_dev, NVM_MAP_HOST_MEMORY, &req,
                      "NVM_MAP_HOST_MEMORY(prp_list_w)") < 0)
             step_fail(errno, "NVM_MAP_HOST_MEMORY prp_list_w");
@@ -921,7 +933,8 @@ int main(int argc, char** argv) {
         req.ioaddrs     = &prp_list_r_ioaddr;
         req.ioq_idx     = -1;
         req.is_cq       = -1;
-        req.group_id    = group_id;
+        req.group_id    = 0;
+        req.map_kind    = NVM_MAP_KIND_DATA;
         if (do_ioctl(fd_dev, NVM_MAP_HOST_MEMORY, &req,
                      "NVM_MAP_HOST_MEMORY(prp_list_r)") < 0)
             step_fail(errno, "NVM_MAP_HOST_MEMORY prp_list_r");
@@ -1155,14 +1168,220 @@ int main(int argc, char** argv) {
     }
 
     /* ============================================================== */
-    /* Phase 7: Tear-down.                                            */
+    /* Phase 7: B6 fd-scoped DATA buffer survives group destroy.       */
+    /*                                                                 */
+    /* End of Phase 6 -- destroy the queue group while every data      */
+    /* buffer (wbuf, rbuf, wbuf2, ..., prp_list_*) was registered      */
+    /* with map_kind=NVM_MAP_KIND_DATA + group_id=0.  By design those  */
+    /* are linked onto own->data_maps, NOT g->maps, so the cascade     */
+    /* should drain ONLY the 4 ring maps (TEST_NR_QUEUES*2) and leave  */
+    /* every DATA descriptor still pinned + DMA-mapped.                */
+    /*                                                                 */
+    /* Then re-create a group, re-allocate fresh SQ/CQ rings (the      */
+    /* NVMe spec requires Create I/O SQ/CQ to point at fresh rings;    */
+    /* nothing here re-uses the previous ring memory), re-issue        */
+    /* NVM_ADD_USER_QUEUE -- and run a 4 KiB write+read+verify on the  */
+    /* SAME wbuf / rbuf the previous group was using.  If anything in  */
+    /* the B6 plumbing is wrong (DATA map got cascade-destroyed; the   */
+    /* IOMMU mapping was torn down; the fd-scoped list lost the        */
+    /* descriptor), the read either fails with -EFAULT, comes back     */
+    /* with an NVMe status error, or returns the wrong bytes.          */
+    /*                                                                 */
+    /* Note: BAR0 is still mmap'd (we didn't munmap above), which is   */
+    /* fine because the doorbell offsets the new ADD_USER_QUEUE        */
+    /* returns are absolute BAR0 byte offsets -- they index the same   */
+    /* mapping cleanly.                                                */
+    /* ============================================================== */
+    {
+        /* a. Destroy the original group.  Should drain only rings.   */
+        uint32_t gid_old = group_id;
+        if (do_ioctl(fd_dev, NVM_DESTROY_QUEUE_GROUP, &gid_old,
+                     "NVM_DESTROY_QUEUE_GROUP(B6 first destroy)") < 0)
+            step_fail(errno, "NVM_DESTROY_QUEUE_GROUP B6 first destroy");
+        step_ok("Phase 7a: NVM_DESTROY_QUEUE_GROUP id=%u drains only %u "
+                "ring map(s) (DATA buffers stay alive on own->data_maps)",
+                group_id, TEST_NR_QUEUES * 2);
+
+        /* b. Re-create a queue group on the same fd. */
+        uint32_t group_id_b6 = 0;
+        {
+            struct nvm_ioctl_queue_group req;
+            memset(&req, 0, sizeof(req));
+            if (do_ioctl(fd_dev, NVM_CREATE_QUEUE_GROUP, &req,
+                         "NVM_CREATE_QUEUE_GROUP(B6)") < 0)
+                step_fail(errno, "NVM_CREATE_QUEUE_GROUP B6");
+            group_id_b6 = req.group_id;
+        }
+        step_ok("Phase 7b: NVM_CREATE_QUEUE_GROUP -> group_id=%u (post-destroy)",
+                group_id_b6);
+
+        /* c. Re-allocate fresh rings + map them with kind=RING_*. */
+        struct nvme_sqe* sq_buf_b6[TEST_NR_QUEUES];
+        struct nvme_cqe* cq_buf_b6[TEST_NR_QUEUES];
+        for (unsigned i = 0; i < TEST_NR_QUEUES; i++) {
+            size_t sq_sz = (size_t)info.q_depth * sizeof(struct nvme_sqe);
+            size_t cq_sz = (size_t)info.q_depth * sizeof(struct nvme_cqe);
+            sq_buf_b6[i] = (struct nvme_sqe*)alloc_aligned(sq_sz, psz);
+            cq_buf_b6[i] = (struct nvme_cqe*)alloc_aligned(cq_sz, psz);
+            if (!sq_buf_b6[i] || !cq_buf_b6[i])
+                step_fail(errno, "B6 alloc rings %u", i);
+            memset(sq_buf_b6[i], 0, sq_sz);
+            memset(cq_buf_b6[i], 0, cq_sz);
+        }
+
+        for (unsigned i = 0; i < TEST_NR_QUEUES; i++) {
+            uint64_t throwaway[1];
+            struct nvm_ioctl_map req;
+
+            memset(&req, 0, sizeof(req));
+            req.vaddr_start = (uint64_t)(uintptr_t)sq_buf_b6[i];
+            req.n_pages     = 1;
+            req.ioaddrs     = throwaway;
+            req.ioq_idx     = -1;
+            req.is_cq       = -1;
+            req.group_id    = group_id_b6;
+            req.map_kind    = NVM_MAP_KIND_RING_SQ;
+            if (do_ioctl(fd_dev, NVM_MAP_HOST_MEMORY, &req,
+                         "NVM_MAP_HOST_MEMORY(B6 SQ)") < 0)
+                step_fail(errno, "NVM_MAP_HOST_MEMORY B6 SQ %u", i);
+
+            memset(&req, 0, sizeof(req));
+            req.vaddr_start = (uint64_t)(uintptr_t)cq_buf_b6[i];
+            req.n_pages     = 1;
+            req.ioaddrs     = throwaway;
+            req.ioq_idx     = -1;
+            req.is_cq       = -1;
+            req.group_id    = group_id_b6;
+            req.map_kind    = NVM_MAP_KIND_RING_CQ;
+            if (do_ioctl(fd_dev, NVM_MAP_HOST_MEMORY, &req,
+                         "NVM_MAP_HOST_MEMORY(B6 CQ)") < 0)
+                step_fail(errno, "NVM_MAP_HOST_MEMORY B6 CQ %u", i);
+        }
+        step_ok("Phase 7c: NVM_MAP_HOST_MEMORY x %u fresh ring(s) registered "
+                "against group_id=%u; existing DATA maps untouched",
+                TEST_NR_QUEUES * 2, group_id_b6);
+
+        /* d. Issue NVM_ADD_USER_QUEUE for the fresh rings. */
+        struct nvm_ioctl_add_user_queue add_req;
+        memset(&add_req, 0, sizeof(add_req));
+        add_req.group_id = group_id_b6;
+        add_req.nr_pairs = TEST_NR_QUEUES;
+        for (unsigned i = 0; i < TEST_NR_QUEUES; i++) {
+            add_req.pairs[i].sq_vaddr = (uint64_t)(uintptr_t)sq_buf_b6[i];
+            add_req.pairs[i].cq_vaddr = (uint64_t)(uintptr_t)cq_buf_b6[i];
+        }
+        if (do_ioctl(fd_dev, NVM_ADD_USER_QUEUE, &add_req,
+                     "NVM_ADD_USER_QUEUE(B6)") < 0)
+            step_fail(errno, "NVM_ADD_USER_QUEUE B6");
+        step_ok("Phase 7d: NVM_ADD_USER_QUEUE created %u user queue(s) "
+                "(qids %u..%u)", TEST_NR_QUEUES,
+                add_req.out_pairs[0].qid,
+                add_req.out_pairs[TEST_NR_QUEUES - 1].qid);
+
+        /* e. Build per-queue runtime state and run a 4 KiB W+R+verify
+         *    using the SAME wbuf/rbuf that survived the group destroy.   */
+        struct test_queue qb6_w;
+        struct test_queue qb6_r;
+        memset(&qb6_w, 0, sizeof(qb6_w));
+        memset(&qb6_r, 0, sizeof(qb6_r));
+        qb6_w.sq      = sq_buf_b6[0];
+        qb6_w.cq      = cq_buf_b6[0];
+        qb6_w.q_depth = info.q_depth;
+        qb6_w.qid     = (uint16_t)add_req.out_pairs[0].qid;
+        qb6_w.cq_phase = 1;
+        qb6_w.sq_db   = (volatile uint32_t*)
+            ((uint8_t*)bar0 + add_req.out_pairs[0].sq_doorbell_offset);
+        qb6_w.cq_db   = (volatile uint32_t*)
+            ((uint8_t*)bar0 + add_req.out_pairs[0].cq_doorbell_offset);
+        qb6_r.sq      = sq_buf_b6[1 % TEST_NR_QUEUES];
+        qb6_r.cq      = cq_buf_b6[1 % TEST_NR_QUEUES];
+        qb6_r.q_depth = info.q_depth;
+        qb6_r.qid     = (uint16_t)add_req.out_pairs[1 % TEST_NR_QUEUES].qid;
+        qb6_r.cq_phase = 1;
+        qb6_r.sq_db   = (volatile uint32_t*)
+            ((uint8_t*)bar0 + add_req.out_pairs[1 % TEST_NR_QUEUES].sq_doorbell_offset);
+        qb6_r.cq_db   = (volatile uint32_t*)
+            ((uint8_t*)bar0 + add_req.out_pairs[1 % TEST_NR_QUEUES].cq_doorbell_offset);
+
+        /* Stamp wbuf with a B6-specific pattern so we know we're not
+         * reading something the previous group left there.            */
+        const uint8_t b6_pat = (uint8_t)(0x5A ^ qb6_w.qid);
+        memset(wbuf, 0, info.block_size);
+        for (size_t b = 0; b < info.block_size; b++)
+            ((uint8_t*)wbuf)[b] = b6_pat ^ (uint8_t)(b >> 12);
+
+        const uint64_t b6_lba = TEST_LBA_BASE + 50000;
+        char status_buf[64];
+        struct nvme_cqe cqe;
+        uint16_t cid_w;
+
+        tq_submit_rw(&qb6_w, NVME_OPC_WRITE, NVME_FLAG_PSDT_PRP,
+                     1, wbuf_ioaddr, 0, b6_lba, 0, &cid_w);
+        int rc = tq_poll_one(&qb6_w, &cqe, 5000);
+        if (rc) step_fail(-rc, "B6 Write poll rc=%d", rc);
+        if ((cqe.status >> 1) != 0) {
+            format_status(cqe.status, status_buf, sizeof(status_buf));
+            step_fail(0, "B6 Write status %s", status_buf);
+        }
+        if (cqe.cid != cid_w)
+            step_fail(0, "B6 Write CQE.cid=%u want %u", cqe.cid, cid_w);
+
+        memset(rbuf, 0, info.block_size);
+        uint16_t cid_r;
+        tq_submit_rw(&qb6_r, NVME_OPC_READ, NVME_FLAG_PSDT_PRP,
+                     1, rbuf_ioaddr, 0, b6_lba, 0, &cid_r);
+        rc = tq_poll_one(&qb6_r, &cqe, 5000);
+        if (rc) step_fail(-rc, "B6 Read poll rc=%d", rc);
+        if ((cqe.status >> 1) != 0) {
+            format_status(cqe.status, status_buf, sizeof(status_buf));
+            step_fail(0, "B6 Read status %s", status_buf);
+        }
+        if (cqe.cid != cid_r)
+            step_fail(0, "B6 Read CQE.cid=%u want %u", cqe.cid, cid_r);
+
+        for (size_t b = 0; b < info.block_size; b++) {
+            uint8_t want = b6_pat ^ (uint8_t)(b >> 12);
+            if (((uint8_t*)rbuf)[b] != want)
+                step_fail(0, "B6 readback mismatch at byte %zu: "
+                             "got 0x%02x want 0x%02x (lba=%" PRIu64 ")",
+                          b, ((uint8_t*)rbuf)[b], want, b6_lba);
+        }
+        step_ok("Phase 7e: 4 KiB W+R+verify on RECYCLED data buffers via "
+                "post-destroy group (lba=%" PRIu64 ", qid_w=%u qid_r=%u)",
+                b6_lba, qb6_w.qid, qb6_r.qid);
+
+        /* f. Hand the fresh group back to Phase 8's destroy by
+         *    overwriting group_id; Phase 8 will issue ONE final
+         *    NVM_DESTROY_QUEUE_GROUP that picks up these new rings + 0
+         *    data maps (DATA maps are already on own->data_maps and
+         *    will be reaped at fd close instead).
+         *
+         *    The OLD rings (the sq_buf[i]/cq_buf[i] from Phase 2) are
+         *    now orphaned at the user-space level: the kernel-side
+         *    pinning was released by the Phase 7a DESTROY_QUEUE_GROUP,
+         *    but the malloc'd memory itself is still ours to free.
+         *    Drop it now before we lose the pointers.                 */
+        for (unsigned i = 0; i < TEST_NR_QUEUES; i++) {
+            free(sq_buf[i]);
+            free(cq_buf[i]);
+            sq_buf[i] = sq_buf_b6[i];
+            cq_buf[i] = cq_buf_b6[i];
+        }
+        group_id = group_id_b6;
+    }
+
+    /* ============================================================== */
+    /* Phase 8: Tear-down.                                            */
     /*                                                                 */
     /* munmap BAR0 first so the doorbell pointers in test_queue are    */
     /* invalidated before destroy_qgroup -- destroy_qgroup may issue  */
     /* admin commands that the kernel handles internally; we don't    */
     /* want to accidentally write a stale tail through the same       */
-    /* pointer.  Then DESTROY_QUEUE_GROUP cascades through both       */
-    /* user queues + all 6 maps (4 rings + 2 data).                   */
+    /* pointer.  Then DESTROY_QUEUE_GROUP cascades through the        */
+    /* Phase-7 fresh queue group's user queues + 4 ring maps; the     */
+    /* DATA maps (wbuf/rbuf/wbuf2/rbuf2/wbuf4/rbuf4/prp_list_*) are    */
+    /* released a moment later by close(fd_dev) via the per-fd        */
+    /* data_maps cleanup in snvm_dev_release.                         */
     /* ============================================================== */
     if (munmap(bar0, info.bar0_size) < 0)
         step_fail(errno, "munmap BAR0");
@@ -1173,13 +1392,11 @@ int main(int argc, char** argv) {
         if (do_ioctl(fd_dev, NVM_DESTROY_QUEUE_GROUP, &gid,
                      "NVM_DESTROY_QUEUE_GROUP") < 0)
             step_fail(errno, "NVM_DESTROY_QUEUE_GROUP");
-        /* Map count: 4 ring (TEST_NR_QUEUES * 2) + 2 single-page data
-         * (wbuf,rbuf) + 2 dual-page data (wbuf2,rbuf2) + 2 quad-page
-         * data (wbuf4,rbuf4) + 2 PRP-list (prp_list_w,prp_list_r) =
-         * TEST_NR_QUEUES*2 + 8 group-scoped map descriptors.        */
+        /* Phase 7 only re-mapped 4 fresh ring buffers, all DATA maps
+         * still live on own->data_maps and will be reaped at close.   */
         step_ok("NVM_DESTROY_QUEUE_GROUP id=%u cascades through %u user "
-                "queue(s) + %u maps",
-                group_id, TEST_NR_QUEUES, TEST_NR_QUEUES * 2 + 8);
+                "queue(s) + %u ring map(s) (8 DATA maps stay)",
+                group_id, TEST_NR_QUEUES, TEST_NR_QUEUES * 2);
     }
 
     /* Free user-side ring + data buffers (the snvme-side maps are
