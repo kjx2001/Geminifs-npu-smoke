@@ -3828,9 +3828,9 @@ struct snvm_dev_owner {
  * NVM_SET_IOQ_NUM.  Different problems, different lifetimes; the
  * _qgroup suffix keeps the namespaces distinct.
  *
- * Chunk G fields (B1 + B2): link, group_id, max_queues, maps,
- * nr_maps.  Chunk H will extend this with the queues[] array and
- * cur_queues counter once NVM_ADD_USER_QUEUE lands.
+ * Fields (B1 + B2 + B3): link, group_id, max_queues, maps, nr_maps,
+ * and (Chunk H) the inline queues[] array + cur_queues counter that
+ * NVM_ADD_USER_QUEUE populates.
  *
  * Lifetime:
  *   - allocated by NVM_CREATE_QUEUE_GROUP, group_id assigned via
@@ -3853,6 +3853,38 @@ struct snvm_qgroup {
 	 */
 	struct list_head	maps;
 	unsigned int		nr_maps;
+
+	/*
+	 * Per-group user IO queues (B3, NVM_ADD_USER_QUEUE).
+	 *
+	 * Each slot pairs an SQ with a CQ on the controller.  The
+	 * NVMe-controller-side state (Create I/O CQ + Create I/O SQ
+	 * was issued, qid is committed) is reflected by
+	 * queues[i].alive == 1.  destroy_qgroup_locked walks this
+	 * array in reverse order issuing Delete I/O SQ + Delete I/O
+	 * CQ (NVMe spec ordering: SQ before CQ) and freeing the qid
+	 * back to ctrl->user_qid_bitmap.
+	 *
+	 * Layout choice -- inline array vs list:
+	 *   - max_queues is a fixed compile-time cap (16), so the
+	 *     overhead is bounded (16 * sizeof(struct snvm_user_queue)
+	 *     ~= 256 B per group).
+	 *   - inline array means destroy/cascade walk is cache-
+	 *     friendly and we don't need yet another list_head
+	 *     pair on struct map.
+	 *
+	 * Concurrency: protected by own->groups_lock at the qgroup
+	 * level (the same mutex protecting maps[] and the group
+	 * descriptor itself).  ctrl->user_qid_lock is taken inside
+	 * own->groups_lock when the bitmap is mutated.
+	 */
+	struct snvm_user_queue {
+		uint16_t qid;
+		uint16_t alive;     /* 1 once Create I/O SQ committed */
+		uint64_t sq_vaddr;  /* echoed back so destroy / recycle  */
+		uint64_t cq_vaddr;  /* can recover the rings if needed   */
+	} queues[NVM_MAX_QUEUES_PER_GROUP];
+	unsigned int		cur_queues; /* number of slots currently alive */
 };
 
 static DEFINE_IDA(snvm_queue_group_ida);
