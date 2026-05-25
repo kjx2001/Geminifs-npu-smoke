@@ -4026,6 +4026,37 @@ static long snvm_dev_map_ioctl(struct file* file, unsigned int cmd, unsigned lon
 			ret = 0;
 			break;
 		}
+		case NVM_SET_KERNEL_IOQ_CAP:
+		{
+			/*
+			 * Cap-only update path: stash setup.cap_kernel_ioq
+			 * without touching the legacy NVM_SET_IOQ_NUM state
+			 * (ctrl->ioq_num, use_sreg, on_host, groups[]).
+			 * Probe segment 6a copies ctrl->setup.cap_kernel_ioq
+			 * into dev->cap_kernel_ioq at SNVM_DEVICE_BIND time,
+			 * gated on ctrl->setup.valid -- so we set .valid here
+			 * too, but with ioq_num=0 the use_user_allocated probe
+			 * branch stays untaken.
+			 *
+			 * Must run pre-bind to have any effect.  We do not
+			 * reject post-bind calls (the field write is still
+			 * useful for the NEXT bind cycle if the user
+			 * unbinds/rebinds), but log so a misordered userspace
+			 * is diagnosable from dmesg.
+			 */
+			uint32_t cap;
+
+			if (copy_from_user(&cap, (void __user *)arg, sizeof(cap)))
+				return -EFAULT;
+
+			ctrl->setup.cap_kernel_ioq = cap;
+			ctrl->setup.valid          = 1;
+
+			pr_info("snvme: NVM_SET_KERNEL_IOQ_CAP cap=%u (legacy ioq_num=%u, use_sreg=%u left unchanged)\n",
+				cap, ctrl->ioq_num, ctrl->use_sreg);
+			ret = 0;
+			break;
+		}
         default:
             printk(KERN_NOTICE "Unknown ioctl command from process %d: %u\n",
                     current->pid, cmd);
