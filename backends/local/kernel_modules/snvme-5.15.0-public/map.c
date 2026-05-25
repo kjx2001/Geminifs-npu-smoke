@@ -42,6 +42,14 @@ static struct map* create_descriptor(const struct ctrl* ctrl, u64 vaddr, unsigne
     }
 
     list_node_init(&map->list);
+    /*
+     * Initialise per-fd queue-group link as an empty self-loop so
+     * that list_empty(&map->group_link) is true and list_del()
+     * remains safe even when the map is never attached to any
+     * group (legacy mode, group_id == 0).
+     */
+    INIT_LIST_HEAD(&map->group_link);
+    map->group_id = 0;
 
     map->owner = current;
     map->vaddr = vaddr;
@@ -65,6 +73,19 @@ static struct map* create_descriptor(const struct ctrl* ctrl, u64 vaddr, unsigne
 void unmap_and_release(struct map* map)
 {
     list_remove(&map->list);
+
+    /*
+     * If this map is attached to a per-fd queue group (group_id !=
+     * 0, group_link non-empty), splice it out of the group's
+     * maps list.  Done unconditionally via list_del because
+     * group_link was INIT_LIST_HEAD'd in create_descriptor: a
+     * never-attached map's list_del is a no-op (next/prev point
+     * at itself, list_del rewires them and that's that).  The
+     * caller is expected to be holding own->groups_lock if the
+     * map is on a group list -- pci.c snvm_dev_release / the
+     * destroy ioctl handler / NVM_UNMAP_* paths all do.
+     */
+    list_del(&map->group_link);
 
     if (map->release != NULL && map->data != NULL)
     {
@@ -120,6 +141,62 @@ struct map* map_find_by_pci_dev_and_idx(const struct list* list, const struct pc
     return NULL;
 }
 EXPORT_SYMBOL_GPL(map_find_by_pci_dev_and_idx);
+
+/*
+ * snvme: walk `list` and unmap_and_release every descriptor whose
+ * ->owner pointer equals `owner`.  Designed for snvm_dev_fops.release
+ * cleanup when a userspace process dies without issuing NVM_UNMAP_*.
+ *
+ * Implementation note: unmap_and_release() does list_remove() on the
+ * descriptor, so we must re-fetch list_next() from list->head on every
+ * iteration -- saving a "next" pointer up front would dereference a
+ * freed node on the next loop.
+ */
+unsigned long map_purge_by_owner(struct list* list, struct task_struct* owner)
+{
+    struct list_node* element;
+    struct map* map;
+    unsigned long freed = 0;
+
+    if (list == NULL || owner == NULL)
+        return 0;
+
+    element = list_next(&list->head);
+    while (element != NULL)
+    {
+        map = container_of(element, struct map, list);
+        /*
+         * Only reap legacy (non-group) maps here.
+         *
+         * Group-attached maps (group_id != 0) are owned per-fd
+         * via the snvm_qgroup descriptor on file->private_data,
+         * not per-task.  They are drained by
+         * destroy_qgroup_locked() in pci.c during the fd's
+         * release Pass 0 (which runs before this purge).
+         *
+         * If we walked group-attached maps here too, a process
+         * holding multiple /dev/ssnvme<N> fds would have one
+         * fd's release accidentally tear down maps registered
+         * via a sibling fd, because all those fds share the same
+         * task_struct as their map->owner.  That was the
+         * symptom seen in the B2 smoke test (fd_d's release
+         * reclaiming fd_a's group-attached map).
+         */
+        if (map->owner == owner && map->group_id == 0)
+        {
+            unmap_and_release(map);
+            ++freed;
+            /* head changed; restart from the new front */
+            element = list_next(&list->head);
+            continue;
+        }
+        element = list_next(element);
+    }
+
+    return freed;
+}
+EXPORT_SYMBOL_GPL(map_purge_by_owner);
+
 
 static void release_user_pages(struct map* map)
 {
