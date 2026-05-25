@@ -3890,6 +3890,160 @@ struct snvm_qgroup {
 static DEFINE_IDA(snvm_queue_group_ida);
 
 /*
+ * B3 user-QID pool management.
+ *
+ * Lazy-init the bitmap on the first allocation request: the pool
+ * range [user_qid_first, user_qid_last] is only known once
+ * nvme_probe has set ndev->online_queues / nr_allocated_queues,
+ * which happens asynchronously after SNVM_DEVICE_BIND.  Doing it
+ * eagerly at bind would require a probe-completion hook the
+ * upstream driver doesn't expose; doing it lazily keeps the code
+ * out of any reset/error path.
+ *
+ * Caller MUST hold ctrl->user_qid_lock.  ndev is the result of
+ * pci_get_drvdata(ctrl->pdev) and must be non-NULL with admin_q
+ * live (i.e. controller is bound and probe finished).
+ */
+static int snvm_user_qid_pool_init_locked(struct ctrl *ctrl,
+					  struct nvme_dev *ndev)
+{
+	unsigned int first, last, count;
+	unsigned long *bm;
+
+	if (ctrl->user_qid_bitmap)
+		return 0;     /* already initialised */
+
+	if (!ndev || !ndev->online_queues || !ndev->nr_allocated_queues)
+		return -ENODEV;
+
+	/*
+	 * online_queues counts admin + every kernel IOQ that finished
+	 * Create I/O SQ.  ctrl_max_io_queues is the authoritative
+	 * controller-granted IOQ ceiling captured in s_nvme_setup_io_queues
+	 * right after snvme_set_queue_count returned.
+	 *
+	 * The user QID pool occupies the gap between "first kernel
+	 * unused QID" and "highest QID the controller will accept":
+	 *   first = online_queues               (admin=0 + kernel IOQs)
+	 *   last  = ctrl_max_io_queues          (granted ceiling)
+	 *
+	 * Why not nr_allocated_queues - 1?  On hosts where
+	 * num_possible_cpus() exceeds the controller's MSI-X grant
+	 * (e.g. 192-vCPU host + Intel DC SSD with MSI-X=136), the
+	 * snvme-side dev->queues[] capacity is bigger than what the
+	 * controller will actually accept; using nr_allocated_queues-1
+	 * placed valid-looking QIDs in the pool that the controller
+	 * then rejected with SC=0x4101 (Invalid Queue Identifier) at
+	 * Create I/O CQ time.  ctrl_max_io_queues fixes this by
+	 * surfacing the real controller ceiling to the pool sizer.
+	 *
+	 * If ctrl_max_io_queues is zero, probe never reached the
+	 * negotiation step (or the build is older than this fix);
+	 * fail loudly rather than fall back to the broken
+	 * nr_allocated_queues-1 estimate.
+	 */
+	if (!ndev->ctrl_max_io_queues) {
+		pr_warn("snvme: user QID pool: ctrl_max_io_queues=0 "
+			"(probe did not complete the Set-Features negotiation?)\n");
+		return -ENODEV;
+	}
+
+	first = ndev->online_queues;
+	last  = ndev->ctrl_max_io_queues;
+	if (first > last) {
+		pr_warn("snvme: user QID pool empty (online=%u, ctrl_max=%u); "
+			"controller refused to leave room for user IOQs.  "
+			"Lower cap_kernel_ioq via NVM_SET_IOQ_NUM before bind, "
+			"or attach to a controller with a larger MSI-X grant.\n",
+			ndev->online_queues, ndev->ctrl_max_io_queues);
+		return -EBUSY;
+	}
+	count = last - first + 1;
+
+	bm = kcalloc(BITS_TO_LONGS(count), sizeof(unsigned long), GFP_KERNEL);
+	if (!bm)
+		return -ENOMEM;
+
+	ctrl->user_qid_first  = first;
+	ctrl->user_qid_last   = last;
+	ctrl->user_qid_bitmap = bm;
+
+	pr_info("snvme: user QID pool initialised: [%u..%u] (%u QIDs)\n",
+		first, last, count);
+	return 0;
+}
+
+/*
+ * Allocate `nr` consecutive (per-call) user QIDs.  Not actually
+ * required to be contiguous on the wire -- NVMe doesn't care --
+ * but find_first_zero_bit + setting individually is plenty fast
+ * for nr <= 16, so we just iterate.
+ *
+ * Caller MUST hold ctrl->user_qid_lock.  Returns the first QID
+ * allocated (caller can deduce the rest in qids_out[]) or
+ * -EAGAIN if the pool is full.  On failure, no bits are set.
+ */
+static int snvm_user_qid_alloc_locked(struct ctrl *ctrl,
+				      unsigned int nr,
+				      uint16_t *qids_out)
+{
+	unsigned int pool_size = ctrl->user_qid_last - ctrl->user_qid_first + 1;
+	unsigned int i;
+	unsigned int bit;
+
+	for (i = 0; i < nr; i++) {
+		bit = find_first_zero_bit(ctrl->user_qid_bitmap, pool_size);
+		if (bit >= pool_size) {
+			/* Pool exhausted; roll back the bits we already set. */
+			while (i > 0) {
+				--i;
+				clear_bit(qids_out[i] - ctrl->user_qid_first,
+					  ctrl->user_qid_bitmap);
+			}
+			return -EAGAIN;
+		}
+		set_bit(bit, ctrl->user_qid_bitmap);
+		qids_out[i] = (uint16_t)(ctrl->user_qid_first + bit);
+	}
+	return 0;
+}
+
+/*
+ * Release one previously-allocated user QID back to the pool.
+ * Idempotent: calling on a never-allocated QID is a no-op (and
+ * a WARN, since that indicates a bookkeeping bug).
+ *
+ * Caller MUST hold ctrl->user_qid_lock.
+ */
+static void snvm_user_qid_free_locked(struct ctrl *ctrl, uint16_t qid)
+{
+	unsigned int bit;
+
+	if (qid < ctrl->user_qid_first || qid > ctrl->user_qid_last) {
+		pr_warn("snvme: user_qid_free: qid %u outside pool [%u..%u]\n",
+			qid, ctrl->user_qid_first, ctrl->user_qid_last);
+		return;
+	}
+	bit = qid - ctrl->user_qid_first;
+	if (!test_and_clear_bit(bit, ctrl->user_qid_bitmap))
+		pr_warn("snvme: user_qid_free: qid %u was already free\n", qid);
+}
+
+/*
+ * Forward decl for snvm_ctrl_get_live_ndev (defined below, between
+ * destroy_qgroup_locked and find_qgroup_locked).  destroy_qgroup_locked
+ * needs it (once H3 wires in the user-queue drain) to issue Delete
+ * I/O SQ/CQ admin commands only while running against a controller
+ * still bound to snvme -- the cascade-cleanup path may race with
+ * unbind/rebind, in which case admin commands must be skipped.
+ *
+ * adapter_delete_sq / adapter_delete_cq are already defined above
+ * in this file (see qid_release path further up), so they don't
+ * need re-declaration here.
+ */
+static struct nvme_dev *snvm_ctrl_get_live_ndev(const struct ctrl *ctrl);
+
+/*
  * Destroy a queue group.  Caller MUST hold own->groups_lock and MUST
  * have already list_del'd g from its parent owner->groups list (or
  * be calling from a context where no other thread can race on the
@@ -3929,6 +4083,60 @@ static void destroy_qgroup_locked(struct snvm_qgroup *g, struct ctrl *ctrl)
 
 	ida_simple_remove(&snvm_queue_group_ida, g->group_id);
 	kfree(g);
+}
+
+/*
+ * Resolve a per-controller "snvme owns this PCI device AND its
+ * NVMe controller is fully initialised" check, returning the
+ * struct nvme_dev * on success.
+ *
+ * Why this helper exists:
+ *
+ *   pci_get_drvdata(ctrl->pdev) is the obvious-looking way to
+ *   reach the nvme_dev, but the in-tree `nvme` PCI driver ALSO
+ *   stashes its struct nvme_dev there with a live admin_q.  If
+ *   we use `pci_get_drvdata + admin_q` as the sole liveness
+ *   check, an ioctl issued while the device is still owned by
+ *   the in-tree driver would happily fall through and start
+ *   issuing admin commands against a controller snvme does not
+ *   own -- fighting the in-tree driver over IOQ resources, and
+ *   in the worst case scribbling on its admin queue.
+ *
+ *   The single source of truth for "did SNVM_DEVICE_BIND succeed
+ *   on this BDF" is the PCI core's pdev->dev.driver pointer: if
+ *   it names PCI_DRIVER_NAME ("snvme") then probe ran here, and
+ *   the drvdata field is owned by us.  Otherwise it's either NULL
+ *   (no driver) or the in-tree nvme driver's.
+ *
+ * Returns:
+ *   non-NULL  -- a struct nvme_dev * owned by snvme, admin_q live;
+ *                safe to call adapter_alloc_*_user / etc.
+ *   NULL      -- either the device is not bound to snvme, or it
+ *                is bound but admin_q has not finished probe.
+ *                Callers MUST surface -ENODEV in that case so
+ *                userspace can poll (e.g. on probe race).
+ *
+ * No locking needed: pdev->dev.driver is stable for the duration
+ * of one ioctl because BIND/UNBIND go through snvm_control_lock
+ * via the control-plane ioctl path.
+ */
+static struct nvme_dev *snvm_ctrl_get_live_ndev(const struct ctrl *ctrl)
+{
+	struct device_driver *drv;
+	struct nvme_dev *ndev;
+
+	if (!ctrl || !ctrl->pdev)
+		return NULL;
+
+	drv = ctrl->pdev->dev.driver;
+	if (!drv || !drv->name || strcmp(drv->name, PCI_DRIVER_NAME) != 0)
+		return NULL;
+
+	ndev = pci_get_drvdata(ctrl->pdev);
+	if (!ndev || !ndev->ctrl.admin_q)
+		return NULL;
+
+	return ndev;
 }
 
 static struct snvm_qgroup *find_qgroup_locked(struct snvm_dev_owner *own,
