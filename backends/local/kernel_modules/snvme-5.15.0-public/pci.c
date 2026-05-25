@@ -4317,13 +4317,14 @@ static long snvm_dev_map_ioctl(struct file* file, unsigned int cmd, unsigned lon
 			 *                          via NVM_ADD_USER_QUEUE, inclusive.
 			 *                          User QID pool is
 			 *                          [start_cq_idx, max_user_qid].
-			 *                          5.15.0 sources this from
-			 *                          ndev->max_qid (the controller-
-			 *                          granted IOQ ceiling after
-			 *                          MSI-X negotiation; the 5.4.241
-			 *                          baseline uses
-			 *                          ndev->ctrl_max_io_queues, which
-			 *                          5.15.0 does not have).
+			 *                          Sourced from ndev->ctrl_max_io_queues
+			 *                          (the controller's authoritative Set
+			 *                          Features grant captured in
+			 *                          s_nvme_setup_io_queues, prior to any
+			 *                          MSI-X clamping).  Using ndev->max_qid
+			 *                          instead would under-report on
+			 *                          MSI-X-limited hosts and silently
+			 *                          shrink the user QID pool.
 			 *   max_queues_per_group   Echoes the kernel-fixed cap
 			 *                          (NVM_MAX_QUEUES_PER_GROUP) so
 			 *                          userspace doesn't have to
@@ -4334,7 +4335,7 @@ static long snvm_dev_map_ioctl(struct file* file, unsigned int cmd, unsigned lon
 			 */
 			drequest.q_depth              = (uint16_t)ndev->q_depth;
 			drequest.bar0_size            = (uint32_t)pci_resource_len(ctrl->pdev, 0);
-			drequest.max_user_qid         = ndev->max_qid;
+			drequest.max_user_qid         = ndev->ctrl_max_io_queues;
 			drequest.max_queues_per_group = NVM_MAX_QUEUES_PER_GROUP;
 			drequest.sgl_supported        = (uint32_t)ndev->ctrl.sgls;
 
