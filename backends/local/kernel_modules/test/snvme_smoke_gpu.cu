@@ -423,23 +423,36 @@ static int submit_and_poll(queue_state& qs,
 
 /* ------------------------------------------------------------------ */
 /* All per-round resources, allocated/freed by run_one_round().       */
+/* B6: only the queue group + the SQ/CQ rings are per-round.  Data    */
+/* buffers (wbuf / rbuf / prp_list_*) live in persistent_data_res     */
+/* below and span every round on this fd.                             */
 /* ------------------------------------------------------------------ */
 
 struct round_resources {
     uint32_t    group_id;
     void*       sq_dev[TEST_NR_QUEUES];
     void*       cq_dev[TEST_NR_QUEUES];
+    uint64_t    sq_ioaddr[TEST_NR_QUEUES];
+    uint64_t    cq_ioaddr[TEST_NR_QUEUES];
+    queue_state QS[TEST_NR_QUEUES];
+};
+
+/* ------------------------------------------------------------------ */
+/* B6: persistent fd-scoped data resources.  Allocated once in main(),*/
+/* registered with map_kind=NVM_MAP_KIND_DATA + group_id=0 so the     */
+/* kernel parks them on snvm_dev_owner.data_maps and they survive    */
+/* every NVM_DESTROY_QUEUE_GROUP cascade.  Released on close(fd_dev). */
+/* ------------------------------------------------------------------ */
+
+struct persistent_data_resources {
     void*       wbuf_dev;
     void*       rbuf_dev;
     void*       prp_list_w_dev;
     void*       prp_list_r_dev;
-    uint64_t    sq_ioaddr[TEST_NR_QUEUES];
-    uint64_t    cq_ioaddr[TEST_NR_QUEUES];
     uint64_t    wbuf_ioaddr;
     uint64_t    rbuf_ioaddr;
     uint64_t    prp_list_w_ioaddr;
     uint64_t    prp_list_r_ioaddr;
-    queue_state QS[TEST_NR_QUEUES];
 };
 
 /* Run all the per-round IO phases (formerly Phase 2..10).  Caller
@@ -455,7 +468,8 @@ static void run_one_round(int fd_dev,
                           const struct nvm_ioctl_dev& info,
                           void* bar0_gpu,
                           unsigned round_idx,
-                          round_resources& rr) {
+                          round_resources& rr,
+                          const persistent_data_resources& pdata) {
     /* ============================================================== */
     /* Phase R.1: queue group.                                        */
     /* ============================================================== */
@@ -471,7 +485,10 @@ static void run_one_round(int fd_dev,
     }
 
     /* ============================================================== */
-    /* Phase R.2: cudaMalloc rings + data buffers (GPU-resident).    */
+    /* Phase R.2: cudaMalloc rings only.  The data + PRP_List buffers */
+    /* live in `pdata` and were registered ONCE in main() with        */
+    /* map_kind=DATA + group_id=0; they outlive every per-round       */
+    /* group and are reaped only at fd close.                         */
     /* ============================================================== */
     for (unsigned i = 0; i < TEST_NR_QUEUES; i++) {
         CUDA_OK(cudaMalloc(&rr.sq_dev[i], GPU_PAGE_SIZE));
@@ -479,23 +496,18 @@ static void run_one_round(int fd_dev,
         CUDA_OK(cudaMemset(rr.sq_dev[i], 0, GPU_PAGE_SIZE));
         CUDA_OK(cudaMemset(rr.cq_dev[i], 0, GPU_PAGE_SIZE));
     }
-    CUDA_OK(cudaMalloc(&rr.wbuf_dev, GPU_PAGE_SIZE));
-    CUDA_OK(cudaMalloc(&rr.rbuf_dev, GPU_PAGE_SIZE));
-    CUDA_OK(cudaMemset(rr.wbuf_dev, 0, GPU_PAGE_SIZE));
-    CUDA_OK(cudaMemset(rr.rbuf_dev, 0, GPU_PAGE_SIZE));
-    CUDA_OK(cudaMalloc(&rr.prp_list_w_dev, GPU_PAGE_SIZE));
-    CUDA_OK(cudaMalloc(&rr.prp_list_r_dev, GPU_PAGE_SIZE));
-    CUDA_OK(cudaMemset(rr.prp_list_w_dev, 0, GPU_PAGE_SIZE));
-    CUDA_OK(cudaMemset(rr.prp_list_r_dev, 0, GPU_PAGE_SIZE));
-    step_ok("round=%u cudaMalloc'd %u SQ + %u CQ + 2 data + 2 PRP_List "
-            "GPU pages (%zu B each)",
+    step_ok("round=%u cudaMalloc'd %u SQ + %u CQ GPU pages "
+            "(%zu B each); reusing persistent wbuf/rbuf/prp_list",
             round_idx, TEST_NR_QUEUES, TEST_NR_QUEUES, GPU_PAGE_SIZE);
 
     /* ============================================================== */
-    /* Phase R.3: NVM_MAP_DEVICE_MEMORY for every GPU page.          */
+    /* Phase R.3: NVM_MAP_DEVICE_MEMORY for the rings only, with      */
+    /* explicit kind tags so NVM_ADD_USER_QUEUE will accept them and  */
+    /* refuse any data-buffer vaddr in the same slot.                 */
     /* ============================================================== */
-    auto map_dev = [&](void* gpu_va, unsigned long n_pages,
-                       uint64_t* ioaddrs_out, const char* what) {
+    auto map_ring = [&](void* gpu_va, unsigned long n_pages,
+                        uint64_t* ioaddrs_out, uint8_t kind,
+                        const char* what) {
         struct nvm_ioctl_map req;
         memset(&req, 0, sizeof(req));
         req.vaddr_start = (uint64_t)(uintptr_t)gpu_va;
@@ -504,28 +516,23 @@ static void run_one_round(int fd_dev,
         req.ioq_idx     = -1;
         req.is_cq       = -1;
         req.group_id    = rr.group_id;
+        req.map_kind    = kind;
         if (do_ioctl(fd_dev, NVM_MAP_DEVICE_MEMORY, &req, what) < 0)
             step_fail(errno, "round=%u %s gpu_va=%p", round_idx, what, gpu_va);
     };
 
     for (unsigned i = 0; i < TEST_NR_QUEUES; i++) {
-        map_dev(rr.sq_dev[i], 1, &rr.sq_ioaddr[i],
-                "NVM_MAP_DEVICE_MEMORY(SQ)");
-        map_dev(rr.cq_dev[i], 1, &rr.cq_ioaddr[i],
-                "NVM_MAP_DEVICE_MEMORY(CQ)");
+        map_ring(rr.sq_dev[i], 1, &rr.sq_ioaddr[i],
+                 NVM_MAP_KIND_RING_SQ,
+                 "NVM_MAP_DEVICE_MEMORY(SQ)");
+        map_ring(rr.cq_dev[i], 1, &rr.cq_ioaddr[i],
+                 NVM_MAP_KIND_RING_CQ,
+                 "NVM_MAP_DEVICE_MEMORY(CQ)");
     }
-    map_dev(rr.wbuf_dev, 1, &rr.wbuf_ioaddr,
-            "NVM_MAP_DEVICE_MEMORY(wbuf)");
-    map_dev(rr.rbuf_dev, 1, &rr.rbuf_ioaddr,
-            "NVM_MAP_DEVICE_MEMORY(rbuf)");
-    map_dev(rr.prp_list_w_dev, 1, &rr.prp_list_w_ioaddr,
-            "NVM_MAP_DEVICE_MEMORY(prpl_w)");
-    map_dev(rr.prp_list_r_dev, 1, &rr.prp_list_r_ioaddr,
-            "NVM_MAP_DEVICE_MEMORY(prpl_r)");
-    step_ok("round=%u NVM_MAP_DEVICE_MEMORY x %u rings + 2 data + 2 "
-            "PRP_List (wbuf_ioaddr=0x%llx)",
+    step_ok("round=%u NVM_MAP_DEVICE_MEMORY x %u ring(s) (RING_SQ/RING_CQ); "
+            "data buffers (wbuf_ioaddr=0x%llx) come from persistent pool",
             round_idx, TEST_NR_QUEUES * 2,
-            (unsigned long long)rr.wbuf_ioaddr);
+            (unsigned long long)pdata.wbuf_ioaddr);
 
     /* ============================================================== */
     /* Phase R.4: NVM_ADD_USER_QUEUE.                                */
@@ -580,10 +587,10 @@ static void run_one_round(int fd_dev,
     /* The data buffer's dma_addr lets us derive 4-KiB-grained NVMe
      * page addresses for tier 2/3.                                  */
     auto wpage = [&](unsigned npage) -> uint64_t {
-        return rr.wbuf_ioaddr + (uint64_t)npage * info.block_size;
+        return pdata.wbuf_ioaddr + (uint64_t)npage * info.block_size;
     };
     auto rpage = [&](unsigned npage) -> uint64_t {
-        return rr.rbuf_ioaddr + (uint64_t)npage * info.block_size;
+        return pdata.rbuf_ioaddr + (uint64_t)npage * info.block_size;
     };
 
     /* This round's LBA window starts here.  Each tier carves out a
@@ -610,7 +617,7 @@ static void run_one_round(int fd_dev,
             uint8_t pat  = WRITE_PATTERN_BYTE(round_idx, qw.dev.qid, i);
 
             int threads = 256, blocks = (int)((io_bytes + threads - 1) / threads);
-            k_fill_pattern<<<blocks, threads>>>((uint8_t*)rr.wbuf_dev,
+            k_fill_pattern<<<blocks, threads>>>((uint8_t*)pdata.wbuf_dev,
                                                 io_bytes, pat);
             CUDA_OK(cudaDeviceSynchronize());
 
@@ -630,7 +637,7 @@ static void run_one_round(int fd_dev,
                 step_fail(0, "round=%u T1 Write %u CQE.cid=%u expected %u",
                           round_idx, i, cqe.cid, cid_w);
 
-            CUDA_OK(cudaMemset(rr.rbuf_dev, 0, io_bytes));
+            CUDA_OK(cudaMemset(pdata.rbuf_dev, 0, io_bytes));
             uint16_t cid_r;
             rc = submit_and_poll(qr, NVME_OPC_READ, NVME_FLAG_PSDT_PRP,
                                  nsid, rpage(0), 0,
@@ -643,7 +650,7 @@ static void run_one_round(int fd_dev,
             }
 
             *mismatch_um = -1;
-            k_verify_pattern<<<blocks, threads>>>((const uint8_t*)rr.rbuf_dev,
+            k_verify_pattern<<<blocks, threads>>>((const uint8_t*)pdata.rbuf_dev,
                                                    io_bytes, pat, mismatch_um);
             CUDA_OK(cudaDeviceSynchronize());
             if (*mismatch_um != -1)
@@ -679,7 +686,7 @@ static void run_one_round(int fd_dev,
             uint8_t  pat = WRITE_PATTERN_BYTE(round_idx, qw.dev.qid, 100 + i);
 
             int threads = 256, blocks = (int)((io_bytes + threads - 1) / threads);
-            k_fill_pattern<<<blocks, threads>>>((uint8_t*)rr.wbuf_dev,
+            k_fill_pattern<<<blocks, threads>>>((uint8_t*)pdata.wbuf_dev,
                                                 io_bytes, pat);
             CUDA_OK(cudaDeviceSynchronize());
 
@@ -695,7 +702,7 @@ static void run_one_round(int fd_dev,
                           round_idx, i, status_buf);
             }
 
-            CUDA_OK(cudaMemset(rr.rbuf_dev, 0, io_bytes));
+            CUDA_OK(cudaMemset(pdata.rbuf_dev, 0, io_bytes));
             uint16_t cid_r;
             rc = submit_and_poll(qr, NVME_OPC_READ, NVME_FLAG_PSDT_PRP,
                                  nsid, rpage(0), rpage(1),
@@ -708,7 +715,7 @@ static void run_one_round(int fd_dev,
             }
 
             *mismatch_um = -1;
-            k_verify_pattern<<<blocks, threads>>>((const uint8_t*)rr.rbuf_dev,
+            k_verify_pattern<<<blocks, threads>>>((const uint8_t*)pdata.rbuf_dev,
                                                    io_bytes, pat, mismatch_um);
             CUDA_OK(cudaDeviceSynchronize());
             if (*mismatch_um != -1)
@@ -736,9 +743,9 @@ static void run_one_round(int fd_dev,
 
         uint64_t prp_w_entries[3] = { wpage(1), wpage(2), wpage(3) };
         uint64_t prp_r_entries[3] = { rpage(1), rpage(2), rpage(3) };
-        CUDA_OK(cudaMemcpy(rr.prp_list_w_dev, prp_w_entries,
+        CUDA_OK(cudaMemcpy(pdata.prp_list_w_dev, prp_w_entries,
                            sizeof(prp_w_entries), cudaMemcpyHostToDevice));
-        CUDA_OK(cudaMemcpy(rr.prp_list_r_dev, prp_r_entries,
+        CUDA_OK(cudaMemcpy(pdata.prp_list_r_dev, prp_r_entries,
                            sizeof(prp_r_entries), cudaMemcpyHostToDevice));
 
         int* mismatch_um = nullptr;
@@ -749,14 +756,14 @@ static void run_one_round(int fd_dev,
             uint8_t  pat = WRITE_PATTERN_BYTE(round_idx, qw.dev.qid, 200 + i);
 
             int threads = 256, blocks = (int)((io_bytes + threads - 1) / threads);
-            k_fill_pattern<<<blocks, threads>>>((uint8_t*)rr.wbuf_dev,
+            k_fill_pattern<<<blocks, threads>>>((uint8_t*)pdata.wbuf_dev,
                                                 io_bytes, pat);
             CUDA_OK(cudaDeviceSynchronize());
 
             nvme_cqe cqe;
             uint16_t cid_w;
             int rc = submit_and_poll(qw, NVME_OPC_WRITE, NVME_FLAG_PSDT_PRP,
-                                     nsid, wpage(0), rr.prp_list_w_ioaddr,
+                                     nsid, wpage(0), pdata.prp_list_w_ioaddr,
                                      lba, nlb_zero_based, &cqe, &cid_w);
             if (rc) step_fail(-rc, "round=%u T3 Write %u", round_idx, i);
             if ((cqe.status >> 1) != 0) {
@@ -765,10 +772,10 @@ static void run_one_round(int fd_dev,
                           round_idx, i, status_buf);
             }
 
-            CUDA_OK(cudaMemset(rr.rbuf_dev, 0, io_bytes));
+            CUDA_OK(cudaMemset(pdata.rbuf_dev, 0, io_bytes));
             uint16_t cid_r;
             rc = submit_and_poll(qr, NVME_OPC_READ, NVME_FLAG_PSDT_PRP,
-                                 nsid, rpage(0), rr.prp_list_r_ioaddr,
+                                 nsid, rpage(0), pdata.prp_list_r_ioaddr,
                                  lba, nlb_zero_based, &cqe, &cid_r);
             if (rc) step_fail(-rc, "round=%u T3 Read %u", round_idx, i);
             if ((cqe.status >> 1) != 0) {
@@ -778,7 +785,7 @@ static void run_one_round(int fd_dev,
             }
 
             *mismatch_um = -1;
-            k_verify_pattern<<<blocks, threads>>>((const uint8_t*)rr.rbuf_dev,
+            k_verify_pattern<<<blocks, threads>>>((const uint8_t*)pdata.rbuf_dev,
                                                    io_bytes, pat, mismatch_um);
             CUDA_OK(cudaDeviceSynchronize());
             if (*mismatch_um != -1)
@@ -815,7 +822,7 @@ static void run_one_round(int fd_dev,
             uint8_t pat = WRITE_PATTERN_BYTE(round_idx, qw.dev.qid, 300 + i);
 
             int threads = 256, blocks = (int)((io_bytes + threads - 1) / threads);
-            k_fill_pattern<<<blocks, threads>>>((uint8_t*)rr.wbuf_dev,
+            k_fill_pattern<<<blocks, threads>>>((uint8_t*)pdata.wbuf_dev,
                                                 io_bytes, pat);
             CUDA_OK(cudaDeviceSynchronize());
 
@@ -834,7 +841,7 @@ static void run_one_round(int fd_dev,
                           round_idx, i, status_buf);
             }
 
-            CUDA_OK(cudaMemset(rr.rbuf_dev, 0, io_bytes));
+            CUDA_OK(cudaMemset(pdata.rbuf_dev, 0, io_bytes));
             uint64_t sgl_addr_r = rpage(0);
             uint64_t sgl_meta_r = ((uint64_t)io_bytes & 0xffffffffu)
                                 | ((uint64_t)NVME_SGL_DESC_BYTE15 << 56);
@@ -850,7 +857,7 @@ static void run_one_round(int fd_dev,
             }
 
             *mismatch_um = -1;
-            k_verify_pattern<<<blocks, threads>>>((const uint8_t*)rr.rbuf_dev,
+            k_verify_pattern<<<blocks, threads>>>((const uint8_t*)pdata.rbuf_dev,
                                                    io_bytes, pat, mismatch_um);
             CUDA_OK(cudaDeviceSynchronize());
             if (*mismatch_um != -1)
@@ -881,7 +888,7 @@ static void run_one_round(int fd_dev,
             uint8_t pat = WRITE_PATTERN_BYTE(round_idx, qw.dev.qid, 1000u + i);
 
             int threads = 256, blocks = (int)((io_bytes + threads - 1) / threads);
-            k_fill_pattern<<<blocks, threads>>>((uint8_t*)rr.wbuf_dev,
+            k_fill_pattern<<<blocks, threads>>>((uint8_t*)pdata.wbuf_dev,
                                                 io_bytes, pat);
             CUDA_OK(cudaDeviceSynchronize());
 
@@ -903,12 +910,14 @@ static void run_one_round(int fd_dev,
     }
 }
 
-/* Tear down everything that run_one_round() built up.  Order
- * matters: free per-queue UM bookkeeping FIRST (those allocs live
- * outside the snvme map list), then DESTROY_QUEUE_GROUP (cascades
- * through user queues + every NVM_MAP_DEVICE_MEMORY descriptor),
- * then cudaFree the GPU pages (snvme has already called nvidia
- * p2p put_pages on them).                                         */
+/* Tear down everything that run_one_round() built up.  In B6 this
+ * is just the queue group + its 4 ring maps + the 2 user IO queues
+ * the controller created.  Data buffers (wbuf / rbuf / prp_list_*)
+ * stay alive across rounds and are reaped at fd close by
+ * snvm_dev_release walking the per-fd data_maps list.  Order
+ * matters: free per-queue UM bookkeeping FIRST, then
+ * NVM_DESTROY_QUEUE_GROUP (cascades through user queues + the 4
+ * ring maps), then cudaFree the GPU ring pages.                 */
 static void teardown_one_round(int fd_dev, unsigned round_idx,
                                round_resources& rr) {
     for (unsigned i = 0; i < TEST_NR_QUEUES; i++) {
@@ -925,19 +934,15 @@ static void teardown_one_round(int fd_dev, unsigned round_idx,
                      "NVM_DESTROY_QUEUE_GROUP") < 0)
             step_fail(errno, "round=%u NVM_DESTROY_QUEUE_GROUP", round_idx);
         step_ok("round=%u NVM_DESTROY_QUEUE_GROUP id=%u cascades through %u "
-                "user queue(s) + %u GPU maps",
+                "user queue(s) + %u ring map(s); data maps persist",
                 round_idx, rr.group_id, TEST_NR_QUEUES,
-                TEST_NR_QUEUES * 2 + 4);
+                TEST_NR_QUEUES * 2);
     }
 
     for (unsigned i = 0; i < TEST_NR_QUEUES; i++) {
         cudaFree(rr.sq_dev[i]);
         cudaFree(rr.cq_dev[i]);
     }
-    cudaFree(rr.wbuf_dev);
-    cudaFree(rr.rbuf_dev);
-    cudaFree(rr.prp_list_w_dev);
-    cudaFree(rr.prp_list_r_dev);
 
     memset(&rr, 0, sizeof(rr));
 }
@@ -1064,9 +1069,59 @@ int main(int argc, char** argv) {
             bar0_cpu, bar0_gpu);
 
     /* ============================================================== */
+    /* Phase 2b: persistent fd-scoped data buffers.  Allocated ONCE   */
+    /* here and registered with map_kind=NVM_MAP_KIND_DATA +          */
+    /* group_id=0; the kernel parks them on own->data_maps so they    */
+    /* survive every per-round NVM_DESTROY_QUEUE_GROUP.  Reaped at    */
+    /* fd close by snvm_dev_release.  This is the canonical B6       */
+    /* usage pattern: one DMA pool spanning many short-lived queue   */
+    /* groups, zero re-pinning per group.                             */
+    /* ============================================================== */
+    persistent_data_resources pdata;
+    memset(&pdata, 0, sizeof(pdata));
+    CUDA_OK(cudaMalloc(&pdata.wbuf_dev,       GPU_PAGE_SIZE));
+    CUDA_OK(cudaMalloc(&pdata.rbuf_dev,       GPU_PAGE_SIZE));
+    CUDA_OK(cudaMalloc(&pdata.prp_list_w_dev, GPU_PAGE_SIZE));
+    CUDA_OK(cudaMalloc(&pdata.prp_list_r_dev, GPU_PAGE_SIZE));
+    CUDA_OK(cudaMemset(pdata.wbuf_dev,       0, GPU_PAGE_SIZE));
+    CUDA_OK(cudaMemset(pdata.rbuf_dev,       0, GPU_PAGE_SIZE));
+    CUDA_OK(cudaMemset(pdata.prp_list_w_dev, 0, GPU_PAGE_SIZE));
+    CUDA_OK(cudaMemset(pdata.prp_list_r_dev, 0, GPU_PAGE_SIZE));
+
+    {
+        auto map_data = [&](void* gpu_va, uint64_t* ioaddrs_out,
+                            const char* what) {
+            struct nvm_ioctl_map req;
+            memset(&req, 0, sizeof(req));
+            req.vaddr_start = (uint64_t)(uintptr_t)gpu_va;
+            req.n_pages     = 1;
+            req.ioaddrs     = ioaddrs_out;
+            req.ioq_idx     = -1;
+            req.is_cq       = -1;
+            req.group_id    = 0;                       /* fd-scoped */
+            req.map_kind    = NVM_MAP_KIND_DATA;
+            if (do_ioctl(fd_dev, NVM_MAP_DEVICE_MEMORY, &req, what) < 0)
+                step_fail(errno, "%s gpu_va=%p", what, gpu_va);
+        };
+        map_data(pdata.wbuf_dev,       &pdata.wbuf_ioaddr,
+                 "NVM_MAP_DEVICE_MEMORY(wbuf, DATA, fd-scoped)");
+        map_data(pdata.rbuf_dev,       &pdata.rbuf_ioaddr,
+                 "NVM_MAP_DEVICE_MEMORY(rbuf, DATA, fd-scoped)");
+        map_data(pdata.prp_list_w_dev, &pdata.prp_list_w_ioaddr,
+                 "NVM_MAP_DEVICE_MEMORY(prpl_w, DATA, fd-scoped)");
+        map_data(pdata.prp_list_r_dev, &pdata.prp_list_r_ioaddr,
+                 "NVM_MAP_DEVICE_MEMORY(prpl_r, DATA, fd-scoped)");
+    }
+    step_ok("persistent DATA maps registered (wbuf_ioaddr=0x%llx, "
+            "rbuf_ioaddr=0x%llx); these survive every round destroy",
+            (unsigned long long)pdata.wbuf_ioaddr,
+            (unsigned long long)pdata.rbuf_ioaddr);
+
+    /* ============================================================== */
     /* Phase 3+: rounds.  Each round builds its OWN queue group +    */
-    /* GPU rings + GPU data buffers, runs all 4 tiers + wrap, then   */
-    /* tears the whole stack down.  We re-allocate everything from  */
+    /* fresh GPU rings only, runs all 4 tiers + wrap against the      */
+    /* persistent data buffers above, then tears down the group +     */
+    /* the 4 ring maps.  Data maps are untouched across rounds.       */
     /* scratch every round to exercise the snvme alloc/free path.   */
     /* ============================================================== */
     for (unsigned round = 0; round < nr_rounds; round++) {
@@ -1075,7 +1130,7 @@ int main(int argc, char** argv) {
 
         fprintf(stderr, "\n===== ROUND %u / %u BEGIN =====\n",
                 round + 1, nr_rounds);
-        run_one_round(fd_dev, info, bar0_gpu, round, rr);
+        run_one_round(fd_dev, info, bar0_gpu, round, rr, pdata);
         teardown_one_round(fd_dev, round, rr);
         fprintf(stderr, "===== ROUND %u / %u END   =====\n",
                 round + 1, nr_rounds);
@@ -1096,7 +1151,19 @@ int main(int argc, char** argv) {
         step_ok("SNVM_DEVICE_UNBIND %s", bdf_str);
     }
     if (close(fd_dev) < 0) step_fail(errno, "close(%s)", dev_path);
-    step_ok("close(%s)", dev_path);
+    step_ok("close(%s) -- snvm_dev_release cascades through %u DATA maps",
+            dev_path, 4);
+
+    /* cudaFree the persistent DATA buffers AFTER close(fd_dev) so the
+     * snvm_dev_release path has already released the nvidia_p2p_get_pages
+     * pin on them.  Doing it before close would leave the pages
+     * referenced by snvme at fput() time, which is the leak the
+     * snvm_dev_release hook is supposed to prevent in the first place
+     * (see PORTING.md §7.3.1).                                       */
+    CUDA_OK(cudaFree(pdata.wbuf_dev));
+    CUDA_OK(cudaFree(pdata.rbuf_dev));
+    CUDA_OK(cudaFree(pdata.prp_list_w_dev));
+    CUDA_OK(cudaFree(pdata.prp_list_r_dev));
 
     {
         struct pci_device_addr bdf = orig_bdf;
