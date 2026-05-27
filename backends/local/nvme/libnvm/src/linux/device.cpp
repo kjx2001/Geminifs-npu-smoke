@@ -464,6 +464,135 @@ int nvm_device_init(nvm_ctrl_t* ctrl){
     return 0;
 }
 
+/* ===================================================================
+ * B3 / B6 thin ioctl wrappers.
+ *
+ * These are stateless 1:1 mappings to the kernel ioctls; the Controller
+ * class (or any other consumer) decides when to issue them.  They live
+ * here in linux/device.cpp because they all need fd_dev (or fd_control)
+ * out of `struct controller`, which is a libnvm-internal type.
+ *
+ * Compared to the legacy nvm_queue_share / nvm_queue_set / nvm_device_init
+ * triplet above, these do NOT push the controller through a hidden state
+ * machine: the caller drives the B3 sequence (CAP -> BIND -> GET_DEV_INFO
+ * -> CREATE_QUEUE_GROUP -> ADD_USER_QUEUE) explicitly.
+ * =================================================================== */
+
+int nvm_set_kernel_ioq_cap_fd(int fd_dev, uint32_t cap)
+{
+    if (ioctl(fd_dev, NVM_SET_KERNEL_IOQ_CAP, &cap) < 0) {
+        return errno;
+    }
+    return 0;
+}
+
+int nvm_set_kernel_ioq_cap(nvm_ctrl_t* ctrl, uint32_t cap)
+{
+    struct controller* container = ctrl_to_controller(ctrl);
+    if (container == NULL) {
+        return EINVAL;
+    }
+    return nvm_set_kernel_ioq_cap_fd(container->device->fd_dev, cap);
+}
+
+int nvm_create_group(nvm_ctrl_t* ctrl,
+                     uint32_t* out_group_id,
+                     uint32_t* out_max_queues)
+{
+    struct controller* container = ctrl_to_controller(ctrl);
+    if (container == NULL) {
+        return EINVAL;
+    }
+    struct nvm_ioctl_queue_group req;
+    memset(&req, 0, sizeof(req));
+    if (ioctl(container->device->fd_dev, NVM_CREATE_QUEUE_GROUP, &req) < 0) {
+        return errno;
+    }
+    if (out_group_id)   *out_group_id   = req.group_id;
+    if (out_max_queues) *out_max_queues = req.max_queues;
+    return 0;
+}
+
+int nvm_destroy_group(nvm_ctrl_t* ctrl, uint32_t group_id)
+{
+    struct controller* container = ctrl_to_controller(ctrl);
+    if (container == NULL) {
+        return EINVAL;
+    }
+    if (ioctl(container->device->fd_dev,
+              NVM_DESTROY_QUEUE_GROUP, &group_id) < 0) {
+        return errno;
+    }
+    return 0;
+}
+
+int nvm_add_user_queue(nvm_ctrl_t* ctrl,
+                       struct nvm_ioctl_add_user_queue* req)
+{
+    struct controller* container = ctrl_to_controller(ctrl);
+    if (container == NULL || req == NULL) {
+        return EINVAL;
+    }
+    if (ioctl(container->device->fd_dev,
+              NVM_ADD_USER_QUEUE, req) < 0) {
+        return errno;
+    }
+    return 0;
+}
+
+/*
+ * Poll NVM_GET_DEV_INFO until nvme_scan_work has populated disk_name.
+ *
+ * SNVM_DEVICE_BIND returns as soon as the chrdev is callable, but the
+ * kernel's nvme_reset_work + nvme_scan_work run asynchronously on
+ * s_nvme_wq.  GET_DEV_INFO returns -ENODEV until those finish.
+ *
+ * Loops up to ~`timeout_ms` ms in 100 ms increments (same shape as the
+ * smoke tests in backends/local/kernel_modules/test/).  Returns 0 on
+ * success and writes the populated nvm_ioctl_dev into *out_info; returns
+ * the last errno seen on timeout.
+ */
+int nvm_wait_dev_info(nvm_ctrl_t* ctrl,
+                      struct nvm_ioctl_dev* out_info,
+                      uint32_t timeout_ms)
+{
+    struct controller* container = ctrl_to_controller(ctrl);
+    if (container == NULL || out_info == NULL) {
+        return EINVAL;
+    }
+    int last_err = ENODEV;
+    int iters = (int)(timeout_ms / 100);
+    if (iters <= 0) iters = 1;
+    for (int i = 0; i < iters; i++) {
+        memset(out_info, 0, sizeof(*out_info));
+        if (ioctl(container->device->fd_dev,
+                  NVM_GET_DEV_INFO, out_info) == 0 &&
+            out_info->disk_name[0] != '\0') {
+            return 0;
+        }
+        last_err = errno;
+        usleep(100 * 1000);
+    }
+    return last_err;
+}
+
+/*
+ * Legacy bring-up entry point.
+ *
+ * Original (pre-B3) flow: open control fd -> CHRDEV_CREATE ->
+ * open device fd -> nvm_ctrl_init (dup fds, mmap BAR0) -> close
+ * original fds -> cudaHostRegister BAR0.  Bind happened LATER, in
+ * nvm_device_init() called from Controller::init_queues, after the
+ * caller had already pre-mapped all user IOQ rings.  That path is
+ * still functional for legacy Controller consumers and the
+ * Controller class's init_queues() drives it.
+ *
+ * New B3 callers should use nvm_controller_init_b3() instead -- that
+ * one performs the cap -> bind -> wait probe sequence in one shot,
+ * matching the L0/L1 smoke ordering and the kernel's actual ABI
+ * expectations.  The two coexist deliberately while Commit 3
+ * migrates Controller::init_queues over.
+ */
 int nvm_controller_init(nvm_ctrl_t** ctrl, const char *snvme_control_path, const char *pci_addr){
     struct pci_device_addr device_addr, pdev_addr;
     cudaError_t err;
@@ -494,6 +623,11 @@ int nvm_controller_init(nvm_ctrl_t** ctrl, const char *snvme_control_path, const
         return EFAULT;
     }
     
+    /* SNVM_CHRDEV_CREATE reuses device_addr->domain as an out-param
+     * carrying the assigned chrdev minor (see Todolist.md entry
+     * "Stop overloading pci_device_addr.domain ...").  Keep the
+     * original BDF in pdev_addr above; subsequent BIND/UNBIND must
+     * use a fresh copy of pdev_addr, not device_addr.  */
     snprintf(snvme_path, sizeof(snvme_path), "/dev/ssnvme%d", device_addr.domain);
     nvm_info("Create chrdev: %s", snvme_path);
 
@@ -522,5 +656,199 @@ int nvm_controller_init(nvm_ctrl_t** ctrl, const char *snvme_control_path, const
     }
 
     return 0;
+}
+
+/*
+ * B3 bring-up entry point.
+ *
+ * Performs the full B3 controller initialisation sequence in one call:
+ *
+ *   1. open(/dev/snvm_control)
+ *   2. SNVM_CHRDEV_CREATE (assigns chrdev minor)
+ *   3. open(/dev/ssnvme<minor>)
+ *   4. NVM_SET_KERNEL_IOQ_CAP(kernel_ioq_cap) -- pre-bind; cap_kernel_ioq=0
+ *      means "no cap, use upstream default of num_possible_cpus()"
+ *   5. SNVM_DEVICE_BIND  (binds snvme to the target PCI device)
+ *   6. NVM_GET_DEV_INFO poll loop, up to 10 s, until nvme_scan_work
+ *      finishes and disk_name is populated.  Result populates the
+ *      five new B3 fields on the ctrl handle (q_depth, bar0_size,
+ *      max_user_qid, max_queues_per_group, sgl_supported) plus
+ *      legacy fields (start_cq_idx, dstrd, max_data_size,
+ *      block_size, disk_name).
+ *   7. nvm_ctrl_init (wraps fds + BAR0 mmap into a controller struct)
+ *   8. cudaHostRegister(BAR0)  -- makes the doorbell page reachable
+ *      from CUDA kernels via cudaHostGetDevicePointer.
+ *
+ * Out-params:
+ *   *ctrl       Populated controller handle on success.  Caller must
+ *               eventually nvm_ctrl_free(*ctrl) (which closes fds
+ *               and unbinds via nvm_device_unbind under the hood --
+ *               legacy behaviour, to be split into owner/client
+ *               roles in a follow-up commit).
+ *   *out_disk   On success, copy of the post-probe disk metadata
+ *               (block_size, max_data_size, ns_id, disk_name).
+ *               May be NULL if caller does not need it.
+ *
+ * Returns 0 on success or a positive errno-style code on failure.
+ */
+int nvm_controller_init_b3(nvm_ctrl_t** ctrl,
+                           const char* snvme_control_path,
+                           const char* pci_addr,
+                           uint32_t kernel_ioq_cap,
+                           struct disk* out_disk)
+{
+    struct pci_device_addr device_addr, pdev_addr;
+    char snvme_path[256];
+    int snvme_d_fd = -1, snvme_c_fd = -1;
+    int status;
+    cudaError_t cerr;
+
+    if (ctrl == NULL || snvme_control_path == NULL || pci_addr == NULL) {
+        return EINVAL;
+    }
+    *ctrl = NULL;
+
+    snvme_c_fd = open(snvme_control_path, O_RDWR | O_NONBLOCK);
+    if (snvme_c_fd < 0) {
+        nvm_error("Failed to open control descriptor: %s", snvme_control_path);
+        return errno ? errno : EFAULT;
+    }
+
+    if (sscanf(pci_addr, "%x:%x:%x.%x",
+               &device_addr.domain, &device_addr.bus,
+               &device_addr.slot, &device_addr.func) != 4) {
+        nvm_error("Failed to parse PCI address: %s", pci_addr);
+        close(snvme_c_fd);
+        return EINVAL;
+    }
+    pdev_addr = device_addr;   /* preserved across CHRDEV_CREATE clobber */
+
+    status = nvm_chrdev_create(snvme_c_fd, &device_addr);
+    if (status != 0) {
+        nvm_error("SNVM_CHRDEV_CREATE failed (errno=%d)", status);
+        close(snvme_c_fd);
+        return status;
+    }
+    /* device_addr->domain now holds the chrdev minor (see legacy
+     * nvm_controller_init for the back-channel explanation). */
+    int minor_n = device_addr.domain;
+    snprintf(snvme_path, sizeof(snvme_path), "/dev/ssnvme%d", minor_n);
+
+    snvme_d_fd = open(snvme_path, O_RDWR | O_NONBLOCK);
+    if (snvme_d_fd < 0) {
+        int e = errno;
+        nvm_error("Failed to open %s: errno=%d", snvme_path, e);
+        /* Best-effort: undo the chrdev create so we don't leak a minor. */
+        {
+            struct pci_device_addr a = pdev_addr;
+            (void) nvm_chrdev_remove(snvme_c_fd, &a);
+        }
+        close(snvme_c_fd);
+        return e ? e : EFAULT;
+    }
+
+    /* Step 4: cap-only pre-bind hint.  cap=0 means "no cap, kernel uses
+     * num_possible_cpus()" which is the same as not calling this ioctl. */
+    if (kernel_ioq_cap != 0) {
+        status = nvm_set_kernel_ioq_cap_fd(snvme_d_fd, kernel_ioq_cap);
+        if (status != 0) {
+            nvm_error("NVM_SET_KERNEL_IOQ_CAP(%u) failed errno=%d",
+                      kernel_ioq_cap, status);
+            goto fail_close_dev;
+        }
+    }
+
+    /* Step 5: BIND.  Use a fresh copy of pdev_addr; the kernel will
+     * write back into the struct we pass in (see kernel pci.c
+     * snvm_chrdev_helper / snvm_rebind_driver). */
+    {
+        struct pci_device_addr a = pdev_addr;
+        if (ioctl(snvme_c_fd, SNVM_DEVICE_BIND, &a) < 0) {
+            status = errno;
+            nvm_error("SNVM_DEVICE_BIND failed errno=%d", status);
+            goto fail_close_dev;
+        }
+    }
+
+    /* Step 7: wrap fds + BAR0 mmap into nvm_ctrl_t BEFORE we run the
+     * GET_DEV_INFO poll loop -- the poll wrapper takes a nvm_ctrl_t. */
+    status = nvm_ctrl_init(ctrl, snvme_c_fd, snvme_d_fd);
+    if (status != 0) {
+        nvm_error("nvm_ctrl_init failed errno=%d", status);
+        goto fail_unbind;
+    }
+    (*ctrl)->on_host = 0;
+    (*ctrl)->pdev_addr = pdev_addr;
+
+    /* Step 6: wait for nvme_scan_work to populate disk_name + new B3
+     * fields, then memcpy them onto the ctrl handle. */
+    {
+        struct nvm_ioctl_dev info;
+        struct disk tmp_disk;
+        if (out_disk == NULL) {
+            out_disk = &tmp_disk;
+        }
+        memset(out_disk, 0, sizeof(*out_disk));
+        status = nvm_wait_dev_info(*ctrl, &info, 10000 /* 10 s */);
+        if (status != 0) {
+            nvm_error("NVM_GET_DEV_INFO poll timed out errno=%d", status);
+            goto fail_ctrl_free;
+        }
+        /* Apply to ctrl + caller's disk view, same shape as
+         * ioctl_get_dev_info above. */
+        (*ctrl)->start_cq_idx          = info.start_cq_idx;
+        (*ctrl)->nr_user_q             = info.nr_user_q;
+        (*ctrl)->dstrd                 = info.dstrd;
+        (*ctrl)->q_depth               = info.q_depth;
+        (*ctrl)->bar0_size             = info.bar0_size;
+        (*ctrl)->max_user_qid          = info.max_user_qid;
+        (*ctrl)->max_queues_per_group  = info.max_queues_per_group;
+        (*ctrl)->sgl_supported         = info.sgl_supported;
+        out_disk->max_data_size = info.max_data_size;  /* bytes already */
+        out_disk->block_size    = info.block_size;
+        out_disk->page_size     = (*ctrl)->page_size;
+        memcpy(out_disk->disk_name, info.disk_name, DISK_NAME_LEN);
+    }
+
+    /* The originating fds are now duped into the controller; close ours.
+     * (nvm_ctrl_init does the dup; this matches the legacy
+     * nvm_controller_init close pattern.)  */
+    close(snvme_c_fd);
+    close(snvme_d_fd);
+    snvme_c_fd = snvme_d_fd = -1;
+
+    /* Step 8: BAR0 -> CUDA host registration for doorbell GPU access.  */
+    cerr = cudaHostRegister((void*) (*ctrl)->mm_ptr,
+                            NVM_CTRL_MEM_MINSIZE,
+                            cudaHostRegisterIoMemory);
+    if (cerr != cudaSuccess) {
+        nvm_error("cudaHostRegister(BAR0) failed: %s",
+                  cudaGetErrorString(cerr));
+        return EFAULT;
+    }
+    return 0;
+
+fail_ctrl_free:
+    /* Drop the ctrl ref without going through nvm_ctrl_free's unbind
+     * cascade (we have NOT given the caller a usable handle).  This
+     * uses the internal _nvm_ctrl_put symbol. */
+    if (*ctrl != NULL) {
+        extern void _nvm_ctrl_put(struct controller*);
+        _nvm_ctrl_put(_nvm_container_of(*ctrl, struct controller, handle));
+        *ctrl = NULL;
+    }
+fail_unbind:
+    {
+        struct pci_device_addr a = pdev_addr;
+        (void) ioctl(snvme_c_fd, SNVM_DEVICE_UNBIND, &a);
+    }
+fail_close_dev:
+    if (snvme_d_fd >= 0) close(snvme_d_fd);
+    {
+        struct pci_device_addr a = pdev_addr;
+        (void) nvm_chrdev_remove(snvme_c_fd, &a);
+    }
+    if (snvme_c_fd >= 0) close(snvme_c_fd);
+    return status ? status : EFAULT;
 }
 

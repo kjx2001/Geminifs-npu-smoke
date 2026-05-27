@@ -43,6 +43,7 @@ LIBNVM_LIB := $(BUILD_DIR)/lib
 LIBNVM_SO := $(LIBNVM_LIB)/libnvm.so
 
 TARGET_LIBNVM := snvme_smoke_libnvm
+TARGET_LIBNVM_B3 := snvme_smoke_libnvm_b3
 
 CC      ?= gcc
 CFLAGS  ?= -O2 -Wall -Wextra -Wno-unused-parameter -std=c11 \
@@ -51,7 +52,7 @@ LDFLAGS ?= -L$(LIBNVM_LIB) -Wl,-rpath,$(LIBNVM_LIB) -lnvm
 
 .PHONY: all clean check-libnvm run
 
-all: check-libnvm $(TARGET_LIBNVM)
+all: check-libnvm $(TARGET_LIBNVM) $(TARGET_LIBNVM_B3)
 
 check-libnvm:
 	@if [ ! -f "$(LIBNVM_SO)" ]; then \
@@ -65,8 +66,11 @@ check-libnvm:
 $(TARGET_LIBNVM): snvme_smoke_libnvm.c $(LIBNVM_SO)
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
 
+$(TARGET_LIBNVM_B3): snvme_smoke_libnvm_b3.c $(LIBNVM_SO)
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+
 clean:
-	rm -f $(TARGET_LIBNVM)
+	rm -f $(TARGET_LIBNVM) $(TARGET_LIBNVM_B3)
 
 # Convenience: PCI=0000:08:00.0 make run
 run: $(TARGET_LIBNVM)
