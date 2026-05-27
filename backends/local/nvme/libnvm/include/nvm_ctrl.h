@@ -10,6 +10,10 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 
 
 
@@ -80,5 +84,9 @@ int nvm_controller_init(nvm_ctrl_t** ctrl, const char *snvme_control_path, const
 int nvm_device_init(nvm_ctrl_t* ctrl);
 
 struct controller* ctrl_to_controller(nvm_ctrl_t* ctrl);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* __NVM_CTRL_H__ */

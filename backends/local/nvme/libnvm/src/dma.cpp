@@ -30,6 +30,8 @@ struct map
     va_range_free_t     release;// Callback for releasing address range
     va_unmap_t          unmap;// Callback for unmapping address range
     unsigned int        on_host;
+    uint32_t            group_id;   // B3 queue-group id (0 = legacy / DATA)
+    uint8_t             map_kind;   // enum nvm_map_kind (B6); 0 = UNSPECIFIED
 };
 
 
@@ -99,6 +101,8 @@ static int create_map(struct map** md, const nvm_ctrl_t* ctrl, struct va_range* 
     m->is_cq = -1;
     m->ioq_idx = -1;
     m->on_host = ctrl->on_host;
+    m->group_id = 0;
+    m->map_kind = NVM_MAP_KIND_UNSPECIFIED;
     *md = m;
     return 0;
 }
@@ -174,24 +178,56 @@ static int dma_map(struct container* container)
         free(ioaddrs);
         return err;
     }
-    // printf("dma_map is_cq is %d, idx is %d, on host is %u\n",md->is_cq,md->ioq_idx,md->on_host);
-    if(md->is_cq>=0 && md->ioq_idx >= 0)
+    /*
+     * Pick the matching unmap routine.
+     *
+     *   B3/B6 new-mode paths (map_kind != UNSPECIFIED):
+     *     RING_SQ / RING_CQ -- do NOT install an explicit unmap.  These
+     *                          maps are released by NVM_DESTROY_QUEUE_
+     *                          GROUP cascade (kernel side), so calling
+     *                          NVM_UNMAP_* from userspace would race
+     *                          with -- and almost always lose to --
+     *                          group teardown.  Leaving md->unmap NULL
+     *                          here is safe: put_map() just skips the
+     *                          callback when count drops to zero.
+     *     DATA              -- unmap_range; valid as either an early
+     *                          explicit release or as fd-close cascade
+     *                          fallback (kernel handles double-free
+     *                          gracefully).
+     *
+     *   Legacy (map_kind == UNSPECIFIED):
+     *     keep the historical behaviour bit-for-bit so the pre-B3
+     *     bring-up path (NVM_SET_IOQ_NUM + per-queue NVM_MAP_DEVICE_
+     *     QUEUE_MEMORY) still rolls back symmetrically.
+     */
+    if (md->map_kind == NVM_MAP_KIND_RING_SQ || md->map_kind == NVM_MAP_KIND_RING_CQ)
     {
-        if(md->on_host)
+        md->unmap = NULL;       // released by NVM_DESTROY_QUEUE_GROUP cascade
+    }
+    else if (md->map_kind == NVM_MAP_KIND_DATA)
+    {
+        md->unmap = md->ctrl->ops.unmap_range;
+    }
+    else if (md->is_cq >= 0 && md->ioq_idx >= 0)
+    {
+        /* Legacy bring-up path: ioq_idx + is_cq sentinel >= 0 means the
+         * caller asked for NVM_MAP_DEVICE_QUEUE_MEMORY (on_host==0) or
+         * NVM_MAP_HOST_MEMORY tagged with the legacy per-queue role
+         * (on_host==1). */
+        if (md->on_host)
         {
-            
             md->unmap = md->ctrl->ops.unmap_range;
         }
         else
         {
             md->unmap = md->ctrl->ops.unmap_queue_range;
         }
-            
-    } else
+    }
+    else
     {
         md->unmap = md->ctrl->ops.unmap_range;
     }
-        
+
     populate_handle(&container->handle, md->va, &md->ctrl->handle, ioaddrs);
     free(ioaddrs);
 
@@ -343,6 +379,8 @@ int _nvm_dma_init(nvm_dma_t** handle, const nvm_ctrl_t* ctrl, struct va_range* v
     // Map controller for device and populate handle
     map->is_cq = m->is_cq;
     map->ioq_idx = m->ioq_idx;
+    map->group_id = m->group_id;
+    map->map_kind = m->map_kind;
     err = dma_map(container);
     if (err != 0)
     {

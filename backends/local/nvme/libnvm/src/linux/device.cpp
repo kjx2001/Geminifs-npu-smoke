@@ -11,6 +11,7 @@
 #include <stdbool.h>
 #include <stdlib.h>
 #include <errno.h>
+#include <string.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -66,22 +67,46 @@ static int ioctl_map(const struct device* dev, const struct va_range* va, uint64
             return EINVAL;
     }
 
+    /*
+     * Layout matches struct nvm_ioctl_map exactly; the B6 `map_kind`
+     * lives in the byte freed by splitting the old `reserved` u32, so
+     * pre-B6 callers (m->map_kind == UNSPECIFIED) submit the same wire
+     * bytes as before and the kernel takes the legacy fallback path.
+     *
+     * New-mode invariant (map_kind != UNSPECIFIED): ioq_idx and is_cq
+     * are forced to -1 here.  The kernel honours map_kind alone for
+     * RING_* / DATA discrimination; NVM_ADD_USER_QUEUE establishes
+     * per-queue identity later via (group_id, sq_vaddr, cq_vaddr).
+     */
+    int wire_ioq_idx = m->ioq_idx;
+    int wire_is_cq   = m->is_cq;
+    if (m->map_kind != NVM_MAP_KIND_UNSPECIFIED)
+    {
+        wire_ioq_idx = -1;
+        wire_is_cq   = -1;
+    }
+
     struct nvm_ioctl_map request = {
         .vaddr_start = (uintptr_t) m->buffer,
-        .n_pages = va->n_pages,
-        .ioaddrs = ioaddrs,
-        .ioq_idx = m->ioq_idx,
-        .is_cq = m->is_cq
+        .n_pages     = va->n_pages,
+        .ioaddrs     = ioaddrs,
+        .ioq_idx     = wire_ioq_idx,
+        .is_cq       = wire_is_cq,
+        .group_id    = m->group_id,
+        .map_kind    = m->map_kind,
+        .reserved0   = { 0, 0, 0 },
     };
 
     int err = ioctl(dev->fd_dev, type, &request);
     if (err < 0)
     {
-        dprintf("Page mapping kernel request failed (ptr=%p, n_pages=%zu): %s\n", 
-                m->buffer, va->n_pages, strerror(errno));
+        dprintf("Page mapping kernel request failed (ptr=%p, n_pages=%zu, group=%u, kind=%u): %s\n",
+                m->buffer, va->n_pages,
+                (unsigned)m->group_id, (unsigned)m->map_kind,
+                strerror(errno));
         return errno;
     }
-    
+
     return 0;
 }
 struct controller* ctrl_to_controller(nvm_ctrl_t* ctrl)
@@ -142,20 +167,45 @@ int ioctl_get_dev_info(nvm_ctrl_t* ctrl, struct disk* d)
         printf("container error!\n");
         return -1;
     }
-    
+
+    memset(&dev_info, 0, sizeof(dev_info));
     err = ioctl(container->device->fd_dev, NVM_GET_DEV_INFO, &dev_info);
     if (err < 0){
         printf("ioctl_get_dev_info err is %d\n",err);
         return errno;
     }
+    /* Legacy fields (unchanged semantics).  Note nr_user_q reads back as
+     * 0 in the B3 flow (kernel sets it only when the legacy
+     * NVM_SET_IOQ_NUM bring-up path is used); callers that need the
+     * actual user-queue count should track it themselves from
+     * NVM_ADD_USER_QUEUE results. */
     ctrl->start_cq_idx = dev_info.start_cq_idx;
-    // ctrl->dstrd = dev_info.dstrd;
     ctrl->nr_user_q = dev_info.nr_user_q;
+    /* CAP.DSTRD is already in `dev_info.dstrd`; keep ctrl->dstrd as the
+     * source of truth (overwrites whatever _nvm_ctrl_init read from
+     * BAR0 -- the kernel value is authoritative per ioctl.h note). */
+    ctrl->dstrd = dev_info.dstrd;
 
-    d->max_data_size = dev_info.max_data_size * 512; //get the ctrl->max_hw_sectors from kernel    
+    /* NEW B3 fields. */
+    ctrl->q_depth              = dev_info.q_depth;
+    ctrl->bar0_size            = dev_info.bar0_size;
+    ctrl->max_user_qid         = dev_info.max_user_qid;
+    ctrl->max_queues_per_group = dev_info.max_queues_per_group;
+    ctrl->sgl_supported        = dev_info.sgl_supported;
+
+    /* dev_info.max_data_size is already in BYTES (CTRL.MDTS converted
+     * by the kernel; see struct nvm_ioctl_dev comment in ioctl.h).
+     * The legacy "* 512" here was a double-conversion bug that this
+     * code only got away with on controllers whose MDTS happens to be
+     * 0 or whose IO never exceeded the bogus inflated cap. */
+    d->max_data_size = dev_info.max_data_size;
     d->block_size = dev_info.block_size; // ns->lba_shift
     memcpy(d->disk_name, dev_info.disk_name, DISK_NAME_LEN * sizeof(char));
-    nvm_debug("Disk info: start cq index is %u, max data size is %lu, block size is %lu", ctrl->start_cq_idx, d->max_data_size, d->block_size);
+    nvm_debug("Disk info: start cq idx=%u q_depth=%u max_user_qid=%u "
+              "max_data_size=%zu block_size=%zu sgls=0x%x",
+              ctrl->start_cq_idx, (unsigned)ctrl->q_depth,
+              ctrl->max_user_qid, d->max_data_size, d->block_size,
+              ctrl->sgl_supported);
     return 0;
 }
 

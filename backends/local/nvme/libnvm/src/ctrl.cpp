@@ -6,6 +6,7 @@
 #include <stdbool.h>
 #include <stdlib.h>
 #include <errno.h>
+#include <string.h>
 #include <atomic>
 #include "mutex.h"
 #include "lib_ctrl.h"

@@ -58,6 +58,12 @@ static int create_mapping_descriptor(struct ioctl_mapping** handle, size_t page_
     // printf("create_mapping_descriptor page size is %u, page num is %u,size is %d\n",page_size,n_pages,size);
     md->is_cq = -1;
     md->ioq_idx = -1;
+    md->n_entries = 0;
+    /* B3/B6 defaults: legacy fallback path. Callers that want new-mode
+     * behaviour overwrite group_id / map_kind on the returned descriptor
+     * before calling _nvm_dma_init(). */
+    md->group_id = 0;
+    md->map_kind = NVM_MAP_KIND_UNSPECIFIED;
     *handle = md;
     return 0;
 }
@@ -196,5 +202,151 @@ int nvm_dma_map_queue_device(nvm_dma_t** handle, const nvm_ctrl_t* ctrl, void* d
         return err;
     }
 
+    return 0;
+}
+
+
+/* ===================================================================
+ * B3/B6 explicit-intent DMA mapping API.
+ *
+ * All four follow the same shape:
+ *   1) allocate ioctl_mapping descriptor (default: legacy fallback).
+ *   2) set group_id + map_kind to the new-mode values.
+ *   3) is_cq / ioq_idx stay at -1 (new-mode invariant: kernel does
+ *      NOT use these in lookups when map_kind != UNSPECIFIED).
+ *   4) hand off to _nvm_dma_init -> ioctl_map.
+ * =================================================================== */
+
+int nvm_dma_map_data_host(nvm_dma_t** handle, const nvm_ctrl_t* ctrl, void* vaddr, size_t size)
+{
+    struct ioctl_mapping* md;
+    *handle = NULL;
+
+    size = NVM_CTRL_ALIGN(ctrl, size);
+    if (size == 0)
+    {
+        return EINVAL;
+    }
+    if (_nvm_ctrl_type(ctrl) != DEVICE_TYPE_IOCTL)
+    {
+        return EBADF;
+    }
+
+    int err = create_mapping_descriptor(&md, ctrl->page_size, MAP_TYPE_HOST, vaddr, size);
+    if (err != 0)
+    {
+        return err;
+    }
+    md->group_id = 0;                                /* DATA: group_id is ignored */
+    md->map_kind = NVM_MAP_KIND_DATA;
+
+    err = _nvm_dma_init(handle, ctrl, &md->range, &release_mapping_descriptor);
+    if (err != 0)
+    {
+        remove_mapping_descriptor(md);
+        return err;
+    }
+    return 0;
+}
+
+
+int nvm_dma_map_data_device(nvm_dma_t** handle, const nvm_ctrl_t* ctrl, void* devptr, size_t size)
+{
+    struct ioctl_mapping* md;
+    *handle = NULL;
+
+    if (_nvm_ctrl_type(ctrl) != DEVICE_TYPE_IOCTL)
+    {
+        return EBADF;
+    }
+
+    int err = create_mapping_descriptor(&md, 1ULL << 16, MAP_TYPE_CUDA, devptr, size);
+    if (err != 0)
+    {
+        return err;
+    }
+    md->group_id = 0;
+    md->map_kind = NVM_MAP_KIND_DATA;
+
+    err = _nvm_dma_init(handle, ctrl, &md->range, &release_mapping_descriptor);
+    if (err != 0)
+    {
+        remove_mapping_descriptor(md);
+        return err;
+    }
+    return 0;
+}
+
+
+int nvm_dma_map_ring_host(nvm_dma_t** handle, const nvm_ctrl_t* ctrl,
+                          uint32_t group_id, void* vaddr, size_t size, int is_cq)
+{
+    struct ioctl_mapping* md;
+    *handle = NULL;
+
+    if (group_id == 0)
+    {
+        /* RING_SQ/CQ must be attached to a queue group; bail early
+         * before the kernel rejects us with -EINVAL so the failure
+         * mode is unambiguous. */
+        return EINVAL;
+    }
+    size = NVM_CTRL_ALIGN(ctrl, size);
+    if (size == 0)
+    {
+        return EINVAL;
+    }
+    if (_nvm_ctrl_type(ctrl) != DEVICE_TYPE_IOCTL)
+    {
+        return EBADF;
+    }
+
+    int err = create_mapping_descriptor(&md, ctrl->page_size, MAP_TYPE_HOST, vaddr, size);
+    if (err != 0)
+    {
+        return err;
+    }
+    md->group_id = group_id;
+    md->map_kind = is_cq ? NVM_MAP_KIND_RING_CQ : NVM_MAP_KIND_RING_SQ;
+
+    err = _nvm_dma_init(handle, ctrl, &md->range, &release_mapping_descriptor);
+    if (err != 0)
+    {
+        remove_mapping_descriptor(md);
+        return err;
+    }
+    return 0;
+}
+
+
+int nvm_dma_map_ring_device(nvm_dma_t** handle, const nvm_ctrl_t* ctrl,
+                            uint32_t group_id, void* devptr, size_t size, int is_cq)
+{
+    struct ioctl_mapping* md;
+    *handle = NULL;
+
+    if (group_id == 0)
+    {
+        return EINVAL;
+    }
+    if (_nvm_ctrl_type(ctrl) != DEVICE_TYPE_IOCTL)
+    {
+        return EBADF;
+    }
+
+    int err = create_mapping_descriptor(&md, 1ULL << 16, MAP_TYPE_CUDA, devptr, size);
+    if (err != 0)
+    {
+        return err;
+    }
+    md->group_id = group_id;
+    md->map_kind = is_cq ? NVM_MAP_KIND_RING_CQ : NVM_MAP_KIND_RING_SQ;
+
+    err = _nvm_dma_init(handle, ctrl, &md->range, &release_mapping_descriptor);
+    if (err != 0)
+    {
+        remove_mapping_descriptor(md);
+        return err;
+    }
     return 0;
 }

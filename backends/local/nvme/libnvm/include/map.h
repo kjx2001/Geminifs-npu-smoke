@@ -21,15 +21,40 @@ enum mapping_type
 
 /*
  * Mapping container
+ *
+ * group_id + map_kind (added for B3/B6, see ioctl.h):
+ *
+ *   group_id == 0 && map_kind == NVM_MAP_KIND_UNSPECIFIED
+ *           Legacy fallback path.  Kernel registers the map against
+ *           the controller-global host/device/device_queue list and
+ *           ignores per-fd queue-group semantics.  This is what every
+ *           pre-B3 libnvm caller still gets, so behaviour is preserved
+ *           bit-for-bit while we incrementally migrate callers.
+ *
+ *   group_id != 0 && map_kind == NVM_MAP_KIND_RING_SQ/RING_CQ
+ *           New B3/B6 path.  Map is linked onto the group's map list
+ *           and cascade-released by NVM_DESTROY_QUEUE_GROUP /
+ *           fd close.  ioq_idx / is_cq are forced to -1 at ioctl
+ *           submission time (new-mode API).
+ *
+ *   group_id == 0 && map_kind == NVM_MAP_KIND_DATA
+ *           B6 fd-scoped DATA buffer.  Map is linked onto the per-fd
+ *           data_maps list; survives queue-group destroy and is only
+ *           released on fd close.  ioq_idx / is_cq are forced to -1.
+ *
+ * is_cq / ioq_idx remain the legacy bring-up (NVM_SET_IOQ_NUM) hints
+ * and are only honoured when map_kind == UNSPECIFIED.
  */
 struct ioctl_mapping
 {
-    enum mapping_type   type;   // What kind of memory
+    enum mapping_type   type;       // What kind of memory
     void*               buffer;
-    struct va_range     range;  // Memory range descriptor
-    int is_cq;
-    int ioq_idx;
-    int n_entries;
+    struct va_range     range;      // Memory range descriptor
+    int                 is_cq;      // legacy mode only; -1 in B3/B6 mode
+    int                 ioq_idx;    // legacy mode only; -1 in B3/B6 mode
+    int                 n_entries;
+    uint32_t            group_id;   // B3 per-fd queue group id; 0 = legacy / DATA
+    uint8_t             map_kind;   // enum nvm_map_kind (B6); 0 = UNSPECIFIED
 };
 
 

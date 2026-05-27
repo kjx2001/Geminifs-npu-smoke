@@ -5,6 +5,10 @@
 #include "mutex.h"
 #include "lib_util.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 
 /* 
  * Device handle.
@@ -111,5 +115,9 @@ void _nvm_ctrl_put(struct controller* ctrl);
  * Convenience macro to get the controller type.
  */
 #define _nvm_ctrl_type(ctrl) _nvm_container_of(ctrl, struct controller, handle)->type
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* __NVM_INTERNAL_CTRL_H__ */

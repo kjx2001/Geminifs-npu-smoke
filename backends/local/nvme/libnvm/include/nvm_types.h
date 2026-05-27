@@ -8,8 +8,43 @@
 #include "ioctl.h"
 #include <stddef.h>
 #include <stdint.h>
-#include <cuda/atomic>
-#include <cuda_runtime.h>
+
+/*
+ * CUDA-vs-C compilation gate.
+ *
+ * libnvm's queue / pad structs use `cuda::atomic<uint32_t, ...>` for
+ * the GPU-side SQ/CQ producer-consumer locks.  Those types are only
+ * available under nvcc; pure C consumers (host-only smokes, gRPC
+ * services that just need ioctl plumbing, etc.) cannot include
+ * <cuda/atomic>.
+ *
+ * To keep the public header reachable from both worlds we provide an
+ * ABI-compatible C view: `cuda::atomic<uint32_t, ...>` is a 4-byte,
+ * 4-byte-aligned scalar at the binary level, and `__align__(N)` is
+ * nvcc-only syntactic sugar for `__attribute__((aligned(N)))`.  The
+ * resulting C-visible structs have IDENTICAL sizeof / offsetof to the
+ * CUDA versions, so userspace ioctl glue compiles either way and the
+ * GPU side keeps full atomicity semantics where it matters.
+ *
+ * Callers that actually need to *operate* on the atomic fields must
+ * still be compiled under nvcc -- this gate just makes the header
+ * usable for binary-layout consumers (size, offset, ioctl pointers).
+ */
+#if defined(__CUDACC__)
+  #include <cuda/atomic>
+  #include <cuda_runtime.h>
+  typedef cuda::atomic<uint32_t, cuda::thread_scope_device> nvm_atomic_u32_dev_t;
+  typedef cuda::atomic<uint32_t, cuda::thread_scope_system> nvm_atomic_u32_sys_t;
+#else
+  /* Plain-C fallback: same size / alignment as cuda::atomic<uint32_t>. */
+  typedef uint32_t __attribute__((aligned(4))) nvm_atomic_u32_dev_t;
+  typedef uint32_t __attribute__((aligned(4))) nvm_atomic_u32_sys_t;
+  /* __align__(N) is an nvcc keyword; map it to the gcc/clang attribute
+   * when seen from a plain-C compile so the rest of this header parses. */
+  #ifndef __align__
+    #define __align__(N) __attribute__((aligned(N)))
+  #endif
+#endif
 
 
 
@@ -73,7 +108,7 @@ typedef struct
 
 
 
-typedef cuda::atomic<uint32_t, cuda::thread_scope_device> padded_struct_pc;
+typedef nvm_atomic_u32_dev_t padded_struct_pc;
 
 #define CACHELINE_SIZE (128)
 
@@ -87,7 +122,7 @@ typedef cuda::atomic<uint32_t, cuda::thread_scope_device> padded_struct_pc;
 
 typedef struct __align__(32)
 {
-    cuda::atomic<uint32_t, cuda::thread_scope_device>  val;
+    nvm_atomic_u32_dev_t  val;
     //uint8_t pad[32-8];
 } __attribute__((aligned (32))) padded_struct;
 
@@ -116,24 +151,24 @@ typedef struct __align__(32)
  */
 typedef struct
 {
-    cuda::atomic<uint32_t, cuda::thread_scope_device> head_lock;
+    nvm_atomic_u32_dev_t head_lock;
     uint8_t pad0[28];
-    cuda::atomic<uint32_t, cuda::thread_scope_device> tail_lock;
+    nvm_atomic_u32_dev_t tail_lock;
     uint8_t pad1[28];
-    cuda::atomic<uint32_t, cuda::thread_scope_device> head;
+    nvm_atomic_u32_dev_t head;
     uint8_t pad2[28];
-    cuda::atomic<uint32_t, cuda::thread_scope_device> tail;
+    nvm_atomic_u32_dev_t tail;
     uint8_t pad3[28];
-    cuda::atomic<uint32_t, cuda::thread_scope_system> tail_copy;
+    nvm_atomic_u32_sys_t tail_copy;
     uint8_t pad4[28];
-    cuda::atomic<uint32_t, cuda::thread_scope_system> head_copy;
+    nvm_atomic_u32_sys_t head_copy;
     uint8_t pad5[28];
 
     /* padded_struct<cuda::atomic<uint32_t, cuda::thread_scope_system>> head; */
     /* padded_struct<cuda::atomic<uint32_t, cuda::thread_scope_system>> tail; */
-    cuda::atomic<uint32_t, cuda::thread_scope_device> in_ticket;
+    nvm_atomic_u32_dev_t in_ticket;
     uint8_t pad6[28];
-    cuda::atomic<uint32_t, cuda::thread_scope_device> cid_ticket;
+    nvm_atomic_u32_dev_t cid_ticket;
     //uint8_t pad7[28];
     padded_struct* tickets;
 
@@ -283,7 +318,20 @@ typedef struct
     uint32_t                on_host;        // 1 indicate qmem created on cpu, otherwise on GPU
     struct queue*           queues;   
     struct pci_device_addr  pdev_addr;
-    
+
+    /* === NEW for B3 (sourced from NVM_GET_DEV_INFO) ===
+     *
+     * These mirror the like-named fields in struct nvm_ioctl_dev and are
+     * the single source of truth for q_depth / user QID pool / BAR0 size
+     * / SGL support, replacing the historical pattern of recomputing them
+     * from CAP at libnvm bring-up time.  Populated by ioctl_get_dev_info()
+     * after SNVM_DEVICE_BIND succeeds; zero before bind.
+     */
+    uint16_t                q_depth;             // applies to ALL user queues
+    uint32_t                bar0_size;           // pci_resource_len(BAR0)
+    uint32_t                max_user_qid;        // top of user QID pool
+    uint32_t                max_queues_per_group;// echoes NVM_MAX_QUEUES_PER_GROUP
+    uint32_t                sgl_supported;       // Identify Controller SGLS dword
 } nvm_ctrl_t;
 
 /* Disk descriptor */

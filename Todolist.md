@@ -228,6 +228,26 @@ is documented as a §7.3.1 trap.
       `d_qps == d_qps_per_group[0]`. Multi-GPU kernels read the
       group-local array.
 
+- [ ] **Stop overloading `pci_device_addr.domain` as the
+      CHRDEV_CREATE out-param.** `SNVM_CHRDEV_CREATE` /
+      `SNVM_CHRDEV_REMOVE` currently `memset(dev_addr, 0, ...)` and
+      stuff the assigned chrdev minor into `dev_addr->domain` on
+      return (see `snvme-*/pci.c::snvm_chrdev_helper`), forcing
+      userspace to do `snprintf("/dev/ssnvme%d", bdf.domain)` with
+      a field that no longer means PCIe domain. Works today only
+      because every NVMe card in scope sits at domain 0; breaks
+      the moment a multi-domain host shows up, and is just
+      confusing to read regardless. Fix is a layout-compatible
+      ABI bump: define a dedicated `struct snvm_ioctl_chrdev {
+      struct pci_device_addr addr; uint32_t out_minor; uint32_t
+      reserved[3]; }` for opcodes 3/4, leave `pci_device_addr` as
+      a pure in-param everywhere else. Touches:
+      `include/ioctl.h`, both `snvme-*/pci.c` chrdev helpers,
+      `libnvm/src/linux/device.cpp::nvm_controller_init`,
+      `snvme_smoke_libnvm.c` / `snvme_smoke_io.c` /
+      `snvme_smoke_addq.c` / `snvme_smoke_gpu.cu` / `snvme_smoke_qgroup.c`,
+      and PORTING.md §4.2 (chrdev minor allocation).
+
 ## Discussion Required Before Major Refactor
 
 - [x] Decide the future runtime/product name — `Tutti`, recorded in
