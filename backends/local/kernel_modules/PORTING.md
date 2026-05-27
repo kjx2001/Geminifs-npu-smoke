@@ -1549,6 +1549,29 @@ Re-audit each one after §7.1.
   separately) AND that destroy_qgroup_locked does NOT touch the
   fd-scoped `data_maps` list.
 
+- **`nvm_ioctl_dev.max_data_size` units must be bytes, not 512 B
+  sectors.**  (`snvme/pci.c::ioctl_get_dev_info` populator.)
+  The kernel-internal `nvme_ctrl::max_hw_sectors` is in 512-byte
+  sectors regardless of LBA size (NVMe block layer convention).
+  Pre-fix the populator copied that field verbatim into
+  `drequest.max_data_size`, but `include/ioctl.h` documents the
+  field as **"CTRL.MDTS in bytes"**.  This silently asked every
+  userspace consumer to either know the convention and `* 512`
+  themselves, or to under-count PRP_List sizing on 4 KiB-LBA
+  controllers.  libnvm flip-flopped on it across versions
+  (Commit 1 of L1 even had to revert a `* 512` strip-out).
+
+  Fix shape: convert at the source —
+  `drequest.max_data_size = (size_t)ndev->ctrl.max_hw_sectors << 9;`
+  Both `snvme-5.4.241-1-tlinux4-0017/pci.c` and
+  `snvme-5.15.0-public/pci.c` carry the fix; userspace
+  (`libnvm/src/linux/device.cpp::ioctl_get_dev_info` and
+  `nvm_controller_init_b3`) trusts the byte value verbatim.
+  Verify with: on a controller whose MDTS is X KiB,
+  `disk.max_data_size` == X*1024.  On the H20 NVMe used as
+  reference, MDTS = 128 KiB → `disk.max_data_size == 131072`,
+  not 256.
+
 None of these are detected by the smoke tests as written — the
 smoke tests run the happy path. They are detected by (a) reading
 this list during the merge, and (b) the **reset + stress** workload

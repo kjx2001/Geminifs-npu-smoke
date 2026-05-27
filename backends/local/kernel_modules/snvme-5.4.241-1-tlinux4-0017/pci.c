@@ -5967,7 +5967,17 @@ static long snvm_dev_map_ioctl(struct file *file, unsigned int cmd,
 		drequest.dstrd         = ndev->db_stride;
 		drequest.nr_user_q     = ndev->nr_user_use_cq;
 		drequest.block_size    = 1 << ns->lba_shift;
-		drequest.max_data_size = ndev->ctrl.max_hw_sectors;
+		/* CTRL.MDTS in BYTES.  ndev->ctrl.max_hw_sectors is the
+		 * NVMe-block-layer internal in 512-byte sectors (regardless
+		 * of LBA size); convert to bytes here so userspace gets a
+		 * single, format-agnostic byte count -- matching the
+		 * documented contract in include/ioctl.h ("CTRL.MDTS in
+		 * bytes").  Pre-fix: userspace had to sometimes "* 512"
+		 * itself depending on which version of libnvm was linked,
+		 * which silently inflated/under-counted PRP_List sizing on
+		 * 4 KiB-LBA controllers.  The 5.15 baseline must mirror
+		 * this; both modules are in scope. */
+		drequest.max_data_size = (size_t)ndev->ctrl.max_hw_sectors << 9;
 
 		/*
 		 * B3 fields.  These are the single source of truth for

@@ -4725,7 +4725,13 @@ static long snvm_dev_map_ioctl(struct file* file, unsigned int cmd, unsigned lon
 			drequest.dstrd         = ndev->db_stride;
 			drequest.nr_user_q     = ndev->nr_user_use_cq;
 			drequest.block_size    = 1 << ns->lba_shift;
-			drequest.max_data_size = ndev->ctrl.max_hw_sectors;
+			/* CTRL.MDTS in BYTES.  max_hw_sectors is the
+			 * NVMe-block-layer internal in 512-byte sectors;
+			 * convert here so userspace gets a single
+			 * format-agnostic byte count.  See ioctl.h
+			 * ("CTRL.MDTS in bytes") and the matching fix in
+			 * the 5.4.241 baseline. */
+			drequest.max_data_size = (size_t)ndev->ctrl.max_hw_sectors << 9;
 
 			/*
 			 * B3 fields.  These are the single source of truth for
