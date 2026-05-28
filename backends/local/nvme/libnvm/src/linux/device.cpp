@@ -31,11 +31,18 @@
 
 /*
  * Unmap controller memory and close file descriptor.
+ *
+ * fd_control may legitimately be -1 in the client-attach path
+ * (nvm_ctrl_attach_client never opens /dev/snvm_control because
+ * a client has no business calling CHRDEV_CREATE/REMOVE or
+ * DEVICE_BIND/UNBIND -- those are owner-only).  Skip the close
+ * in that case.
  */
 static void release_device(struct device* dev)
 {
-
-    close(dev->fd_control);
+    if (dev->fd_control >= 0) {
+        close(dev->fd_control);
+    }
     close(dev->fd_dev);
     free(dev);
 }
@@ -390,37 +397,42 @@ int nvm_ctrl_init(nvm_ctrl_t** ctrl, int snvme_c_fd, int snvme_d_fd)
         return ENOMEM;
     }
 
-    dev->fd_control = dup(snvme_c_fd);
-    if (dev->fd_control < 0)
-    {
-        free(dev);
-        dprintf("Could not duplicate file descriptor: %s\n", strerror(errno));
-        return errno;
+    dev->fd_control = -1;
+    if (snvme_c_fd >= 0) {
+        dev->fd_control = dup(snvme_c_fd);
+        if (dev->fd_control < 0)
+        {
+            free(dev);
+            dprintf("Could not duplicate file descriptor: %s\n", strerror(errno));
+            return errno;
+        }
     }
-    
-    dev->fd_dev = dup(snvme_d_fd);
-    if (dev->fd_control < 0)
-    {
-        close(dev->fd_control);
-        free(dev);
-        dprintf("Could not duplicate file descriptor: %s\n", strerror(errno));
-        return errno;
-    }
-    
 
-    err = fcntl(dev->fd_control, F_SETFD, O_RDWR);
-    if (err == -1)
+    dev->fd_dev = dup(snvme_d_fd);
+    if (dev->fd_dev < 0)
     {
-        close(dev->fd_control);
-        close(dev->fd_dev);
+        if (dev->fd_control >= 0) close(dev->fd_control);
         free(dev);
-        dprintf("Failed to set file descriptor control: %s\n", strerror(errno));
+        dprintf("Could not duplicate file descriptor: %s\n", strerror(errno));
         return errno;
+    }
+
+
+    if (dev->fd_control >= 0) {
+        err = fcntl(dev->fd_control, F_SETFD, O_RDWR);
+        if (err == -1)
+        {
+            close(dev->fd_control);
+            close(dev->fd_dev);
+            free(dev);
+            dprintf("Failed to set file descriptor control: %s\n", strerror(errno));
+            return errno;
+        }
     }
     err = fcntl(dev->fd_dev, F_SETFD, O_RDWR);
     if (err == -1)
     {
-        close(dev->fd_control);
+        if (dev->fd_control >= 0) close(dev->fd_control);
         close(dev->fd_dev);
         free(dev);
         dprintf("Failed to set file descriptor control: %s\n", strerror(errno));
@@ -430,7 +442,7 @@ int nvm_ctrl_init(nvm_ctrl_t** ctrl, int snvme_c_fd, int snvme_d_fd)
     void* mm_ptr = mmap(NULL, NVM_CTRL_MEM_MINSIZE, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_FILE|MAP_LOCKED, dev->fd_dev, 0);
     if (mm_ptr == NULL)
     {
-        close(dev->fd_control);
+        if (dev->fd_control >= 0) close(dev->fd_control);
         close(dev->fd_dev);
         free(dev);
         dprintf("Failed to map device memory: %s\n", strerror(errno));
@@ -850,5 +862,126 @@ fail_close_dev:
     }
     if (snvme_c_fd >= 0) close(snvme_c_fd);
     return status ? status : EFAULT;
+}
+
+/* ===================================================================
+ * Owner / client role split (L1 Commit 4a) -- implementation.
+ *
+ * See nvm_ctrl.h for the API contract.
+ *
+ * The client path opens an existing /dev/ssnvme<N> chrdev (the owner
+ * created it with SNVM_CHRDEV_CREATE earlier in another process),
+ * mmaps its BAR0, registers the BAR0 host VA with CUDA, and wraps
+ * fd_dev into a fresh struct controller.  fd_control is left at -1
+ * inside struct device: a client has no business calling any of the
+ * /dev/snvm_control-only ioctls (CHRDEV_CREATE/REMOVE, DEVICE_BIND/
+ * UNBIND), and every B3/B6 user-visible ioctl (CREATE/DESTROY_GROUP,
+ * ADD_USER_QUEUE, MAP_HOST/DEVICE_MEMORY, GET_DEV_INFO, ...) goes
+ * through fd_dev only.  release_device() tolerates fd_control == -1.
+ *
+ * The client path does NOT call:
+ *   - SNVM_CHRDEV_CREATE  (the owner did this)
+ *   - NVM_SET_KERNEL_IOQ_CAP  (pre-bind only; owner did it)
+ *   - SNVM_DEVICE_BIND  (owner did this, single-driver-per-PCI invariant)
+ *   - NVM_GET_DEV_INFO  (the disk metadata is not the client's concern;
+ *                        the daemon already mounted the FS / told the
+ *                        client what mount path / namespace_id / block_size
+ *                        to use via RPC)
+ *
+ * What the client CAN do once attached:
+ *   - nvm_create_group()       -- per-fd, kernel ignores other fds
+ *   - nvm_dma_map_ring_*()     -- linked onto its own group->maps
+ *   - nvm_dma_map_data_*()     -- linked onto its own data_maps list
+ *   - nvm_add_user_queue()     -- kernel allocates user QID from pool
+ *   - nvm_destroy_group()      -- cascades through Delete I/O CQ/SQ +
+ *                                 RING_* map purge for its own group
+ *   - close fd                 -- fd-cascade releases everything still
+ *                                 attached to this fd.  This is the
+ *                                 reaping path that fires when a
+ *                                 client process dies unexpectedly.
+ * =================================================================== */
+
+int nvm_ctrl_attach_client(nvm_ctrl_t** ctrl,
+                           const char* snvme_dev_path,
+                           uint32_t bar0_size)
+{
+    if (ctrl == NULL || snvme_dev_path == NULL || bar0_size == 0) {
+        return EINVAL;
+    }
+    *ctrl = NULL;
+
+    /* Client does NOT open /dev/snvm_control: that fd is only used
+     * for owner-only ioctls (CHRDEV_CREATE/REMOVE, DEVICE_BIND/
+     * UNBIND).  All B3/B6 user-visible ioctls (CREATE/DESTROY_GROUP,
+     * ADD_USER_QUEUE, MAP_HOST/DEVICE_MEMORY, GET_DEV_INFO, ...) go
+     * through fd_dev only.  We pass -1 to nvm_ctrl_init, which will
+     * leave struct device::fd_control at -1 and skip the dup/fcntl
+     * and the close-on-release for that field. */
+
+    int fd_dev = open(snvme_dev_path, O_RDWR | O_NONBLOCK);
+    if (fd_dev < 0) {
+        return errno ? errno : EFAULT;
+    }
+
+    int rc = nvm_ctrl_init(ctrl, /*snvme_c_fd=*/-1, fd_dev);
+    if (rc != 0) {
+        close(fd_dev);
+        return rc;
+    }
+    /* nvm_ctrl_init dup'd fd_dev; close ours. */
+    close(fd_dev);
+
+    (*ctrl)->on_host = 0;
+    /* pdev_addr is unknown to a client (it never parsed a PCI BDF;
+     * it only got a /dev/ssnvme<N> path).  Leave zero -- callers
+     * that need it should use the daemon's RPC payload. */
+
+    /* Register BAR0 with CUDA so doorbells become reachable from
+     * GPU kernels via cudaHostGetDevicePointer.  Same code path
+     * as nvm_controller_init_b3() takes; failure here is fatal
+     * because the only reason a client attaches in the first
+     * place is to drive IO from the GPU. */
+    cudaError_t cerr = cudaHostRegister(
+        (void*) (*ctrl)->mm_ptr,
+        NVM_CTRL_MEM_MINSIZE,
+        cudaHostRegisterIoMemory);
+    if (cerr != cudaSuccess) {
+        nvm_error("nvm_ctrl_attach_client: cudaHostRegister(BAR0) failed: %s",
+                  cudaGetErrorString(cerr));
+        /* Drop the ctrl we just built. */
+        extern void _nvm_ctrl_put(struct controller*);
+        _nvm_ctrl_put(_nvm_container_of(*ctrl, struct controller, handle));
+        *ctrl = NULL;
+        return EFAULT;
+    }
+
+    /* Note: bar0_size is currently not stored on nvm_ctrl_t (mm_size
+     * was set to NVM_CTRL_MEM_MINSIZE inside nvm_ctrl_init).  The
+     * passed-in size is reserved for future use (e.g. extended
+     * doorbell windows) and validated only as non-zero above.
+     * Callers that need to mmap MORE than NVM_CTRL_MEM_MINSIZE
+     * should issue a separate mmap on a fresh fd; that's outside
+     * libnvm's scope. */
+    (void) bar0_size;
+    return 0;
+}
+
+void nvm_ctrl_free_client(nvm_ctrl_t* ctrl)
+{
+    if (ctrl == NULL) {
+        return;
+    }
+    /* Crucially: NO unbind / chrdev_remove.  Just unregister BAR0
+     * with CUDA (matched to the cudaHostRegister in attach_client)
+     * and drop the libnvm refcount; release_device closes fd_dev,
+     * which triggers the kernel's snvm_dev_release cascade for
+     * any groups / DATA maps still attached. */
+    if (ctrl->mm_ptr != NULL) {
+        /* Best-effort: ignore the return code.  If CUDA was already
+         * shut down (process is exiting), unregister fails harmlessly. */
+        (void) cudaHostUnregister((void*) ctrl->mm_ptr);
+    }
+    extern void _nvm_ctrl_put(struct controller*);
+    _nvm_ctrl_put(_nvm_container_of(ctrl, struct controller, handle));
 }
 

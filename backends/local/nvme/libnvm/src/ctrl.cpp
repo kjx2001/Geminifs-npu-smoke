@@ -195,6 +195,30 @@ int _nvm_ctrl_init(nvm_ctrl_t** handle, struct device* dev, const struct device_
 
 
 
+/*
+ * Release controller handle (OWNER-ONLY path).
+ *
+ * Unconditionally cascades through:
+ *   nvm_queue_clear      -- legacy admin queue scrub
+ *   nvm_device_unbind    -- SNVM_DEVICE_UNBIND ioctl: detaches snvme
+ *                           from the PCI BDF.  System-wide effect:
+ *                           the in-tree nvme driver gets the device
+ *                           back, /dev/nvmeXnY reappears, etc.
+ *   nvm_chrdev_remove    -- SNVM_CHRDEV_REMOVE ioctl: tears down
+ *                           /dev/ssnvme<N>.  Affects every other
+ *                           process that still has the chrdev open.
+ *   _nvm_ctrl_put        -- closes fd_dev + fd_control on refcount=0
+ *
+ * MUST NOT be called from a client process that did NOT originally
+ * issue SNVM_CHRDEV_CREATE + SNVM_DEVICE_BIND -- doing so would yank
+ * the device out from under the owner and any sibling clients.
+ *
+ * Client processes (those built via nvm_ctrl_attach_client()) MUST
+ * use nvm_ctrl_free_client() instead, which only drops the libnvm
+ * refcount + closes the client's own fd; kernel snvm_dev_release
+ * then cascade-cleans whatever groups / DATA maps were attached to
+ * that fd, leaving the chrdev / PCI binding intact.
+ */
 void nvm_ctrl_free(nvm_ctrl_t* ctrl)
 {
     if (ctrl != NULL)

@@ -135,6 +135,60 @@ int nvm_wait_dev_info(nvm_ctrl_t* ctrl,
                       struct nvm_ioctl_dev* out_info,
                       uint32_t timeout_ms);
 
+/* ===================================================================
+ * Owner / client role split (L1 Commit 4a).
+ *
+ * In the multi-process model, exactly one process plays "driver
+ * owner" -- the one that issued SNVM_CHRDEV_CREATE +
+ * SNVM_DEVICE_BIND.  Every other process attaching the same
+ * controller is a "client" -- it shares BAR0 (multi-process safe
+ * mmap) and must NOT call unbind / chrdev_remove.
+ *
+ * The original nvm_ctrl_free() unconditionally cascades through
+ * unbind + chrdev_remove, which is correct for the owner but would
+ * tear the device out from under every other client if invoked
+ * from one of them.  We therefore expose two separate APIs:
+ *
+ *   nvm_controller_init_b3()  - owner-only, performs full B3
+ *                               bring-up (chrdev_create + cap +
+ *                               bind + probe wait + ctrl_init +
+ *                               cudaHostRegister BAR0).
+ *
+ *   nvm_ctrl_attach_client()  - client-only, opens an already-
+ *                               existing /dev/ssnvme<N>, mmaps
+ *                               BAR0, registers it with CUDA, and
+ *                               wraps it in a fresh nvm_ctrl_t.
+ *                               Does NOT touch the bind/chrdev
+ *                               ioctls.  The caller may then
+ *                               nvm_create_group() / nvm_dma_map_*
+ *                               / nvm_add_user_queue on its own
+ *                               fd; everything is per-fd scoped
+ *                               (B6) so it can't accidentally
+ *                               disturb the owner or sibling
+ *                               clients.
+ *
+ *   nvm_ctrl_free()           - owner-only release (same as before:
+ *                               unbind + chrdev_remove + put).
+ *
+ *   nvm_ctrl_free_client()    - client-only release: closes the
+ *                               attached fd via _nvm_ctrl_put;
+ *                               kernel snvm_dev_release will
+ *                               cascade-clean any groups / DATA
+ *                               maps still attached to that fd.
+ *                               No PCI driver state is touched.
+ *
+ * The CUDA host-register step is skipped from this header's contract
+ * (it requires a CUDA-capable build).  nvm_ctrl_attach_client()
+ * therefore cudaHostRegister's BAR0 internally on the same code path
+ * as nvm_controller_init_b3() so the GPU view is consistent.
+ * =================================================================== */
+
+int nvm_ctrl_attach_client(nvm_ctrl_t** ctrl,
+                           const char* snvme_dev_path,
+                           uint32_t bar0_size);
+
+void nvm_ctrl_free_client(nvm_ctrl_t* ctrl);
+
 #ifdef __cplusplus
 }
 #endif
