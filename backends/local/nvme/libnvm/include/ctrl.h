@@ -80,6 +80,11 @@ struct Controller
     // (daemon owns the mount), no nvm_ctrl_free (daemon owns nvm_ctrl_t).
     bool                    is_shared = false;
 
+    // B3 queue group id assigned by NVM_CREATE_QUEUE_GROUP during
+    // init_queues().  Zero in shared mode (the daemon owns the group)
+    // and pre-init.  ~Controller() destroys the group when non-zero.
+    uint32_t                group_id = 0;
+
     Controller(const char* snvme_control_path,
                 const char* pci_addr,
                 std::string mount_path,
@@ -181,10 +186,23 @@ inline Controller::Controller(const char* snvme_control_path,
 
     int status;
 
-    status = nvm_controller_init(&ctrl, snvme_control_path, pci_addr);
+    /* B3 bring-up: chrdev_create -> SET_KERNEL_IOQ_CAP -> BIND ->
+     * wait probe -> GET_DEV_INFO -> ctrl_init -> cudaHostRegister.
+     *
+     * kernel_ioq_cap=0 means "no cap, use upstream nvme default of
+     * num_possible_cpus()".  Callers that need to pin a smaller
+     * kernel-side IOQ count (e.g. Intel DC SSD: MSI-X=136 vs 192
+     * vCPUs) should expose a separate Controller ctor / param;
+     * for now the cap is left at 0 to match the upstream default. */
+    status = nvm_controller_init_b3(&ctrl,
+                                    snvme_control_path,
+                                    pci_addr,
+                                    /* kernel_ioq_cap */ 0,
+                                    &this->disk);
     if (status != 0){
-        nvm_throw_error("Failed to nvm_controller_init", status);
+        nvm_throw_error("Failed to nvm_controller_init_b3", status);
     }
+    this->disk.ns_id = ns_id;
 
     status = init_queues(ns_id, queue_targets, queueDepth);
     if (status != 0){
@@ -221,10 +239,40 @@ inline int Controller::init_queues(uint32_t ns_id,  uint32_t cudaDevice,
 inline int Controller::init_queues(uint32_t ns_id,
                                     const std::vector<QueueMemTarget>& queue_targets,
                                     uint64_t queueDepth){
+    /*
+     * B3 init_queues.
+     *
+     * Replaces the legacy:
+     *   nvm_queue_set(n_sq+n_cq) -> per-q create_queue_Dma rings
+     *   -> nvm_device_init (BIND) -> init_userioq_device
+     *
+     * with the explicit B3 sequence (BIND already happened in the
+     * Controller ctor via nvm_controller_init_b3):
+     *
+     *   1. nvm_create_group()                   -> group_id
+     *   2. for each requested queue:
+     *        new QueuePair(B3 ctor) which calls
+     *          create_ring_Dma(group_id, RING_SQ)
+     *          create_ring_Dma(group_id, RING_CQ)
+     *          (defers init_gpu_specific_struct)
+     *   3. NVM_ADD_USER_QUEUE batch (1 ioctl, all (sq_vaddr, cq_vaddr)
+     *      pairs at once).  Kernel issues Create I/O CQ + Create I/O SQ
+     *      admin commands; on partial failure it unwinds the
+     *      already-created pairs before returning.
+     *   4. for each pair: write the kernel-returned doorbell offsets
+     *      into nvm_queue_t.db, init_gpu_specific_struct, cudaMemcpy
+     *      QueuePair -> d_qps[i].
+     *
+     * Doorbell handling differs from the legacy path: the kernel
+     * returns BAR0-relative byte offsets in out_pairs[].sq/cq_doorbell_offset
+     * rather than us re-deriving the doorbell address from QID via the
+     * SQ_DBL/CQ_DBL macros.  This is the kernel's documented invariant
+     * for B3.  Doorbell GPU VAs are still obtained per-queue via
+     * cudaHostGetDevicePointer on the BAR0 host mapping (with cudaSetDevice
+     * to the per-queue device first), preserving multi-GPU semantics.
+     */
 
-    uint16_t max_queue = 75;
     void* devicePtr = nullptr;
-    size_t i;
     int status;
 
     // Reject host-resident queues for now -- API accepts them so the
@@ -237,77 +285,206 @@ inline int Controller::init_queues(uint32_t ns_id,
     }
 
     const uint64_t numQueues = static_cast<uint64_t>(queue_targets.size());
-    this->n_qps = std::min(max_queue, (uint16_t)numQueues);
+
+    // Step 1: per-fd queue group container.
+    uint32_t max_q = 0;
+    status = nvm_create_group(this->ctrl, &this->group_id, &max_q);
+    if (status != 0) {
+        printf("nvm_create_group failed: %s\n", nvm_strerror(status));
+        return EFAULT;
+    }
+    if (this->group_id == 0 || max_q == 0) {
+        printf("nvm_create_group returned bogus gid=%u max_q=%u\n",
+               this->group_id, max_q);
+        return EFAULT;
+    }
+
+    // Authoritative caps come from kernel: NVM_MAX_QUEUES_PER_GROUP
+    // (mirrored into ctrl->max_queues_per_group via NVM_GET_DEV_INFO)
+    // bounds the per-group user-queue count, and the user QID pool
+    // [start_cq_idx, max_user_qid] bounds the absolute queue count.
+    uint32_t qpool_room = (this->ctrl->max_user_qid >= this->ctrl->start_cq_idx)
+                            ? (this->ctrl->max_user_qid - this->ctrl->start_cq_idx + 1)
+                            : 0;
+    uint16_t kernel_cap = static_cast<uint16_t>(std::min<uint32_t>(max_q, qpool_room));
+    if (kernel_cap == 0) {
+        printf("init_queues: no user QID room (max_user_qid=%u start_cq_idx=%u max_q_per_grp=%u)\n",
+               this->ctrl->max_user_qid, this->ctrl->start_cq_idx, max_q);
+        nvm_destroy_group(this->ctrl, this->group_id);
+        this->group_id = 0;
+        return EBUSY;
+    }
+    this->n_qps = std::min(kernel_cap, (uint16_t)numQueues);
     this->n_sqs = n_qps;
     this->n_cqs = n_qps;
 
     this->ctrl->cq_num = this->n_cqs;
     this->ctrl->sq_num = this->n_sqs;
 
-    status = nvm_queue_set(ctrl, this->n_sqs + this->n_cqs);
-    if (status != 0){
-        printf("Failed to nvm_queue_set : %s\n", nvm_strerror(status));
-        return EFAULT;
-    }
-
-    this->h_qps = (QueuePair**) malloc(sizeof(QueuePair) * n_qps);
+    this->h_qps = (QueuePair**) malloc(sizeof(QueuePair*) * n_qps);
     cuda_err_chk(cudaMalloc((void**)&this->d_qps, sizeof(QueuePair) * this->n_qps));
 
-    for (i = 0; i < n_qps; i++) {
-        // Per-queue cuda device: SQ/CQ ring memory and intra-queue
-        // tickets/marks live on this GPU. May differ across queues.
+    // Step 2: allocate ring memory per queue pair.
+    for (size_t i = 0; i < n_qps; i++) {
         const uint32_t per_queue_dev = queue_targets[i].cuda_device;
-        h_qps[i] = new QueuePair(ctrl, per_queue_dev, i, queueDepth);
+        // defer_gpu_init = true: tickets/marks/cid arrays get allocated
+        // AFTER NVM_ADD_USER_QUEUE succeeds, so a partial failure
+        // doesn't leak per-queue GPU buffers.
+        h_qps[i] = new QueuePair(ctrl, per_queue_dev,
+                                 (uint16_t)i, queueDepth,
+                                 this->group_id,
+                                 /*defer_gpu_init=*/true);
     }
 
-    status = nvm_device_init(ctrl);
-    if (status != 0){
-        printf("Failed to nvm_device_init : %s\n", nvm_strerror(status));
+    // Step 3: batch NVM_ADD_USER_QUEUE for all rings in one shot.
+    if (n_qps > NVM_MAX_QUEUES_PER_GROUP) {
+        // Should not happen given the cap above, but guard anyway --
+        // the kernel ABI hard-limits nr_pairs to NVM_MAX_QUEUES_PER_GROUP.
+        printf("init_queues: n_qps=%u exceeds NVM_MAX_QUEUES_PER_GROUP=%u\n",
+               this->n_qps, NVM_MAX_QUEUES_PER_GROUP);
+        return EINVAL;
+    }
+    struct nvm_ioctl_add_user_queue req;
+    memset(&req, 0, sizeof(req));
+    req.group_id = this->group_id;
+    req.nr_pairs = (uint32_t) n_qps;
+    for (size_t i = 0; i < n_qps; i++) {
+        req.pairs[i].sq_vaddr = (uint64_t)(uintptr_t) h_qps[i]->sq_mem.get()->vaddr;
+        req.pairs[i].cq_vaddr = (uint64_t)(uintptr_t) h_qps[i]->cq_mem.get()->vaddr;
+    }
+    status = nvm_add_user_queue(this->ctrl, &req);
+    if (status != 0) {
+        printf("nvm_add_user_queue failed: %s\n", nvm_strerror(status));
+        // QueuePair dtors + nvm_destroy_group cascade clean up.
         return EFAULT;
     }
 
-    this->disk.ns_id = ns_id;
-    this->disk.page_size = ctrl->page_size;
-    status = init_userioq_device(ctrl, this->h_qps, &this->disk);
-    if (status != 0){
-        printf("Failed to init userioq : %s\n", nvm_strerror(status));
-    }
-
-    this->n_qps = ctrl->nr_user_q;
-
-    for (i = 0; i < this->n_qps; i++) {
-        // Doorbell GPU VAs are obtained via cudaHostGetDevicePointer on
-        // the BAR0 host mapping. The returned VA is the *current device*'s
-        // view of that host memory, so set the device matching this queue
-        // before each lookup.
+    // Step 4: bind doorbells + finish per-queue GPU init.
+    //
+    // The kernel's NVM_ADD_USER_QUEUE returns BAR0-relative offsets in
+    // out_pairs[i].sq/cq_doorbell_offset.  We add those to the BAR0
+    // host VA (ctrl->mm_ptr) to get the host-side doorbell address,
+    // then translate to a GPU VA via cudaHostGetDevicePointer on the
+    // current cudaDevice (which was already cudaHostRegister'd in
+    // nvm_controller_init_b3 via cudaHostRegisterIoMemory).
+    for (size_t i = 0; i < n_qps; i++) {
         const uint32_t per_queue_dev = queue_targets[i].cuda_device;
         cuda_err_chk(cudaSetDevice(per_queue_dev));
 
-        devicePtr = nullptr;
-        cudaError_t err = cudaHostGetDevicePointer(&devicePtr, (void*) h_qps[i]->cq.db, 0);
+        // Host-side doorbell pointers (within BAR0 mmap range).
+        volatile uint32_t* sq_db_host = (volatile uint32_t*)
+            ((uintptr_t) this->ctrl->mm_ptr + req.out_pairs[i].sq_doorbell_offset);
+        volatile uint32_t* cq_db_host = (volatile uint32_t*)
+            ((uintptr_t) this->ctrl->mm_ptr + req.out_pairs[i].cq_doorbell_offset);
+
+        // Populate the host-side nvm_queue_t skeleton (B3 replaces
+        // nvm_queue_clear's macro-derived db with the kernel-returned
+        // offset; the rest of the fields match nvm_queue_clear's
+        // semantics).  qid uses the kernel-assigned value, NOT
+        // i + start_cq_idx -- the kernel may not always hand them out
+        // contiguously (e.g. after recycle).
+        QueuePair* qp = h_qps[i];
+        qp->pageSize = this->ctrl->page_size;
+        qp->block_size = this->disk.block_size;
+        qp->block_size_minus_1 = this->disk.block_size - 1;
+        qp->block_size_log = std::log2(this->disk.block_size);
+        qp->nvmNamespace = ns_id;
+
+        qp->cq.no       = (uint16_t) req.out_pairs[i].qid;
+        qp->cq.es       = sizeof(nvm_cpl_t);
+        qp->cq.head     = 0;
+        qp->cq.tail     = 0;
+        qp->cq.last     = 0;
+        qp->cq.phase    = 1;
+        qp->cq.local    = 0;
+        qp->cq.head_lock = 0;
+        qp->cq.tail_lock = 0;
+        qp->cq.in_ticket = 0;
+        qp->cq.cid_ticket = 0;
+        qp->cq.vaddr    = qp->cq_mem.get()->vaddr;
+        qp->cq.ioaddr   = qp->cq_mem.get()->ioaddrs[0];
+        qp->cq.db       = cq_db_host;
+
+        qp->sq.no       = (uint16_t) req.out_pairs[i].qid;
+        qp->sq.es       = sizeof(nvm_cmd_t);
+        qp->sq.head     = 0;
+        qp->sq.tail     = 0;
+        qp->sq.last     = 0;
+        qp->sq.phase    = 1;
+        qp->sq.local    = 0;
+        qp->sq.head_lock = 0;
+        qp->sq.tail_lock = 0;
+        qp->sq.in_ticket = 0;
+        qp->sq.cid_ticket = 0;
+        qp->sq.vaddr    = qp->sq_mem.get()->vaddr;
+        qp->sq.ioaddr   = qp->sq_mem.get()->ioaddrs[0];
+        qp->sq.db       = sq_db_host;
+
+        // Allocate intra-queue tickets/marks/cid/pos_locks now that the
+        // ring is alive on the controller.  This is the half of the old
+        // QueuePair ctor that we deferred.
+        qp->init_gpu_specific_struct(per_queue_dev);
+
+        // Translate doorbell host VA -> GPU VA for the current device.
+        // Done AFTER init_gpu_specific_struct since that path doesn't
+        // touch qp->{sq,cq}.db.
+        cudaError_t err = cudaHostGetDevicePointer(&devicePtr, (void*) qp->cq.db, 0);
         if (err != cudaSuccess) {
-            printf("Failed to get device pointer %s\n", cudaGetErrorString(err));
+            printf("Failed to get device pointer (cq db): %s\n", cudaGetErrorString(err));
             return -1;
         }
-        h_qps[i]->cq.db = (volatile uint32_t*) devicePtr;
+        qp->cq.db = (volatile uint32_t*) devicePtr;
 
-        // Get a valid device pointer for SQ doorbell
-        err = cudaHostGetDevicePointer(&devicePtr, (void*) h_qps[i]->sq.db, 0);
+        err = cudaHostGetDevicePointer(&devicePtr, (void*) qp->sq.db, 0);
         if (err != cudaSuccess) {
-            printf("Failed to get device pointer %s\n", cudaGetErrorString(err));
+            printf("Failed to get device pointer (sq db): %s\n", cudaGetErrorString(err));
             return -1;
         }
-        h_qps[i]->sq.db = (volatile uint32_t*) devicePtr;
+        qp->sq.db = (volatile uint32_t*) devicePtr;
 
-        // d_qps lives on the primary GPU; cudaMemcpy from any host source
-        // to that primary works regardless of per_queue_dev.
-        cuda_err_chk(cudaMemcpy(d_qps + i, h_qps[i], sizeof(QueuePair), cudaMemcpyHostToDevice));
+        // d_qps lives on the primary GPU; cudaMemcpy from any host
+        // source to that primary works regardless of per_queue_dev.
+        cuda_err_chk(cudaMemcpy(d_qps + i, qp, sizeof(QueuePair),
+                                cudaMemcpyHostToDevice));
     }
     return 0;
 }
 
 inline Controller::~Controller()
 {
+    /*
+     * Cleanup order matters under B6:
+     *
+     *   1. NVM_DESTROY_QUEUE_GROUP first.  This cascades through
+     *      Delete I/O SQ + Delete I/O CQ on the controller and
+     *      releases every RING_SQ/RING_CQ map attached to the group.
+     *      User QIDs go back into the kernel's pool.
+     *
+     *   2. Then drop d_qps (cudaFree on primary GPU) and h_qps
+     *      (each delete h_qps[i] runs the QueuePair dtor; in
+     *      legacy mode that drops the DmaPtr ring members which
+     *      then cudaFree the GPU buffers; in shared mode IPC
+     *      handles get cudaIpcCloseMemHandle'd).
+     *
+     *   3. is_shared short-circuits the rest -- daemon owns mount
+     *      and nvm_ctrl_t.
+     *
+     *   4. Standalone teardown: umount + nvm_ctrl_free (which
+     *      currently still cascades unbind+chrdev_remove; the
+     *      owner/client role split is Commit 4).
+     */
+    if (this->group_id != 0 && !is_shared && this->ctrl != nullptr) {
+        int rc = nvm_destroy_group(this->ctrl, this->group_id);
+        if (rc != 0) {
+            // Logged but not fatal: the kernel falls back to the
+            // fd-close cascade in snvm_dev_release, so the worst
+            // case is a noisy dmesg, not a leak.
+            printf("Controller dtor: nvm_destroy_group(gid=%u) failed: %s\n",
+                   this->group_id, nvm_strerror(rc));
+        }
+        this->group_id = 0;
+    }
+
     if (d_qps != nullptr) {
         cudaFree(d_qps);
         d_qps = nullptr;

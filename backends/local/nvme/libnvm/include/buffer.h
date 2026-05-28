@@ -336,6 +336,72 @@ inline DmaPtr create_queue_Dma(const nvm_ctrl_t* ctrl, size_t size, int cudaDevi
     });
 }
 
+/*
+ * B3/B6 ring DMA helper.
+ *
+ * Successor to create_queue_Dma above.  Allocates a GPU buffer (pinned
+ * for DMA + reachable from host VA via cudaHostRegister inside
+ * getDeviceMemory) and registers it with the kernel as a ring of the
+ * given kind (RING_SQ if is_cq=0, RING_CQ if is_cq=1) attached to the
+ * supplied queue group.
+ *
+ * Caller MUST have allocated the group via nvm_create_group() on the
+ * same fd; the kernel will -EINVAL otherwise (RING_* maps require a
+ * non-zero group_id).
+ *
+ * Lifetime: the returned DmaPtr's deleter calls nvm_dma_unmap (which
+ * is a no-op kernel-side under B6 -- ring maps are released by
+ * nvm_destroy_group's cascade -- but still drops the libnvm-internal
+ * refcount) and cudaFree's the GPU buffer.  The natural cleanup
+ * order in Controller::~Controller is therefore:
+ *   nvm_destroy_group(ctrl, group_id)   // kernel: cascade ring maps
+ *   then drop the DmaPtr members        // libnvm: cudaFree + bookkeeping
+ */
+inline DmaPtr create_ring_Dma(const nvm_ctrl_t* ctrl,
+                              size_t size,
+                              int cudaDevice,
+                              uint32_t group_id,
+                              unsigned int is_cq)
+{
+    if (cudaDevice < 0) {
+        // Host-resident rings are not implemented in this code path
+        // yet; the legacy createDma() path was reused as a placeholder
+        // for that case.  Refuse here so the caller fails loud
+        // instead of silently bypassing the group/kind enforcement.
+        throw error(string("create_ring_Dma: host-resident rings not "
+                           "supported (cudaDevice < 0)"));
+    }
+
+    nvm_dma_t* dma = nullptr;
+    void* bufferPtr = nullptr;
+    void* devicePtr = nullptr;
+    void* origPtr = nullptr;
+
+    getDeviceMemory(cudaDevice, bufferPtr, devicePtr, size, origPtr);
+
+    int status = nvm_dma_map_ring_device(&dma, ctrl, group_id,
+                                         bufferPtr, size,
+                                         (int)is_cq);
+    if (!nvm_ok(status)) {
+        cudaFree(origPtr);
+        throw error(string("nvm_dma_map_ring_device failed: ")
+                    + nvm_strerror(status));
+    }
+    cudaError_t err = cudaMemset(bufferPtr, 0, size);
+    if (err != cudaSuccess) {
+        nvm_dma_unmap(dma);
+        cudaFree(origPtr);
+        throw error(string("Failed to clear ring memory: ")
+                    + cudaGetErrorString(err));
+    }
+    dma->vaddr = bufferPtr;
+
+    return DmaPtr(dma, [bufferPtr, origPtr](nvm_dma_t* d) {
+        nvm_dma_unmap(d);
+        cudaFree(origPtr);
+    });
+}
+
 
 inline BufferPtr createBuffer(size_t size)
 {

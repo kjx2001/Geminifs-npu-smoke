@@ -174,6 +174,76 @@ struct QueuePair
 
     }
 
+    /*
+     * B3/B6 QueuePair ctor.
+     *
+     * Successor to the legacy ctor above.  Differences:
+     *
+     *   - Allocates SQ + CQ ring memory via create_ring_Dma() against
+     *     the supplied queue group_id, so the kernel registers them
+     *     as RING_SQ / RING_CQ and links them onto g->maps.  This is
+     *     the only ABI-correct way to feed rings into
+     *     NVM_ADD_USER_QUEUE under B3+B6.
+     *   - Drops the (cqr, MQES)-derived sizing and uses ctrl->q_depth
+     *     (NVM_GET_DEV_INFO authoritative value) clipped to queueDepth.
+     *     This eliminates the BAR0-derived MQES read which the kernel
+     *     ABI now lists as MUST-NOT-recompute.
+     *   - Does NOT call init_gpu_specific_struct here; Controller::
+     *     init_queues calls it explicitly after NVM_ADD_USER_QUEUE
+     *     succeeds, so a per-pair allocation is paired with a
+     *     per-pair Create I/O CQ + Create I/O SQ on the controller.
+     *
+     * The caller (Controller::init_queues_b3) owns the rollback path:
+     * if NVM_ADD_USER_QUEUE later fails, deleting this QueuePair will
+     * drop the DmaPtrs which trigger nvm_dma_unmap.  Because the
+     * group has not been destroyed yet that's a real unmap, not a
+     * cascade no-op.
+     */
+    inline QueuePair(const nvm_ctrl_t* ctrl,
+                     uint32_t          cudaDevice,
+                     uint16_t          qp_id,
+                     uint64_t          queueDepth,
+                     uint32_t          group_id,
+                     bool              defer_gpu_init)
+    {
+        if (group_id == 0) {
+            throw error(string("QueuePair(B3): group_id must be non-zero "
+                               "(see nvm_dma_map_ring_device contract)"));
+        }
+        if (ctrl->q_depth == 0) {
+            throw error(string("QueuePair(B3): ctrl->q_depth == 0 -- did "
+                               "nvm_controller_init_b3 / NVM_GET_DEV_INFO "
+                               "run successfully?"));
+        }
+
+        const uint64_t hw_depth = (uint64_t) ctrl->q_depth;
+        uint64_t sq_size = std::min<uint64_t>(queueDepth, hw_depth);
+        uint64_t cq_size = std::min<uint64_t>(queueDepth, hw_depth);
+
+        // Single-page contiguous ring requirement (NVMe spec PHYS_CONTIG):
+        // q_depth=64 + SQE=64B = 4 KiB, q_depth=256 + CQE=16B = 4 KiB.
+        // Round up to the GPU's 64 KiB granularity inside create_ring_Dma.
+        size_t sq_mem_size = sq_size * sizeof(nvm_cmd_t);
+        size_t cq_mem_size = cq_size * sizeof(nvm_cpl_t);
+
+        this->sq_mem = create_ring_Dma(ctrl,
+                                       NVM_PAGE_ALIGN(sq_mem_size, 1UL << 16),
+                                       (int)cudaDevice, group_id,
+                                       /*is_cq=*/0);
+        this->cq_mem = create_ring_Dma(ctrl,
+                                       NVM_PAGE_ALIGN(cq_mem_size, 1UL << 16),
+                                       (int)cudaDevice, group_id,
+                                       /*is_cq=*/1);
+
+        this->qp_id = qp_id;
+        this->sq.qs = (uint32_t) sq_size;
+        this->cq.qs = (uint32_t) cq_size;
+
+        if (!defer_gpu_init) {
+            init_gpu_specific_struct(cudaDevice);
+        }
+    }
+
     // Shared-resource constructor. Defined in libnvm/src/shared_ctrl.cu.
     // Imports SQ / CQ (+ optional PRP) via cudaIpcOpenMemHandle, derives
     // this-process's doorbell GPU VAs from bar0_gpu_va, and cudaMalloc's
@@ -210,6 +280,22 @@ struct QueuePair
 
 };
 
+/*
+ * Legacy bring-up tail.  Pre-B3, after Controller::init_queues had
+ * pre-mapped all rings + run nvm_queue_set + nvm_device_init (BIND),
+ * this function ran NVM_GET_DEV_INFO and called nvm_queue_clear() on
+ * every QueuePair to derive doorbell host VAs from the controller's
+ * dstrd via the SQ_DBL/CQ_DBL macros.
+ *
+ * In the B3 flow the kernel returns BAR0-relative doorbell offsets
+ * directly via NVM_ADD_USER_QUEUE.out_pairs[].sq/cq_doorbell_offset,
+ * and Controller::init_queues writes those into nvm_queue_t.db
+ * itself.  This function is kept only for binary compatibility with
+ * any external caller; the Controller class no longer uses it.
+ */
+__attribute__((deprecated("B3 flow handles per-queue init inside "
+                          "Controller::init_queues; use nvm_add_user_queue() "
+                          "+ out_pairs[].*_doorbell_offset directly")))
 inline int init_userioq_device(nvm_ctrl_t* ctrl, QueuePair** qps, struct disk* d)
 {
     int err,i;

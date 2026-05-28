@@ -44,15 +44,43 @@ LIBNVM_SO := $(LIBNVM_LIB)/libnvm.so
 
 TARGET_LIBNVM := snvme_smoke_libnvm
 TARGET_LIBNVM_B3 := snvme_smoke_libnvm_b3
+TARGET_LIBNVM_IO := snvme_smoke_libnvm_io
 
 CC      ?= gcc
 CFLAGS  ?= -O2 -Wall -Wextra -Wno-unused-parameter -std=c11 \
            -I$(LIBNVM_INC)
 LDFLAGS ?= -L$(LIBNVM_LIB) -Wl,-rpath,$(LIBNVM_LIB) -lnvm
 
+# nvcc path -- mirrors the L0 GPU smoke Makefile so users can override
+# CUDA_ARCH or NVCC the same way.
+NVCC       ?= nvcc
+
+DETECTED_CC := $(shell nvidia-smi --query-gpu=compute_cap \
+                       --format=csv,noheader 2>/dev/null \
+                   | head -n1 \
+                   | sed -e 's/[[:space:]]//g' -e 's/\.//' )
+ifneq ($(DETECTED_CC),)
+CUDA_ARCH  ?= sm_$(DETECTED_CC)
+else
+CUDA_ARCH  ?= sm_80
+endif
+
+NVCCFLAGS  ?= -O2 -std=c++17 -arch=$(CUDA_ARCH) -I$(LIBNVM_INC) \
+              -Xcompiler=-Wall,-Wextra,-Wno-unused-parameter
+NVCC_LDFLAGS ?= -L$(LIBNVM_LIB) -Xlinker -rpath=$(LIBNVM_LIB) -lnvm \
+                -lcudart
+
+HAVE_NVCC := $(shell command -v $(NVCC) >/dev/null 2>&1 && echo yes || echo no)
+
 .PHONY: all clean check-libnvm run
 
+ifeq ($(HAVE_NVCC),yes)
+all: check-libnvm $(TARGET_LIBNVM) $(TARGET_LIBNVM_B3) $(TARGET_LIBNVM_IO)
+else
 all: check-libnvm $(TARGET_LIBNVM) $(TARGET_LIBNVM_B3)
+	@echo "[i] nvcc not found; skipping $(TARGET_LIBNVM_IO)."
+	@echo "    Install CUDA Toolkit (or set NVCC=...) and re-run make to enable it."
+endif
 
 check-libnvm:
 	@if [ ! -f "$(LIBNVM_SO)" ]; then \
@@ -69,8 +97,12 @@ $(TARGET_LIBNVM): snvme_smoke_libnvm.c $(LIBNVM_SO)
 $(TARGET_LIBNVM_B3): snvme_smoke_libnvm_b3.c $(LIBNVM_SO)
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
 
+$(TARGET_LIBNVM_IO): snvme_smoke_libnvm_io.cu $(LIBNVM_SO)
+	@echo "[+] nvcc: CUDA_ARCH=$(CUDA_ARCH) (override with 'make CUDA_ARCH=sm_XX')"
+	$(NVCC) $(NVCCFLAGS) -o $@ $< $(NVCC_LDFLAGS)
+
 clean:
-	rm -f $(TARGET_LIBNVM) $(TARGET_LIBNVM_B3)
+	rm -f $(TARGET_LIBNVM) $(TARGET_LIBNVM_B3) $(TARGET_LIBNVM_IO)
 
 # Convenience: PCI=0000:08:00.0 make run
 run: $(TARGET_LIBNVM)
