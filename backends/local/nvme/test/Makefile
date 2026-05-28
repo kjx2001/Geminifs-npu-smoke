@@ -45,6 +45,7 @@ LIBNVM_SO := $(LIBNVM_LIB)/libnvm.so
 TARGET_LIBNVM := snvme_smoke_libnvm
 TARGET_LIBNVM_B3 := snvme_smoke_libnvm_b3
 TARGET_LIBNVM_IO := snvme_smoke_libnvm_io
+TARGET_LIBNVM_ROLE := snvme_smoke_libnvm_role
 
 CC      ?= gcc
 CFLAGS  ?= -O2 -Wall -Wextra -Wno-unused-parameter -std=c11 \
@@ -75,10 +76,10 @@ HAVE_NVCC := $(shell command -v $(NVCC) >/dev/null 2>&1 && echo yes || echo no)
 .PHONY: all clean check-libnvm run
 
 ifeq ($(HAVE_NVCC),yes)
-all: check-libnvm $(TARGET_LIBNVM) $(TARGET_LIBNVM_B3) $(TARGET_LIBNVM_IO)
+all: check-libnvm $(TARGET_LIBNVM) $(TARGET_LIBNVM_B3) $(TARGET_LIBNVM_IO) $(TARGET_LIBNVM_ROLE)
 else
 all: check-libnvm $(TARGET_LIBNVM) $(TARGET_LIBNVM_B3)
-	@echo "[i] nvcc not found; skipping $(TARGET_LIBNVM_IO)."
+	@echo "[i] nvcc not found; skipping $(TARGET_LIBNVM_IO) + $(TARGET_LIBNVM_ROLE)."
 	@echo "    Install CUDA Toolkit (or set NVCC=...) and re-run make to enable it."
 endif
 
@@ -101,8 +102,12 @@ $(TARGET_LIBNVM_IO): snvme_smoke_libnvm_io.cu $(LIBNVM_SO)
 	@echo "[+] nvcc: CUDA_ARCH=$(CUDA_ARCH) (override with 'make CUDA_ARCH=sm_XX')"
 	$(NVCC) $(NVCCFLAGS) -o $@ $< $(NVCC_LDFLAGS)
 
+$(TARGET_LIBNVM_ROLE): snvme_smoke_libnvm_role.cu $(LIBNVM_SO)
+	@echo "[+] nvcc: CUDA_ARCH=$(CUDA_ARCH) (override with 'make CUDA_ARCH=sm_XX')"
+	$(NVCC) $(NVCCFLAGS) -o $@ $< $(NVCC_LDFLAGS)
+
 clean:
-	rm -f $(TARGET_LIBNVM) $(TARGET_LIBNVM_B3) $(TARGET_LIBNVM_IO)
+	rm -f $(TARGET_LIBNVM) $(TARGET_LIBNVM_B3) $(TARGET_LIBNVM_IO) $(TARGET_LIBNVM_ROLE)
 
 # Convenience: PCI=0000:08:00.0 make run
 run: $(TARGET_LIBNVM)
