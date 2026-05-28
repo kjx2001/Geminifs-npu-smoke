@@ -1,6 +1,7 @@
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>     // _exit (gcc-13 stricter visibility vs gcc-11)
 #include <libunwind.h>
 #include <dlfcn.h>
 #include <cxxabi.h>
