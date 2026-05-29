@@ -1,10 +1,11 @@
 /**
  * nvmeservice_daemon.cpp -- NVMeService daemon entry point.
  *
- * Reads sys_config.yaml, initialises every NVMe controller described there
- * (standalone libnvm path, full admin + queue pool), pre-computes
- * cudaIpcMemHandle_t for every queue's SQ/CQ/PRP memory, starts the gRPC
- * server, and runs until SIGINT/SIGTERM.
+ * Reads sys_config.yaml, brings up every NVMe controller described
+ * there as the *owner* (libnvm B3: chrdev_create + cap + bind + probe),
+ * installs per-GPU view symlinks, starts the gRPC server, and runs
+ * until SIGINT/SIGTERM.  No quota ledger is maintained -- the kernel
+ * owns user QID accounting.
  */
 
 #include "nvmeservice_config.h"
@@ -62,7 +63,6 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // --- Parse config ---
     std::string parse_err;
     auto cfg_opt = nvmeservice::parse_config_file(config_path, &parse_err);
     if (!cfg_opt.has_value()) {
@@ -71,23 +71,16 @@ int main(int argc, char** argv) {
     }
     const auto& cfg = cfg_opt.value();
 
-    for(const auto& n : cfg.nvmes) {
-        const bool on_host = (n.queue_setup.flags & NVM_QUEUE_SETUP_F_ON_HOST) != 0;
+    for (const auto& n : cfg.nvmes) {
         std::cout << "Parsed NVMe config: pci=" << n.pci_addr
                   << " mount=" << n.mount_path
                   << " ns=" << n.namespace_id
-                  << " qdepth=" << n.queue_depth
-                  << " total_queues=" << n.total_queues
-                  << " queue_groups=" << n.yaml_queue_groups.size()
-                  << " queue_setup={kernel_ioq_cap=" << n.queue_setup.cap_kernel_ioq
-                  << " on_host=" << (on_host ? "true" : "false")
-                  << " nr_write=" << n.queue_setup.nr_write
-                  << " nr_poll=" << n.queue_setup.nr_poll << "}"
+                  << " kernel_ioq_cap=" << n.kernel_ioq_cap
+                  << " allowed_gpus=" << n.allowed_gpus.size()
                   << "\n";
     }
 
     {
-    // --- Build service state (opens Controllers, pre-computes IPC handles) ---
         std::shared_ptr<nvmeservice::ServiceState> state;
         try {
             state = std::make_shared<nvmeservice::ServiceState>(cfg);
@@ -98,7 +91,6 @@ int main(int argc, char** argv) {
 
         state->start_reaper();
 
-        // // --- gRPC server ---
         nvmeservice::NvmeServiceImpl svc(state);
 
         grpc::ServerBuilder builder;
@@ -128,22 +120,18 @@ int main(int argc, char** argv) {
             std::cout << "  device_id=" << d.device_id
                     << " pci=" << d.pci_addr
                     << " snvme=" << d.snvme_dev_path
-                    << " gpu=" << d.cuda_device
                     << " ns=" << d.namespace_id
                     << " page=" << d.page_size
                     << " blk=" << d.blk_size
                     << " qdepth=" << d.queue_depth
                     << " dstrd=" << d.dstrd
                     << " bar0=" << d.bar0_size
-                    << " queues=" << d.available_queues
-                    << "/" << d.total_queues
+                    << " max_user_qid=" << d.max_user_qid
+                    << " max_q/grp=" << d.max_queues_per_group
                     << "\n";
-            for (const auto& g : d.groups) {
-                std::cout << "      group: cuda_device=" << g.cuda_device
-                        << " range=[" << g.queue_start_idx
-                        << ", " << (g.queue_start_idx + g.queue_count) << ")"
-                        << " avail=" << g.available
-                        << "/" << g.queue_count
+            for (const auto& a : d.allowed_gpus) {
+                std::cout << "      allowed: cuda_device=" << a.cuda_device
+                        << " mount=" << (a.mount_path.empty() ? "(none)" : a.mount_path)
                         << "\n";
             }
         }
@@ -153,7 +141,6 @@ int main(int argc, char** argv) {
                 << " max=" << cfg.queue_pool.max_per_client << "\n";
         std::cout.flush();
 
-        // Block until signal -> server->Shutdown()
         server->Wait();
 
         std::cout << "Shutting down...\n";
@@ -161,6 +148,6 @@ int main(int argc, char** argv) {
         g_server.store(nullptr);
         std::cout << "Daemon exited cleanly.\n";
     }
-    
+
     return 0;
 }

@@ -1,9 +1,10 @@
 # NVMeService examples: daemon + client smoke test.
 #
-# Both link against the `nvmeservice` library (built by the root CMakeLists).
-# The daemon needs libnvm for Controller construction; the client needs it
-# only for shared_ctrl.h types (the function is inside libnvm too once
-# shared_ctrl.cu is added).
+# daemon: brings up libnvm controllers as the chrdev/bind owner and
+#         serves gRPC for quota requests.
+# client: runs the full L1 4b path -- gRPC Connect, libnvm
+#         attach_client, create_group, add_user_queue, GPU IO smoke,
+#         destroy_group, free_client, Disconnect.
 
 add_executable(nvmeservice_daemon_example
     nvmeservice_daemon.cpp
@@ -26,8 +27,12 @@ set_target_properties(nvmeservice_daemon_example PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
 )
 
+# client: gRPC half in .cpp, CUDA / libnvm IO smoke in .cu (kept
+# separate because nvcc trips over protobuf's C++17 inline-static
+# enum traits if those headers go through its frontend).
 add_executable(nvmeservice_client_example
     nvmeservice_client.cpp
+    nvmeservice_client_io.cu
 )
 
 target_link_libraries(nvmeservice_client_example PRIVATE
@@ -50,9 +55,7 @@ install(TARGETS nvmeservice_daemon_example nvmeservice_client_example
         DESTINATION "bin")
 
 # Copy the canonical sys_config.yaml from the repo root next to the
-# binaries so users can run them without figuring out a path. The repo
-# only keeps ONE sys_config.yaml (at the project root) -- the previous
-# per-examples copy was removed to avoid drift.
+# binaries so users can run them without figuring out a path.
 configure_file("${CMAKE_SOURCE_DIR}/sys_config.yaml"
                "${CMAKE_BINARY_DIR}/bin/sys_config.yaml"
                COPYONLY)

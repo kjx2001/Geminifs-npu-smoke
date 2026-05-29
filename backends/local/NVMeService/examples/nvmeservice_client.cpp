@@ -1,26 +1,15 @@
 /**
- * nvmeservice_client.cpp -- NVMeService client smoke test.
+ * nvmeservice_client.cpp -- gRPC half of the NVMeService client smoke.
  *
- * Connects to the daemon, lists devices, allocates a queue range, holds it
- * while the built-in heartbeat thread keeps the lease alive, then releases.
- *
- * Useful to verify:
- *   - gRPC connectivity
- *   - AllocateQueues end-to-end
- *   - build_shared_controller (BAR0 mmap + IPC import) on the client side
- *   - GPU-view mount_path symlink is reachable from this process
- *   - Heartbeat stream stays stable for the hold duration
- *   - Release on Allocation dtor
+ * Calls Connect, prints the grant, then dispatches into
+ * run_nvmeservice_client_io() (compiled in nvmeservice_client_io.cu)
+ * to drive the actual libnvm + GPU IO path.  After IO it holds the
+ * session for `--hold` seconds (heartbeat thread runs in background)
+ * before letting the Session dtor send Disconnect.
  */
 
 #include "nvmeservice_client.h"
-
-// Include libnvm Controller / QueuePair definitions for the post-allocate
-// hand-off probe (we walk a handful of imported queues to confirm IPC
-// + BAR0 hand-off succeeded). The client library itself only needs the
-// forward declaration.
-#include "ctrl.h"
-#include "queue.h"
+#include "nvmeservice_client_io.h"
 
 #include <chrono>
 #include <cstdio>
@@ -38,21 +27,23 @@ static void print_usage(const char* prog) {
         "Options:\n"
         "  --endpoint <host:port>   gRPC endpoint (default 127.0.0.1:50051)\n"
         "  --device   <id>          device_id to allocate on (default 0)\n"
-        "  --cuda     <id>          target cuda_device (default: first queue group)\n"
-        "  --count    <n>           number of queues to request (0 = daemon default)\n"
-        "  --hold     <sec>         how long to hold the allocation (default 30)\n"
-        "  --list-only              list devices and exit (no allocate)\n"
+        "  --cuda     <id>          target cuda_device (default: first allowed)\n"
+        "  --count    <n>           queues to request (0 = daemon default)\n"
+        "  --hold     <sec>         hold session AFTER IO smoke (default 0)\n"
+        "  --list-only              list devices and exit (no Connect)\n"
+        "  --skip-io                Connect + attach + create + destroy, no IO\n"
         "  -h, --help               show this message\n",
         prog);
 }
 
 int main(int argc, char** argv) {
     std::string endpoint = "127.0.0.1:50051";
-    int32_t device_id    = 0;
-    int32_t cuda_device  = -1;  // -1 => auto-pick first queue group
-    int32_t num_queues   = 0;   // 0 => use daemon default
-    int     hold_seconds = 30;
-    bool    list_only    = false;
+    int32_t device_id   = 0;
+    int32_t cuda_device = -1;
+    int32_t num_queues  = 0;
+    int     hold_seconds = 0;
+    bool    list_only   = false;
+    bool    skip_io     = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -63,12 +54,13 @@ int main(int argc, char** argv) {
             }
             return argv[++i];
         };
-        if (a == "--endpoint")      endpoint   = next("--endpoint");
-        else if (a == "--device")   device_id  = std::atoi(next("--device"));
-        else if (a == "--cuda")     cuda_device = std::atoi(next("--cuda"));
-        else if (a == "--count")    num_queues = std::atoi(next("--count"));
-        else if (a == "--hold")     hold_seconds = std::atoi(next("--hold"));
-        else if (a == "--list-only") list_only = true;
+        if (a == "--endpoint")       endpoint    = next("--endpoint");
+        else if (a == "--device")    device_id   = std::atoi(next("--device"));
+        else if (a == "--cuda")      cuda_device = std::atoi(next("--cuda"));
+        else if (a == "--count")     num_queues  = std::atoi(next("--count"));
+        else if (a == "--hold")      hold_seconds = std::atoi(next("--hold"));
+        else if (a == "--list-only") list_only   = true;
+        else if (a == "--skip-io")   skip_io     = true;
         else if (a == "-h" || a == "--help") { print_usage(argv[0]); return 0; }
         else {
             std::fprintf(stderr, "Unknown argument: %s\n", a.c_str());
@@ -80,8 +72,7 @@ int main(int argc, char** argv) {
     std::cout << "Connecting to " << endpoint << " ...\n";
     nvmeservice::NvmeServiceClient client(endpoint);
 
-    // --- List devices ---
-    std::cout << "\n=== Listing devices ===\n";
+    std::cout << "\n=== ListDevices ===\n";
     auto devs = client.list_devices();
     if (devs.empty()) {
         std::fprintf(stderr, "No devices returned. Is the daemon running?\n");
@@ -95,128 +86,86 @@ int main(int argc, char** argv) {
                   << " page=" << d.page_size
                   << " blk=" << d.blk_size
                   << " qdepth=" << d.queue_depth
-                  << " avail=" << d.available_queues
-                  << "/" << d.total_queues
+                  << " bar0=" << d.bar0_size
+                  << " max_user_qid=" << d.max_user_qid
+                  << " max_q/grp=" << d.max_queues_per_group
                   << "\n";
-        for (const auto& g : d.queue_groups) {
-            std::cout << "      group: cuda_device=" << g.cuda_device
-                      << " range=[" << g.queue_start_idx
-                      << ", " << (g.queue_start_idx + g.queue_count) << ")"
-                      << " avail=" << g.available
-                      << "/" << g.queue_count
+        for (const auto& a : d.allowed_gpus) {
+            std::cout << "      allowed: cuda_device=" << a.cuda_device
+                      << " mount=" << (a.mount_path.empty() ? "(none)" : a.mount_path)
                       << "\n";
         }
     }
 
     if (list_only) return 0;
 
-    // --- Allocate ---
-    std::cout << "\n=== Allocating "
-              << (num_queues == 0 ? "(daemon default)" : std::to_string(num_queues))
-              << " queues on device " << device_id;
-    if (cuda_device >= 0) {
-        std::cout << " (cuda_device=" << cuda_device << ")";
+    if (cuda_device < 0) {
+        for (const auto& d : devs) {
+            if (d.device_id != device_id) continue;
+            if (!d.allowed_gpus.empty()) cuda_device = d.allowed_gpus.front().cuda_device;
+            break;
+        }
+        if (cuda_device < 0) {
+            std::fprintf(stderr, "Could not auto-pick cuda_device on device %d\n",
+                         device_id);
+            return 1;
+        }
     }
-    std::cout << " ===\n";
-    auto alloc = (cuda_device >= 0)
-        ? client.allocate(device_id, cuda_device, num_queues)
-        : client.allocate(device_id, num_queues);
-    if (!alloc) {
-        std::fprintf(stderr, "allocate() failed\n");
+
+    std::cout << "\n=== Connect device=" << device_id
+              << " cuda_device=" << cuda_device
+              << " count=" << (num_queues == 0 ? "(default)"
+                                                : std::to_string(num_queues))
+              << " ===\n";
+    auto sess = client.connect(device_id, cuda_device, num_queues);
+    if (!sess) {
+        std::fprintf(stderr, "connect() failed\n");
         return 1;
     }
 
-    std::cout << "  allocation_id : " << alloc->allocation_id << "\n";
-    std::cout << "  device_id     : " << alloc->device_id << "\n";
-    std::cout << "  queue range   : [" << alloc->queue_start_idx
-              << ", " << (alloc->queue_start_idx + alloc->queue_count) << ")"
-              << " count=" << alloc->queue_count << "\n";
-    std::cout << "  controller    : " << alloc->controller.get() << "\n";
+    std::cout << "  allocation_id : " << sess->allocation_id << "\n";
+    std::cout << "  device_id     : " << sess->device_id << "\n";
+    std::cout << "  cuda_device   : " << sess->cuda_device << "\n";
+    std::cout << "  granted_queues: " << sess->granted_queues << "\n";
+    std::cout << "  snvme_dev     : " << sess->snvme_dev_path << "\n";
+    std::cout << "  bar0_size     : 0x" << std::hex << sess->bar0_size << std::dec << "\n";
+    std::cout << "  ns_id         : " << sess->namespace_id << "\n";
+    std::cout << "  blk_size      : " << sess->blk_size << "\n";
+    std::cout << "  queue_depth   : " << sess->queue_depth << "\n";
     std::cout << "  mount_path    : "
-              << (alloc->mount_path.empty() ? "(empty)" : alloc->mount_path)
+              << (sess->mount_path.empty() ? "(empty)" : sess->mount_path)
               << "\n";
-    std::cout << "  heartbeat     : " << alloc->heartbeat_interval_sec
-              << "s interval\n";
-    std::cout << "  lease timeout : " << alloc->lease_timeout_sec << "s\n";
-    std::cout << "  client_pid    : " << alloc->client_pid << "\n";
+    std::cout << "  heartbeat     : " << sess->heartbeat_interval_sec << "s\n";
+    std::cout << "  lease timeout : " << sess->lease_timeout_sec << "s\n";
 
-    // --- Hand-off validation: prove the client-side bring-up actually
-    //     gives us (1) a usable working directory and (2) live GPU
-    //     queue addresses that came from the daemon's IPC handles. ---
-    std::cout << "\n=== Hand-off validation ===\n";
-
-    // (1) GPU-view filesystem path. The daemon pre-installed a symlink
-    //     under the consuming GPU's mount_path; verify it resolves and
-    //     is enumerable from this process. Empty string means symlink
-    //     install failed at daemon init -- callers can fall back to
-    //     `alloc->controller->dev_mount_path`.
-    if (alloc->mount_path.empty()) {
-        std::cout << "  mount_path  : EMPTY -- daemon symlink install "
-                     "failed; falling back to controller->dev_mount_path='"
-                  << alloc->controller->dev_mount_path << "'\n";
-    } else {
+    if (!sess->mount_path.empty()) {
         std::error_code ec;
-        const auto resolved = std::filesystem::read_symlink(alloc->mount_path, ec);
-        if (ec) {
-            std::cout << "  mount_path  : " << alloc->mount_path
-                      << " (read_symlink failed: " << ec.message()
-                      << ", trying as plain dir)\n";
-        } else {
-            std::cout << "  mount_path  : " << alloc->mount_path
-                      << " -> " << resolved.string() << "\n";
-        }
-
-        size_t entries = 0;
-        for (const auto& it : std::filesystem::directory_iterator(
-                 alloc->mount_path, std::filesystem::directory_options::skip_permission_denied, ec)) {
-            (void)it;
-            ++entries;
-        }
-        if (ec) {
-            std::cout << "  ls          : FAILED (" << ec.message() << ")\n";
-        } else {
-            std::cout << "  ls          : " << entries
-                      << " entries reachable from this process\n";
+        const auto resolved = std::filesystem::read_symlink(sess->mount_path, ec);
+        if (!ec) {
+            std::cout << "  mount->        : " << resolved.string() << "\n";
         }
     }
 
-    // (2) Per-queue address sanity. Walk the first few QueuePairs and
-    //     print the GPU pointers the client-side build_shared_controller
-    //     just imported. If any of these are zero we know the IPC handle
-    //     import path went wrong.
-    {
-        Controller* ctrl = alloc->controller.get();
-        const uint16_t n = (ctrl != nullptr) ? ctrl->n_qps : 0;
-        const uint16_t probe = std::min<uint16_t>(n, 4);
-        std::cout << "  queues      : n_qps=" << n
-                  << " (probing first " << probe << ")\n";
-        for (uint16_t i = 0; i < probe; ++i) {
-            const QueuePair* qp = ctrl->h_qps[i];
-            if (qp == nullptr) {
-                std::cout << "    qp[" << i << "] : NULL\n";
-                continue;
-            }
-            std::cout << "    qp[" << i << "] qp_id=" << qp->qp_id
-                      << " is_shared=" << (qp->is_shared ? "true" : "false")
-                      << " sq_gpu=" << qp->shared_sq_ptr
-                      << " cq_gpu=" << qp->shared_cq_ptr
-                      << " prp_gpu=" << qp->shared_prp_ptr
-                      // sq.db / cq.db are `volatile uint32_t*` (BAR0
-                      // doorbell GPU VAs). We only want to print the
-                      // numeric pointer for the hand-off probe; strip
-                      // volatile via const_cast and let the resulting
-                      // uint32_t* decay to void* in operator<<.
-                      << " sq.db=" << static_cast<void*>(const_cast<uint32_t*>(qp->sq.db))
-                      << " cq.db=" << static_cast<void*>(const_cast<uint32_t*>(qp->cq.db))
-                      << "\n";
-        }
-    }
-    std::cout.flush();
+    std::cout << "\n=== libnvm bring-up + GPU IO smoke ===\n";
+    nvmeservice_client_io_args io_args;
+    io_args.cuda_dev       = cuda_device;
+    io_args.snvme_dev_path = sess->snvme_dev_path.c_str();
+    io_args.bar0_size      = sess->bar0_size;
+    io_args.namespace_id   = sess->namespace_id;
+    io_args.blk_size       = sess->blk_size;
+    io_args.queue_depth    = sess->queue_depth;
+    io_args.granted_queues = sess->granted_queues;
+    io_args.skip_io        = skip_io;
 
-    // --- Hold the allocation so the heartbeat thread has time to run ---
+    int rc = run_nvmeservice_client_io(&io_args);
+    if (rc != 0) {
+        std::fprintf(stderr, "IO smoke failed rc=%d\n", rc);
+        return rc;
+    }
+
     if (hold_seconds > 0) {
-        std::cout << "\n=== Holding allocation for " << hold_seconds
-                  << "s (heartbeat thread running in background) ===\n";
+        std::cout << "\n=== Holding session for " << hold_seconds
+                  << "s (heartbeat thread running) ===\n";
         for (int i = 0; i < hold_seconds; ++i) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
             if ((i + 1) % 5 == 0 || i + 1 == hold_seconds) {
@@ -226,9 +175,8 @@ int main(int argc, char** argv) {
         }
     }
 
-    // --- Release (automatic via Allocation dtor -> ReleaseQueues RPC) ---
-    std::cout << "\n=== Releasing (via Allocation dtor) ===\n";
-    alloc.reset();
+    std::cout << "\n=== Disconnect (Session dtor) ===\n";
+    sess.reset();
 
     std::cout << "\nDone.\n";
     return 0;
