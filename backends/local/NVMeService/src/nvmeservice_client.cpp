@@ -1,10 +1,7 @@
 #include "nvmeservice_client.h"
 
-#include "shared_ctrl.h"
-
 #include <chrono>
 #include <cstdio>
-#include <cstring>
 #include <iostream>
 #include <unistd.h>
 
@@ -17,23 +14,15 @@ uint64_t now_ns() {
         std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
-// Inverse of server-side set_ipc_bytes: copy 64 raw bytes from proto bytes
-// field into a cudaIpcMemHandle_t.
-bool ipc_from_bytes(cudaIpcMemHandle_t* out, const std::string& src) {
-    if (src.size() != sizeof(cudaIpcMemHandle_t)) return false;
-    std::memcpy(out, src.data(), sizeof(cudaIpcMemHandle_t));
-    return true;
-}
-
 } // namespace
 
 // ---------------------------------------------------------------------------
-// Allocation
+// Session
 // ---------------------------------------------------------------------------
 
-NvmeServiceClient::Allocation::~Allocation() {
+NvmeServiceClient::Session::~Session() {
     if (owner != nullptr) {
-        owner->release_allocation(this);
+        owner->release_session(this);
     }
 }
 
@@ -68,188 +57,109 @@ std::vector<ClientDeviceInfo> NvmeServiceClient::list_devices() {
     out.reserve(resp.devices_size());
     for (const auto& d : resp.devices()) {
         ClientDeviceInfo info;
-        info.device_id        = d.device_id();
-        info.pci_addr         = d.pci_addr();
-        info.snvme_dev_path   = d.snvme_dev_path();
-        info.cuda_device      = d.cuda_device();
-        info.namespace_id     = d.namespace_id();
-        info.page_size        = d.page_size();
-        info.blk_size         = d.blk_size();
-        info.blk_size_log     = d.blk_size_log();
-        info.queue_depth      = d.queue_depth();
-        info.total_queues     = d.total_queues();
-        info.available_queues = d.available_queues();
-        info.queue_groups.reserve(d.queue_groups_size());
-        for (const auto& g : d.queue_groups()) {
-            ClientQueueGroup cg;
-            cg.cuda_device     = g.cuda_device();
-            cg.queue_start_idx = g.queue_start_idx();
-            cg.queue_count     = g.queue_count();
-            cg.available       = g.available();
-            info.queue_groups.push_back(cg);
+        info.device_id            = d.device_id();
+        info.pci_addr             = d.pci_addr();
+        info.snvme_dev_path       = d.snvme_dev_path();
+        info.namespace_id         = d.namespace_id();
+        info.page_size            = d.page_size();
+        info.blk_size             = d.blk_size();
+        info.blk_size_log         = d.blk_size_log();
+        info.queue_depth          = d.queue_depth();
+        info.dstrd                = d.dstrd();
+        info.bar0_size            = d.bar0_size();
+        info.max_user_qid         = d.max_user_qid();
+        info.max_queues_per_group = d.max_queues_per_group();
+        info.allowed_gpus.reserve(d.allowed_gpus_size());
+        for (const auto& a : d.allowed_gpus()) {
+            ClientAllowedGpu row;
+            row.cuda_device = a.cuda_device();
+            row.mount_path  = a.mount_path();
+            info.allowed_gpus.push_back(std::move(row));
         }
         out.push_back(std::move(info));
     }
     return out;
 }
 
-std::unique_ptr<NvmeServiceClient::Allocation>
-NvmeServiceClient::allocate(int32_t device_id, int32_t num_queues) {
-    // 2-arg overload: pick the first queue_group's cuda_device for the
-    // target device. Single-GPU pools see no behaviour change.
-    auto devs = list_devices();
-    int32_t cuda_dev = -1;
-    for (const auto& d : devs) {
-        if (d.device_id != device_id) continue;
-        if (!d.queue_groups.empty()) {
-            cuda_dev = d.queue_groups.front().cuda_device;
-        } else {
-            cuda_dev = d.cuda_device;  // legacy single-GPU server
-        }
-        break;
-    }
-    if (cuda_dev < 0) {
-        std::fprintf(stderr, "allocate: device_id %d not found\n", device_id);
-        return nullptr;
-    }
-    return allocate(device_id, cuda_dev, num_queues);
-}
-
-std::unique_ptr<NvmeServiceClient::Allocation>
-NvmeServiceClient::allocate(int32_t device_id, int32_t cuda_device, int32_t num_queues) {
+std::unique_ptr<NvmeServiceClient::Session>
+NvmeServiceClient::connect(int32_t device_id,
+                            int32_t cuda_device,
+                            int32_t num_queues) {
     grpc::ClientContext ctx;
-    AllocRequest req;
-    AllocResponse resp;
+    ConnectRequest req;
+    ConnectResponse resp;
 
     req.set_device_id(device_id);
     req.set_cuda_device(cuda_device);
     req.set_num_queues(num_queues);
     req.set_client_pid(static_cast<uint32_t>(::getpid()));
 
-    auto status = stub_->AllocateQueues(&ctx, req, &resp);
+    auto status = stub_->Connect(&ctx, req, &resp);
     if (!status.ok()) {
-        std::fprintf(stderr, "AllocateQueues RPC failed: %s\n",
+        std::fprintf(stderr, "Connect RPC failed: %s\n",
                      status.error_message().c_str());
         return nullptr;
     }
     if (!resp.error_message().empty()) {
-        std::fprintf(stderr, "AllocateQueues rejected: %s\n",
+        std::fprintf(stderr, "Connect rejected: %s\n",
                      resp.error_message().c_str());
         return nullptr;
     }
 
-    // Translate AllocResponse -> SharedControllerSpec
-    SharedControllerSpec spec;
-    spec.snvme_dev_path = resp.snvme_dev_path();
-    spec.bar0_size      = resp.bar0_size();
-    spec.dstrd          = resp.dstrd();
-    spec.page_size      = resp.page_size();
-    spec.blk_size       = resp.blk_size();
-    spec.blk_size_log   = resp.blk_size_log();
-    spec.namespace_id   = resp.namespace_id();
-    spec.cuda_device    = req.cuda_device();
-    spec.queue_depth    = resp.queue_depth();
-    // GPU-view symlink path the daemon installed for this client's GPU.
-    // Becomes Controller.dev_mount_path on the local shared Controller,
-    // so file paths resolve through the per-GPU subdirectory on the
-    // NVMe (e.g. /mnt/gpu0/snvm_nvme0n1/foo -> /mnt/nvme0/GPU0/foo).
-    spec.mount_path     = resp.mount_path();
+    auto sess = std::make_unique<Session>();
+    sess->allocation_id          = resp.allocation_id();
+    sess->device_id              = device_id;
+    sess->cuda_device            = cuda_device;
+    sess->granted_queues         = resp.granted_queues();
+    sess->pci_addr               = resp.pci_addr();
+    sess->snvme_dev_path         = resp.snvme_dev_path();
+    sess->bar0_size              = resp.bar0_size();
+    sess->dstrd                  = resp.dstrd();
+    sess->namespace_id           = resp.namespace_id();
+    sess->page_size              = resp.page_size();
+    sess->blk_size               = resp.blk_size();
+    sess->blk_size_log           = resp.blk_size_log();
+    sess->queue_depth            = resp.queue_depth();
+    sess->mount_path             = resp.mount_path();
+    sess->heartbeat_interval_sec = resp.heartbeat_interval_sec();
+    sess->lease_timeout_sec      = resp.lease_timeout_sec();
+    sess->client_pid             = static_cast<uint32_t>(::getpid());
+    sess->owner                  = this;
 
-    spec.queues.reserve(resp.queue_shared_mem_size());
-    for (const auto& q : resp.queue_shared_mem()) {
-        SharedQueueSpec qs;
-        qs.queue_id   = q.queue_id();
-        qs.sq_entries = q.sq_entries();
-        qs.cq_entries = q.cq_entries();
-        qs.sq_ioaddr  = q.sq_ioaddr();
-        qs.cq_ioaddr  = q.cq_ioaddr();
-
-        if (!ipc_from_bytes(&qs.sq_handle, q.ipc_handle_sq())) {
-            std::fprintf(stderr, "bad SQ IPC handle size for queue %d\n", q.queue_id());
-            return nullptr;
-        }
-        if (!ipc_from_bytes(&qs.cq_handle, q.ipc_handle_cq())) {
-            std::fprintf(stderr, "bad CQ IPC handle size for queue %d\n", q.queue_id());
-            return nullptr;
-        }
-        if (!q.ipc_handle_prp().empty()) {
-            if (!ipc_from_bytes(&qs.prp_handle, q.ipc_handle_prp())) {
-                std::fprintf(stderr, "bad PRP IPC handle size for queue %d\n", q.queue_id());
-                return nullptr;
-            }
-            qs.has_prp = true;
-        }
-        spec.queues.push_back(qs);
-    }
-
-    // Hand off to libnvm to build the local Controller
-    std::shared_ptr<Controller> ctrl;
-    try {
-        ctrl = build_shared_controller(spec);
-    } catch (const std::exception& e) {
-        std::fprintf(stderr, "build_shared_controller failed: %s\n", e.what());
-        // Best-effort release
-        grpc::ClientContext rctx;
-        ReleaseRequest rreq;
-        ReleaseResponse rresp;
-        rreq.set_allocation_id(resp.allocation_id());
-        rreq.set_client_pid(::getpid());
-        stub_->ReleaseQueues(&rctx, rreq, &rresp);
-        return nullptr;
-    }
-
-    auto alloc = std::make_unique<Allocation>();
-    alloc->allocation_id          = resp.allocation_id();
-    alloc->device_id              = device_id;
-    alloc->queue_start_idx        = resp.queue_start_idx();
-    alloc->queue_count            = resp.queue_count();
-    alloc->controller             = std::move(ctrl);
-    // GPU-view symlink path the daemon installed for this allocation;
-    // empty when symlink install failed at daemon init time.
-    alloc->mount_path             = resp.mount_path();
-    alloc->heartbeat_interval_sec = resp.heartbeat_interval_sec();
-    alloc->lease_timeout_sec      = resp.lease_timeout_sec();
-    alloc->client_pid             = static_cast<uint32_t>(::getpid());
-    alloc->owner                  = this;
-
-    // Register for heartbeat
     {
         std::lock_guard<std::mutex> lock(live_mtx_);
-        LiveAlloc la;
-        la.allocation_id          = alloc->allocation_id;
-        la.heartbeat_interval_sec = alloc->heartbeat_interval_sec;
-        live_allocs_.emplace(alloc->allocation_id, std::move(la));
+        LiveSession ls;
+        ls.allocation_id          = sess->allocation_id;
+        ls.heartbeat_interval_sec = sess->heartbeat_interval_sec;
+        live_sessions_.emplace(sess->allocation_id, std::move(ls));
     }
     ensure_heartbeat_started();
 
-    return alloc;
+    return sess;
 }
 
-void NvmeServiceClient::release_allocation(Allocation* alloc) {
-    if (!alloc || alloc->allocation_id.empty()) return;
+void NvmeServiceClient::release_session(Session* sess) {
+    if (!sess || sess->allocation_id.empty()) return;
 
     {
         std::lock_guard<std::mutex> lock(live_mtx_);
-        live_allocs_.erase(alloc->allocation_id);
+        live_sessions_.erase(sess->allocation_id);
     }
 
     grpc::ClientContext ctx;
-    ReleaseRequest req;
-    ReleaseResponse resp;
-    req.set_allocation_id(alloc->allocation_id);
-    req.set_client_pid(alloc->client_pid);
+    DisconnectRequest req;
+    DisconnectResponse resp;
+    req.set_allocation_id(sess->allocation_id);
+    req.set_client_pid(sess->client_pid);
 
-    auto status = stub_->ReleaseQueues(&ctx, req, &resp);
+    auto status = stub_->Disconnect(&ctx, req, &resp);
     if (!status.ok()) {
-        std::fprintf(stderr, "ReleaseQueues RPC failed: %s\n",
+        std::fprintf(stderr, "Disconnect RPC failed: %s\n",
                      status.error_message().c_str());
     } else if (!resp.success()) {
-        std::fprintf(stderr, "ReleaseQueues rejected: %s\n",
+        std::fprintf(stderr, "Disconnect rejected: %s\n",
                      resp.error_message().c_str());
     }
-
-    // The local Controller (and all its imported handles, BAR0 mmap, etc.)
-    // are released by the shared_ptr deleter in shared_ctrl.cu.
 }
 
 // ---------------------------------------------------------------------------
@@ -268,25 +178,23 @@ void NvmeServiceClient::stop_heartbeat() {
 
 void NvmeServiceClient::heartbeat_loop() {
     while (hb_running_.load()) {
-        // Snapshot live allocations
         std::vector<std::string> ids;
         uint32_t interval = 10;
         {
             std::lock_guard<std::mutex> lock(live_mtx_);
-            if (live_allocs_.empty()) {
+            if (live_sessions_.empty()) {
                 hb_running_ = false;
                 break;
             }
-            ids.reserve(live_allocs_.size());
-            for (const auto& kv : live_allocs_) {
+            ids.reserve(live_sessions_.size());
+            for (const auto& kv : live_sessions_) {
                 ids.push_back(kv.first);
                 interval = std::min(interval, kv.second.heartbeat_interval_sec);
             }
         }
 
-        // Open one bidi stream per tick. Send all allocations' heartbeats,
-        // drain responses, close. Wasteful but trivially correct for low
-        // frequencies (default 10s).
+        // Open one bidi stream per tick.  Wasteful but trivially
+        // correct for low frequencies (default 10s).
         {
             grpc::ClientContext ctx;
             auto stream = stub_->Heartbeat(&ctx);
@@ -308,13 +216,12 @@ void NvmeServiceClient::heartbeat_loop() {
                         resp.allocation_id().c_str(),
                         resp.notice().message().c_str());
                     std::lock_guard<std::mutex> lock(live_mtx_);
-                    live_allocs_.erase(resp.allocation_id());
+                    live_sessions_.erase(resp.allocation_id());
                 }
             }
             stream->Finish();
         }
 
-        // Wait for next tick (interruptible)
         for (uint32_t i = 0; i < interval && hb_running_.load(); ++i) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
         }

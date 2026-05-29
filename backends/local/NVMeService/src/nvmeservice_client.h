@@ -2,20 +2,29 @@
 #define __NVMESERVICE_CLIENT_H__
 
 /**
- * nvmeservice_client.h -- thin gRPC client + local Controller rebuild.
+ * nvmeservice_client.h -- thin gRPC session wrapper.
  *
- * A process that wants to use NVMe queues handed out by the NVMeService daemon:
+ * Post-L1-Commit-4b the client library hands the caller a *session*
+ * (allocation_id + metadata + heartbeat thread).  Caller is
+ * responsible for the libnvm bring-up:
  *
- *   NvmeServiceClient client("127.0.0.1:50051");
- *   auto alloc = client.allocate(device_id=0, num_queues=32);
- *   // alloc->controller is a libnvm Controller; use like any other
- *   BlockDeviceManager dm(alloc->controller, "/mnt/gpu0");
+ *   auto sess = client.connect(device_id=0, cuda_device=0, num_queues=4);
+ *   if (!sess) ...;
+ *
+ *   nvm_ctrl_t* ctrl = nullptr;
+ *   nvm_ctrl_attach_client(&ctrl, sess->snvme_dev_path.c_str(),
+ *                          (uint32_t)sess->bar0_size);
+ *   uint32_t group_id = 0, max_q = 0;
+ *   nvm_create_group(ctrl, &group_id, &max_q);
+ *   // map rings, add user queues up to sess->granted_queues, drive IO
  *   ...
- *   // alloc goes out of scope -> dtor releases on server + frees local resources
+ *   nvm_destroy_group(ctrl, group_id);
+ *   nvm_ctrl_free_client(ctrl);
+ *   sess.reset();   // -> Disconnect RPC + heartbeat thread joins
  *
- * Heartbeat is maintained by an internal thread as long as any Allocation
- * is live. No configuration needed: interval/timeout come from the daemon's
- * AllocResponse.
+ * Heartbeat is maintained by an internal thread as long as any
+ * Session is live; interval/timeout come from the daemon's
+ * ConnectResponse.
  */
 
 #include <atomic>
@@ -30,80 +39,82 @@
 #include <grpcpp/grpcpp.h>
 #include "nvmeservice.grpc.pb.h"
 
-// Forward declaration -- include libnvm's ctrl.h in the .cpp
-struct Controller;
-
 namespace nvmeservice {
 
-/**
- * Queue partition advertised by the daemon for a single device.
- * Each entry maps a contiguous queue range to one cuda_device.
- */
-struct ClientQueueGroup {
-    int32_t cuda_device     = -1;
-    int32_t queue_start_idx = 0;
-    int32_t queue_count     = 0;
-    int32_t available       = 0;
+// One ACL row from DeviceInfo.allowed_gpus[].  mount_path is the
+// GPU-view symlink the daemon installed; empty == install failed.
+struct ClientAllowedGpu {
+    int32_t     cuda_device = -1;
+    std::string mount_path;
 };
 
-/**
- * DeviceInfo mirror for callers that want to enumerate devices.
- */
+// Mirror of DeviceInfo for callers that want to enumerate.
 struct ClientDeviceInfo {
-    int32_t     device_id    = -1;
+    int32_t     device_id            = -1;
     std::string pci_addr;
     std::string snvme_dev_path;
-    // Legacy single cuda_device field: equals queue_groups[0].cuda_device.
-    // Modern callers should iterate `queue_groups` and pass an explicit
-    // cuda_device to allocate().
-    int32_t     cuda_device  = -1;
-    uint32_t    namespace_id = 0;
-    uint32_t    page_size    = 0;
-    uint32_t    blk_size     = 0;
-    uint32_t    blk_size_log = 0;
-    uint32_t    queue_depth  = 0;
-    int32_t     total_queues     = 0;
-    int32_t     available_queues = 0;
-    std::vector<ClientQueueGroup> queue_groups;
+    uint32_t    namespace_id         = 0;
+    uint32_t    page_size            = 0;
+    uint32_t    blk_size             = 0;
+    uint32_t    blk_size_log         = 0;
+    uint32_t    queue_depth          = 0;
+    uint32_t    dstrd                = 0;
+    uint64_t    bar0_size            = 0;
+    uint32_t    max_user_qid         = 0;
+    uint32_t    max_queues_per_group = 0;
+    std::vector<ClientAllowedGpu> allowed_gpus;
 };
 
 class NvmeServiceClient {
 public:
     /**
-     * An active queue allocation. Owns the local Controller and all
-     * associated resources (IPC imports, BAR0 mmap, local GPU buffers).
-     * The destructor sends a ReleaseQueues RPC and cleans up local state.
+     * An active session with the daemon.  Pure metadata + lease
+     * bookkeeping; the libnvm controller / queue group / DATA buffers
+     * are NOT owned here -- the caller drives those itself.
+     *
+     * Destructor sends a Disconnect RPC and stops the heartbeat
+     * thread (when this is the last live session).
      */
-    struct Allocation {
-        std::string                 allocation_id;
-        int32_t                     device_id;
-        int32_t                     queue_start_idx;
-        int32_t                     queue_count;
-        std::shared_ptr<Controller> controller;      // libnvm Controller
+    struct Session {
+        std::string allocation_id;
 
-        // GPU-view filesystem path the daemon installed for this
-        // allocation: a symlink under the consuming GPU's mount_path
-        // that resolves to the per-GPU subdirectory on the NVMe (e.g.
-        // "/mnt/gpu0/snvm_nvme0n1" -> "/mnt/nvme0/GPU0"). Hand this to
-        // BlockDeviceManager (or any FileManager-style consumer) so
-        // file paths stay GPU-isolated. Empty if symlink installation
-        // failed at daemon init time -- callers can fall back to
-        // `controller->dev_mount_path` (libnvm carries the same
-        // string from the AllocResponse).
-        std::string                 mount_path;
+        // Echo of the request so callers can pass it to libnvm.
+        int32_t     device_id     = -1;
+        int32_t     cuda_device   = -1;
 
-        // These are filled by the client but exposed for debugging only.
-        uint32_t                    heartbeat_interval_sec;
-        uint32_t                    lease_timeout_sec;
+        // Daemon's recommendation: caller must not exceed this when
+        // calling nvm_add_user_queue.  Authoritative kernel cap is
+        // also available via max_queues_per_group on ListDevices
+        // output.  This is policy only -- daemon does not maintain
+        // a quota ledger.
+        int32_t     granted_queues = 0;
 
-        // Client-side-only -- needed for ReleaseQueues RPC.
-        uint32_t                    client_pid;
+        // Device metadata for nvm_ctrl_attach_client + IO submit.
+        std::string pci_addr;
+        std::string snvme_dev_path;
+        uint64_t    bar0_size     = 0;
+        uint32_t    dstrd         = 0;
+        uint32_t    namespace_id  = 0;
+        uint32_t    page_size     = 0;
+        uint32_t    blk_size      = 0;
+        uint32_t    blk_size_log  = 0;
+        uint32_t    queue_depth   = 0;
 
-        Allocation() = default;
-        ~Allocation();
+        // GPU-view symlink path the daemon installed for
+        // (cuda_device, NVMe).  Empty if symlink install failed.
+        std::string mount_path;
 
-        Allocation(const Allocation&)            = delete;
-        Allocation& operator=(const Allocation&) = delete;
+        // Lease parameters (informational; heartbeat thread uses these).
+        uint32_t    heartbeat_interval_sec = 0;
+        uint32_t    lease_timeout_sec      = 0;
+
+        uint32_t    client_pid    = 0;
+
+        Session() = default;
+        ~Session();
+
+        Session(const Session&)            = delete;
+        Session& operator=(const Session&) = delete;
 
     private:
         friend class NvmeServiceClient;
@@ -116,36 +127,22 @@ public:
     NvmeServiceClient(const NvmeServiceClient&)            = delete;
     NvmeServiceClient& operator=(const NvmeServiceClient&) = delete;
 
-    /**
-     * Enumerate devices exposed by the daemon.
-     */
     std::vector<ClientDeviceInfo> list_devices();
 
     /**
-     * Request a contiguous queue range on device_id.
-     *
-     * num_queues == 0 -> use daemon default (capped by config).
-     * Returns nullptr on failure; error details go to stderr.
-     *
-     * The heartbeat thread is started on first successful allocate() and
-     * stopped when the last Allocation is destroyed.
-     *
-     * The 2-arg overload picks the first queue_group's cuda_device,
-     * preserving single-GPU caller behaviour. Multi-GPU clients should
-     * use the 3-arg overload to target a specific GPU.
+     * Open a session.  num_queues == 0 -> use daemon default
+     * (capped by config).  Returns nullptr on failure; error details
+     * go to stderr.
      */
-    std::unique_ptr<Allocation> allocate(int32_t device_id, int32_t num_queues);
-    std::unique_ptr<Allocation> allocate(int32_t device_id,
-                                          int32_t cuda_device,
-                                          int32_t num_queues);
+    std::unique_ptr<Session> connect(int32_t device_id,
+                                      int32_t cuda_device,
+                                      int32_t num_queues);
 
 private:
-    friend struct Allocation;
+    friend struct Session;
 
-    // Called by Allocation dtor.
-    void release_allocation(Allocation* alloc);
+    void release_session(Session* sess);
 
-    // Heartbeat thread management.
     void ensure_heartbeat_started();
     void stop_heartbeat();
     void heartbeat_loop();
@@ -154,13 +151,12 @@ private:
     std::shared_ptr<grpc::Channel>                       channel_;
     std::unique_ptr<NvmeService::Stub>                   stub_;
 
-    // Tracking live allocations for heartbeat.
-    struct LiveAlloc {
+    struct LiveSession {
         std::string allocation_id;
         uint32_t    heartbeat_interval_sec = 10;
     };
     std::mutex                                           live_mtx_;
-    std::unordered_map<std::string, LiveAlloc>           live_allocs_;
+    std::unordered_map<std::string, LiveSession>         live_sessions_;
 
     std::thread                                          hb_thread_;
     std::atomic<bool>                                    hb_running_{false};

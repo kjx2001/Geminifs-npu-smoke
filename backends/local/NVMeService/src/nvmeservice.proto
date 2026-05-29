@@ -1,24 +1,39 @@
 // nvmeservice.proto -- gRPC contract between NVMeService daemon and GPU clients.
 //
+// Post-L1-Commit-4b
+// -----------------
+// The daemon is a *session broker*, not a queue host.  It owns the
+// chrdev / bind for each NVMe and hands out metadata so clients can
+// bring up their own libnvm controllers (nvm_ctrl_attach_client +
+// nvm_create_group + nvm_add_user_queue).  The kernel's user QID
+// pool is the single source of truth for queue accounting; the
+// daemon does NOT track a shadow ledger.
+//
 // Daemon responsibilities:
-//   - Own NVMe controller lifecycle (admin setup, IO queue creation)
-//   - Pre-create a pool of queues; SQ/CQ memory is cudaMalloc'd so it can be
-//     shared via CUDA IPC
-//   - Hand out exclusive queue ID ranges to client processes
+//   1. Open / bind / hold the chrdev for every configured NVMe
+//      (NVM_SET_KERNEL_IOQ_CAP + SNVM_DEVICE_BIND + NVM_GET_DEV_INFO).
+//   2. Enforce a per-NVMe ACL (allowed_gpus -- NUMA / PCIe-switch
+//      affinity) on Connect requests.
+//   3. Hand out per-allocation metadata: snvme_dev_path, bar0_size,
+//      ns_id, queue_depth, mount_path symlink, lease parameters.
+//   4. Heartbeat-based lease cleanup: PID + /proc starttime check
+//      with grace timeout.  The kernel's snvm_dev_release fd-cascade
+//      already reclaims the dead client's queues; the daemon just
+//      drops the now-stale lease record.
 //
-// Client responsibilities (after AllocateQueues returns):
-//   - Open /dev/snvm_* itself and mmap BAR0 in its own process
-//     (multi-process mmap is allowed by SNVMe)
-//   - cudaHostRegister BAR0 + cudaHostGetDevicePointer to derive its own
-//     doorbell GPU VAs (host-mapped memory cannot be IPC'd across processes)
-//   - cudaIpcOpenMemHandle to import each queue's SQ / CQ / PRP memory
-//     (cudaMalloc'd in daemon, so IPC-compatible)
-//   - cudaMalloc its own per-queue internal state (tickets, marks, cid,
-//     pos_locks) -- these coordinate intra-process GPU threads and do not
-//     need to be shared
-//   - Assemble a local QueuePair[] shadow for kernel use
+// Client responsibilities (after Connect returns ok):
+//   - libnvm: nvm_ctrl_attach_client(snvme_dev_path)  [no chrdev_create,
+//     no bind, no GET_DEV_INFO -- those are owner-only].
+//   - libnvm: nvm_create_group()  -> per-fd group_id assigned by kernel.
+//   - libnvm: nvm_dma_map_ring_device + nvm_dma_map_data_device
+//     (rings cascade through destroy_group; DATA stays alive on the
+//     client fd until close).
+//   - libnvm: nvm_add_user_queue() up to `granted_queues` queues.
+//   - libnvm: nvm_destroy_group + nvm_ctrl_free_client on shutdown.
+//   - Send periodic Heartbeat keyed by allocation_id to keep lease.
+//   - Disconnect on graceful exit; crash falls back to PID reaper.
 //
-// Trust model: cooperative processes only. No cryptographic auth.
+// Trust model: cooperative processes only.  No cryptographic auth.
 // Lease-based reclaim uses heartbeat + PID liveness + /proc/<pid>/stat
 // starttime to defeat PID reuse.
 
@@ -30,20 +45,9 @@ package nvmeservice;
 // Service
 // -----------------------------------------------------------------
 service NvmeService {
-    // List NVMe devices the daemon has initialised, with queue pool status.
     rpc ListDevices    (Empty)               returns (DeviceListResponse);
-
-    // Request an exclusive range of queues on a device.
-    // Returns metadata needed for the client to mmap BAR0 itself and
-    // IPC-import the shared SQ/CQ memory for each queue.
-    rpc AllocateQueues (AllocRequest)        returns (AllocResponse);
-
-    // Explicitly release a previously allocated queue range.
-    rpc ReleaseQueues  (ReleaseRequest)      returns (ReleaseResponse);
-
-    // Bi-directional heartbeat stream. Client must send periodically to
-    // keep the lease alive. Daemon echoes timestamps and can push
-    // administrative notifications (lease expiry warnings, forced revoke).
+    rpc Connect        (ConnectRequest)      returns (ConnectResponse);
+    rpc Disconnect     (DisconnectRequest)   returns (DisconnectResponse);
     rpc Heartbeat      (stream HeartbeatMsg) returns (stream HeartbeatMsg);
 }
 
@@ -62,72 +66,63 @@ message DeviceListResponse {
 }
 
 message DeviceInfo {
-    int32   device_id        = 1;   // daemon-local index
-    string  pci_addr         = 2;   // e.g. "0000:50:00.0"
-    string  snvme_dev_path   = 3;   // e.g. "/dev/snvm_nvme0n1"
-    // Legacy single-GPU field. Populated by the daemon with the FIRST
-    // queue group's cuda_device for back-compat with single-group
-    // clients. Multi-GPU-aware clients should read `queue_groups`
-    // instead and use AllocRequest.cuda_device to target a specific
-    // group at allocation time.
-    int32   cuda_device      = 4;
-    uint32  namespace_id     = 5;
-    uint32  page_size        = 6;   // NVMe page size (bytes)
-    uint32  blk_size         = 7;   // logical block size (bytes)
-    uint32  blk_size_log     = 8;   // log2(blk_size)
-    uint32  queue_depth      = 9;   // entries per queue
-    uint32  dstrd            = 10;  // doorbell stride (encoded)
-    uint64  bar0_size        = 11;  // BAR0 region length (for mmap)
-    int32   total_queues     = 12;  // pool size
-    int32   available_queues = 13;  // sum of available across all groups
-    // Per-GPU partition view: one entry per queue group on this NVMe.
-    // Each entry tells the client which cuda_device owns a contiguous
-    // queue range and how many queues are currently free in it.
-    repeated QueueGroupInfo queue_groups = 14;
+    int32   device_id            = 1;   // daemon-local index
+    string  pci_addr             = 2;   // e.g. "0000:50:00.0"
+    string  snvme_dev_path       = 3;   // e.g. "/dev/ssnvme0"
+    uint32  namespace_id         = 4;
+    uint32  page_size            = 5;   // NVMe page size (bytes)
+    uint32  blk_size             = 6;   // logical block size (bytes)
+    uint32  blk_size_log         = 7;   // log2(blk_size)
+    uint32  queue_depth          = 8;   // entries per queue (NVMe MQES+1)
+    uint32  dstrd                = 9;   // doorbell stride (encoded)
+    uint64  bar0_size            = 10;  // BAR0 region length (for client mmap)
+    uint32  max_user_qid         = 11;  // upper bound of kernel user-QID pool
+    uint32  max_queues_per_group = 12;  // kernel hard cap per fd
+
+    // Per-NVMe ACL: which cuda_device values may Connect to this
+    // device, plus the GPU-view symlink path daemon installed for
+    // each.  Empty mount_path means symlink installation failed.
+    repeated AllowedGpu allowed_gpus = 13;
 }
 
-message QueueGroupInfo {
-    int32 cuda_device     = 1;
-    int32 queue_start_idx = 2;
-    int32 queue_count     = 3;
-    int32 available       = 4;
+message AllowedGpu {
+    int32  cuda_device = 1;
+    string mount_path  = 2;   // e.g. "/mnt/gpu0/ssnvme0"
 }
 
 // -----------------------------------------------------------------
-// AllocateQueues
+// Connect
 // -----------------------------------------------------------------
 
-message AllocRequest {
+message ConnectRequest {
     int32   device_id   = 1;   // from ListDevices
-    int32   cuda_device = 2;   // must match the device's bound GPU
-    int32   num_queues  = 3;   // 0 = use daemon default; capped by config
+    int32   cuda_device = 2;   // must be present in DeviceInfo.allowed_gpus[]
+    int32   num_queues  = 3;   // 0 = use daemon default; capped by daemon policy
+                               //     and kernel max_queues_per_group
     uint32  client_pid  = 4;   // for liveness checks on heartbeat timeout
 }
 
-message AllocResponse {
-    string  allocation_id   = 1;   // opaque identifier; use in Release / Heartbeat
+message ConnectResponse {
+    string  allocation_id = 1;   // opaque session id; use in Disconnect / Heartbeat
 
-    // --- Device info (client needs these to mmap BAR0 itself) ---
+    // --- Device metadata for nvm_ctrl_attach_client ---
     string  pci_addr        = 2;
     string  snvme_dev_path  = 3;
-    uint64  bar0_size       = 4;   // mmap length
-    uint32  dstrd           = 5;   // doorbell stride, used in SQ_DBL/CQ_DBL
+    uint64  bar0_size       = 4;
 
-    // --- Allocated queue range (contiguous) ---
-    int32   queue_start_idx = 10;
-    int32   queue_count     = 11;
+    // --- Daemon's recommended queue count ---
+    // Client must not exceed this when calling nvm_add_user_queue.
+    // The kernel separately enforces NVM_MAX_QUEUES_PER_GROUP per
+    // client fd; granted_queues is the daemon's policy clamp.
+    int32   granted_queues  = 10;
 
-    // --- Per-queue shared memory IPC handles ---
-    // Size equals queue_count; queue_shared_mem[i] describes
-    // queue (queue_start_idx + i).
-    repeated QueueSharedMem queue_shared_mem = 12;
-
-    // --- Controller metadata ---
+    // --- Controller metadata for IO submit ---
     uint32  namespace_id    = 20;
     uint32  page_size       = 21;
     uint32  blk_size        = 22;
     uint32  blk_size_log    = 23;
     uint32  queue_depth     = 24;
+    uint32  dstrd           = 25;
 
     // --- Lease parameters chosen by the daemon ---
     uint32  heartbeat_interval_sec = 30;
@@ -135,9 +130,7 @@ message AllocResponse {
 
     // --- GPU-view filesystem path for this allocation ---
     // Daemon-installed symlink under the consuming GPU's mount_path,
-    // e.g. "/mnt/gpu0/snvm_nvme0n1", pointing at "/mnt/nvme0/GPU0".
-    // The client uses this as Controller.dev_mount_path so file paths
-    // resolve through the GPU-isolated subdirectory on the NVMe.
+    // e.g. "/mnt/gpu0/ssnvme0", pointing at "/mnt/nvme0/GPU0".
     // Empty string if symlink installation failed at init time.
     string  mount_path      = 32;
 
@@ -145,32 +138,16 @@ message AllocResponse {
     string  error_message   = 99;
 }
 
-// Per-queue memory that must be shared across daemon and client.
-// SQ, CQ and PRP buffers are daemon-allocated via cudaMalloc so they are
-// valid sources for cudaIpcGetMemHandle.
-message QueueSharedMem {
-    int32  queue_id         = 1;   // absolute queue ID on the device
-
-    bytes  ipc_handle_sq    = 2;   // cudaIpcMemHandle_t (64 bytes) for SQ ring
-    bytes  ipc_handle_cq    = 3;   // cudaIpcMemHandle_t (64 bytes) for CQ ring
-    bytes  ipc_handle_prp   = 4;   // PRP list memory; empty if client allocates its own
-
-    uint32 sq_entries       = 5;   // number of SQ entries
-    uint32 cq_entries       = 6;   // number of CQ entries
-    uint64 sq_ioaddr        = 7;   // SQ DMA address (for client debugging only)
-    uint64 cq_ioaddr        = 8;   // CQ DMA address (for client debugging only)
-}
-
 // -----------------------------------------------------------------
-// ReleaseQueues
+// Disconnect
 // -----------------------------------------------------------------
 
-message ReleaseRequest {
+message DisconnectRequest {
     string allocation_id = 1;
     uint32 client_pid    = 2;   // sanity check
 }
 
-message ReleaseResponse {
+message DisconnectResponse {
     bool   success       = 1;
     string error_message = 2;
 }
@@ -183,16 +160,16 @@ message HeartbeatMsg {
     string allocation_id = 1;
     uint64 timestamp_ns  = 2;
 
-    // Server -> client only: populated when the daemon wants to notify
-    // the client of a state change.
+    // Server -> client only: populated when the daemon wants to
+    // notify the client of a state change.
     AdminNotice notice = 3;
 }
 
 message AdminNotice {
     enum Kind {
         NONE              = 0;
-        LEASE_EXPIRING    = 1;   // warning, seconds_remaining set
-        LEASE_REVOKED     = 2;   // terminal, client should stop using queues
+        LEASE_EXPIRING    = 1;
+        LEASE_REVOKED     = 2;
     }
     Kind   kind              = 1;
     uint32 seconds_remaining = 2;

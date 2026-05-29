@@ -5,7 +5,8 @@
  * nvmeservice_server.h -- gRPC service implementation.
  *
  * Thin translation layer: converts between proto messages and the
- * protobuf-free ServiceState API. All mutable state lives in ServiceState.
+ * protobuf-free ServiceState API.  All mutable state lives in
+ * ServiceState.
  */
 
 #include <memory>
@@ -25,13 +26,13 @@ public:
                               const Empty* request,
                               DeviceListResponse* response) override;
 
-    grpc::Status AllocateQueues(grpc::ServerContext* ctx,
-                                 const AllocRequest* request,
-                                 AllocResponse* response) override;
+    grpc::Status Connect(grpc::ServerContext* ctx,
+                          const ConnectRequest* request,
+                          ConnectResponse* response) override;
 
-    grpc::Status ReleaseQueues(grpc::ServerContext* ctx,
-                                const ReleaseRequest* request,
-                                ReleaseResponse* response) override;
+    grpc::Status Disconnect(grpc::ServerContext* ctx,
+                             const DisconnectRequest* request,
+                             DisconnectResponse* response) override;
 
     grpc::Status Heartbeat(grpc::ServerContext* ctx,
                             grpc::ServerReaderWriter<HeartbeatMsg, HeartbeatMsg>* stream) override;

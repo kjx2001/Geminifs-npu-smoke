@@ -4,20 +4,30 @@
 /**
  * nvmeservice_state.h -- daemon-side service state.
  *
- * Responsibilities:
- *   - Own one libnvm Controller per configured NVMe device (admin queues,
- *     full queue pool creation)
- *   - Precompute cudaIpcMemHandle_t for each queue's SQ / CQ / PRP memory
- *   - Accept AllocateQueues requests, carve out a contiguous queue range
- *     for the caller, and return the IPC handles
- *   - Track per-allocation leases: PID, /proc/<pid>/stat starttime,
- *     last_heartbeat
- *   - Run a background reaper that reclaims queue ranges whose lease has
- *     expired AND whose client PID is dead (starttime-checked to defeat
- *     PID reuse)
+ * Post-L1-Commit-4b (no per-GPU queue accounting in daemon)
+ * --------------------------------------------------------
  *
- * Thread safety: all public operations are serialised by an internal mutex.
- * No protobuf dependency -- the server layer translates to/from proto.
+ * The daemon owns the chrdev/bind for each NVMe and keeps the
+ * controller alive for clients.  It does NOT track any per-GPU
+ * queue ledger -- the kernel's user QID pool is the single source
+ * of truth, and the per-fd queue group model means each client
+ * brings up its own queues independently.
+ *
+ * What ServiceState tracks:
+ *
+ *   * One nvm_ctrl_t* per configured NVMe (owner-side B3 bring-up;
+ *     freed at daemon shutdown).
+ *   * The kernel-reported metadata (max_user_qid, max_queues_per_group,
+ *     queue_depth, dstrd, bar0_size) -- read once from NVM_GET_DEV_INFO.
+ *   * Per-GPU mount-path symlinks installed at startup.
+ *   * Per-allocation lease (PID + starttime + last_heartbeat) for the
+ *     reaper to clean up dead clients' bookkeeping.  No quota refund
+ *     is needed -- the kernel's snvm_dev_release fd-cascade reclaims
+ *     the actual queues when the dead client's fd closes.
+ *
+ * Thread safety: all public operations are serialised by an internal
+ * mutex.  No protobuf dependency -- the server layer translates
+ * to/from proto.
  */
 
 #include <atomic>
@@ -29,140 +39,119 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
-
-#include <cuda_runtime.h>
 
 #include "nvmeservice_config.h"
 
-// Forward declarations to avoid pulling libnvm headers into this file.
-struct Controller;
+// libnvm types: nvm_ctrl_t is a typedef of an anonymous struct in
+// nvm_types.h, so a forward decl wouldn't match.  Pull the header.
+#include <nvm_types.h>
 
 namespace nvmeservice {
 
 // -----------------------------------------------------------------
-// Value types (mirror of proto messages, but proto-free)
+// Snapshots returned to the gRPC layer (proto-free DTOs)
 // -----------------------------------------------------------------
 
-struct QueueGroupSnapshot {
-    int32_t cuda_device     = -1;
-    int32_t queue_start_idx = 0;     // absolute queue index where this group begins
-    int32_t queue_count     = 0;
-    int32_t available       = 0;     // unallocated queues in this group
+// One row per allowed GPU on a device, telling clients where the
+// per-GPU view directory lives.  Empty mount_path means symlink
+// install failed at daemon startup.
+struct AllowedGpuView {
+    int32_t     cuda_device = -1;
+    std::string mount_path;
 };
 
 struct DeviceSnapshot {
-    int32_t     device_id        = -1;
+    int32_t     device_id            = -1;
     std::string pci_addr;
     std::string snvme_dev_path;
-    int32_t     cuda_device      = -1;   // legacy: equals groups[0].cuda_device
-    uint32_t    namespace_id     = 0;
-    uint32_t    page_size        = 0;
-    uint32_t    blk_size         = 0;
-    uint32_t    blk_size_log     = 0;
-    uint32_t    queue_depth      = 0;
-    uint32_t    dstrd            = 0;
-    uint64_t    bar0_size        = 0;
-    int32_t     total_queues     = 0;
-    int32_t     available_queues = 0;        // sum across all groups
-    std::vector<QueueGroupSnapshot> groups;  // per-GPU partition view
+    uint32_t    namespace_id         = 0;
+    uint32_t    page_size            = 0;
+    uint32_t    blk_size             = 0;
+    uint32_t    blk_size_log         = 0;
+    uint32_t    queue_depth          = 0;
+    uint32_t    dstrd                = 0;
+    uint64_t    bar0_size            = 0;
+    uint32_t    max_user_qid         = 0;
+    uint32_t    max_queues_per_group = 0;
+
+    // ACL: which cuda_device values may Connect to this NVMe.
+    // Empty == any GPU in the daemon's gpus[] list.  Mirrors
+    // nvmes[].allowed_gpus from YAML, with mount_paths populated.
+    std::vector<AllowedGpuView> allowed_gpus;
 };
 
-struct QueueShared {
-    int32_t             queue_id     = -1;
-    cudaIpcMemHandle_t  ipc_sq   {};
-    cudaIpcMemHandle_t  ipc_cq   {};
-    cudaIpcMemHandle_t  ipc_prp  {};     // zeroed when client should allocate its own PRP
-    bool                has_prp  = false;
-    uint32_t            sq_entries   = 0;
-    uint32_t            cq_entries   = 0;
-    uint64_t            sq_ioaddr    = 0;
-    uint64_t            cq_ioaddr    = 0;
-};
+// What the client gets after Connect.
+struct ConnectGrant {
+    std::string allocation_id;
+    int32_t     device_id              = -1;
+    std::string pci_addr;
+    std::string snvme_dev_path;
+    uint64_t    bar0_size              = 0;
+    uint32_t    dstrd                  = 0;
 
-struct AllocationGrant {
-    std::string               allocation_id;
-    int32_t                   device_id              = -1;
-    std::string               pci_addr;
-    std::string               snvme_dev_path;
-    // GPU-view filesystem path for this allocation: the symlink under
-    // the consuming GPU's mount_path that points at the per-GPU
-    // subdirectory on the NVMe. Empty if symlink install failed.
-    std::string               mount_path;
-    uint64_t                  bar0_size              = 0;
-    uint32_t                  dstrd                  = 0;
-    int32_t                   queue_start_idx        = 0;
-    int32_t                   queue_count            = 0;
-    std::vector<QueueShared>  queue_shared;
-    uint32_t                  namespace_id           = 0;
-    uint32_t                  page_size              = 0;
-    uint32_t                  blk_size               = 0;
-    uint32_t                  blk_size_log           = 0;
-    uint32_t                  queue_depth            = 0;
-    uint32_t                  heartbeat_interval_sec = 0;
-    uint32_t                  lease_timeout_sec      = 0;
+    // Daemon's recommendation.  The client must not exceed this when
+    // calling nvm_add_user_queue.  This is policy only -- the kernel
+    // separately enforces NVM_MAX_QUEUES_PER_GROUP per client fd.
+    int32_t     granted_queues         = 0;
+
+    uint32_t    namespace_id           = 0;
+    uint32_t    page_size              = 0;
+    uint32_t    blk_size               = 0;
+    uint32_t    blk_size_log           = 0;
+    uint32_t    queue_depth            = 0;
+    std::string mount_path;
+    uint32_t    heartbeat_interval_sec = 0;
+    uint32_t    lease_timeout_sec      = 0;
 };
 
 // -----------------------------------------------------------------
-// Internal allocation record
+// Internal allocation record (pure lease bookkeeping; no quota)
 // -----------------------------------------------------------------
 
 struct Allocation {
     std::string                              allocation_id;
     int32_t                                  device_id            = -1;
-    int32_t                                  cuda_device          = -1;  // GPU this allocation is bound to (= group's cuda_device)
-    int32_t                                  queue_start_idx      = 0;   // absolute queue index
-    int32_t                                  queue_count          = 0;
-    uint32_t                                  client_pid          = 0;
-    uint64_t                                  client_pid_starttime = 0;  // /proc/<pid>/stat field 22
+    int32_t                                  cuda_device          = -1;
+    int32_t                                  granted_queues       = 0;
+    uint32_t                                 client_pid           = 0;
+    uint64_t                                 client_pid_starttime = 0;
     std::chrono::steady_clock::time_point    last_heartbeat;
 };
 
-// -----------------------------------------------------------------
-// Per-device state
-// -----------------------------------------------------------------
-
-// One queue partition inside a device: a contiguous range of queues
-// physically allocated on a single GPU. queue_allocated is the per-queue
-// busy bitmap, indexed locally (0..count-1) within this group.
-struct DeviceQueueGroup {
-    int32_t           cuda_device     = -1;
-    int32_t           queue_start_idx = 0;     // absolute queue index (offset into queue_handles)
-    int32_t           count           = 0;
-    std::vector<bool> queue_allocated;          // size == count
-    // GPU-view symlink path that the daemon installed for this group's
-    // GPU, e.g. "/mnt/gpu0/snvm_nvme0n1" -> "/mnt/nvme0/GPU0". Empty
-    // if symlink installation failed; allocate() copies it into the
-    // grant so the client can see the right mount path.
-    std::string       gpu_view_path;
-};
-
+// Per-NVMe device state.  No queue ledger; the kernel owns that.
 struct DeviceState {
-    int32_t                     device_id        = -1;
-    std::string                 pci_addr;
-    std::string                 snvme_dev_path;      // /dev/snvm_*
-    std::string                 mount_path;          // real NVMe mount, e.g. "/mnt/nvme0"
-    uint64_t                    bar0_size        = 0;
-    uint32_t                    dstrd            = 0;
-    uint32_t                    namespace_id     = 0;
-    uint32_t                    page_size        = 0;
-    uint32_t                    blk_size         = 0;
-    uint32_t                    blk_size_log     = 0;
-    uint32_t                    queue_depth      = 0;
-    int32_t                     total_queues     = 0;
+    int32_t                  device_id            = -1;
+    std::string              pci_addr;
+    std::string              snvme_dev_path;
+    std::string              mount_path;          // real NVMe mount
+    uint64_t                 bar0_size            = 0;
+    uint32_t                 dstrd                = 0;
+    uint32_t                 namespace_id         = 0;
+    uint32_t                 page_size            = 0;
+    uint32_t                 blk_size             = 0;
+    uint32_t                 blk_size_log         = 0;
+    uint32_t                 queue_depth          = 0;
+    uint32_t                 max_user_qid         = 0;
+    uint32_t                 max_queues_per_group = 0;
 
-    std::shared_ptr<Controller> controller;          // libnvm handle
+    // Owner-side libnvm handle.  Held for the daemon's lifetime to
+    // keep the chrdev / bind alive.  Freed via nvm_ctrl_free in
+    // ~ServiceState().
+    nvm_ctrl_t*              ctrl                 = nullptr;
 
-    std::vector<QueueShared>      queue_handles;     // size == total_queues
-    std::vector<DeviceQueueGroup> groups;             // per-GPU partitions
+    // ACL: empty == any GPU in cfg_.gpus.
+    std::unordered_set<int>  allowed_gpus;
+
+    // cuda_device -> per-GPU symlink path (e.g. "/mnt/gpu0/ssnvme0").
+    // Populated during install_gpu_symlinks; entries with empty
+    // string mean install failed for that GPU.
+    std::unordered_map<int, std::string> gpu_view_paths;
 
     // Symlinks created at init_device time, removed in dtor.
-    // Each entry is the absolute symlink path under a GpuEntry.mount_path,
-    // e.g. "/mnt/gpu0/snvm_nvme0n1". The corresponding subdirectory on
-    // the NVMe (e.g. "/mnt/nvme0/GPU0") is also tracked for best-effort
-    // rmdir on shutdown.
-    std::vector<std::string>    created_symlinks;
-    std::vector<std::string>    created_nvme_subdirs;
+    std::vector<std::string> created_symlinks;
+    std::vector<std::string> created_nvme_subdirs;
 };
 
 // -----------------------------------------------------------------
@@ -172,8 +161,10 @@ struct DeviceState {
 class ServiceState {
 public:
     /**
-     * Initialise all devices from config: open Controller, populate
-     * queue_handles. Throws std::runtime_error on failure.
+     * Initialise all devices from config: bring up libnvm controller
+     * (owner role: chrdev_create + cap + bind + probe), install
+     * GPU-view symlinks for every allowed GPU.  Throws
+     * std::runtime_error on failure.
      */
     explicit ServiceState(const ServiceConfig& cfg);
     ~ServiceState();
@@ -181,74 +172,45 @@ public:
     ServiceState(const ServiceState&)            = delete;
     ServiceState& operator=(const ServiceState&) = delete;
 
-    // Start the background reaper thread (lease expiry + PID liveness).
     void start_reaper();
     void stop_reaper();
 
     // --- Query ---
-    // Todo: Hotplug support would require refreshing this view on demand (e.g. on Allocate with device_id == -1) or on a timer. For now it's static after init.
     std::vector<DeviceSnapshot> list_devices() const;
 
-    // --- Allocation lifecycle ---
+    // --- Session lifecycle ---
 
-    struct AllocResult {
-        bool            success = false;
-        std::string     error;
-        AllocationGrant grant;
+    struct ConnectResult {
+        bool         success = false;
+        std::string  error;
+        ConnectGrant grant;
     };
 
     /**
-     * Allocate a contiguous queue range on the specified device.
-     * num_queues == 0 means "use daemon default". The count is clamped to
-     * the configured max and to what's actually available.
+     * Validate (device_id, cuda_device) against allowed_gpus, clamp
+     * num_queues to per-client policy + kernel max_queues_per_group,
+     * record the lease, return the grant.  No quota account is
+     * decremented -- the kernel's user QID pool is the only ledger.
      */
-    AllocResult allocate(int32_t device_id,
+    ConnectResult connect(int32_t device_id,
                           int32_t cuda_device,
                           int32_t num_queues,
                           uint32_t client_pid);
 
-    bool release(const std::string& allocation_id,
-                 uint32_t client_pid,
-                 std::string* error);
+    bool disconnect(const std::string& allocation_id,
+                    uint32_t client_pid,
+                    std::string* error);
 
-    /**
-     * Update last_heartbeat for allocation_id.
-     * Returns false (with error set) if the allocation is unknown.
-     */
     bool update_heartbeat(const std::string& allocation_id, std::string* error);
 
-    /**
-     * Check whether an allocation exists (e.g. for heartbeat stream setup).
-     */
     bool has_allocation(const std::string& allocation_id) const;
 
 private:
     // --- Init helpers ---
-    // Build one DeviceState from an NvmeEntry. The full gpus vector is
-    // needed to translate each queue_groups[].gpu_id into its
-    // GpuEntry.mount_path for symlink setup.
-    void init_device(const std::vector<GpuEntry>& gpus,
-                     const NvmeEntry& nvme,
-                     int32_t device_id);
-    void init_queue_handles(DeviceState& dev);
+    void init_device(const NvmeEntry& nvme, int32_t device_id);
 
-    // Setup / teardown of GPU-view symlinks (best effort on teardown).
-    void install_gpu_symlinks(DeviceState& dev,
-                              const std::vector<GpuEntry>& gpus,
-                              const NvmeEntry& nvme);
+    void install_gpu_symlinks(DeviceState& dev);
     void remove_gpu_symlinks(DeviceState& dev);
-
-    // --- Queue range reservation (group-local) ---
-    // reserve_range searches `group` for a contiguous run of `count`
-    // free queues. On success returns true and writes the *absolute*
-    // queue start index (group.queue_start_idx + local offset) plus the
-    // granted count.
-    bool reserve_range(DeviceQueueGroup& group, int32_t count,
-                       int32_t* out_start, int32_t* out_count);
-    // release_range takes an absolute queue start and a count; the
-    // owning group is determined from `start` falling inside one of
-    // dev.groups.
-    void release_range(DeviceState& dev, int32_t start, int32_t count);
 
     // --- Reaper ---
     void reaper_loop();
@@ -258,14 +220,18 @@ private:
     static std::string generate_allocation_id();
     static std::optional<uint64_t> read_pid_starttime(uint32_t pid);
 
-    // --- Data members ---
-    ServiceConfig                                   cfg_;
-    std::vector<DeviceState>                        devices_;
-    std::unordered_map<std::string, Allocation>    allocations_;
-    mutable std::mutex                              state_mtx_;
+    // GPU id -> mount path (drawn from cfg_.gpus at construction;
+    // immutable thereafter).
+    const std::string* gpu_mount_for(int gpu_id) const;
 
-    std::thread                                     reaper_thread_;
-    std::atomic<bool>                               reaper_running_{false};
+    // --- Data members ---
+    ServiceConfig                                cfg_;
+    std::vector<DeviceState>                     devices_;
+    std::unordered_map<std::string, Allocation>  allocations_;
+    mutable std::mutex                           state_mtx_;
+
+    std::thread                                  reaper_thread_;
+    std::atomic<bool>                            reaper_running_{false};
 };
 
 } // namespace nvmeservice
