@@ -28,9 +28,6 @@
 #include "file.h"
 #include "queue.h"
 
-// Forward declarations
-struct SharedControllerSpec;   // defined in shared_ctrl.h
-
 // Per-queue memory target. Each IO queue's SQ/CQ ring memory either
 // lives on a specific GPU (on_host=false, cuda_device=<id>) or in host
 // memory (on_host=true). The host-memory path is reserved for future
@@ -74,15 +71,8 @@ struct Controller
     void* d_ctrl_ptr;
     BufferPtr d_ctrl_buff;
 
-    // True when this Controller was assembled from shared resources
-    // (imported via NVMeService / build_shared_controller). Shared mode
-    // skips standalone-only cleanup in the destructor: no Host_file_system_exit
-    // (daemon owns the mount), no nvm_ctrl_free (daemon owns nvm_ctrl_t).
-    bool                    is_shared = false;
-
     // B3 queue group id assigned by NVM_CREATE_QUEUE_GROUP during
-    // init_queues().  Zero in shared mode (the daemon owns the group)
-    // and pre-init.  ~Controller() destroys the group when non-zero.
+    // init_queues().  ~Controller() destroys the group when non-zero.
     uint32_t                group_id = 0;
 
     Controller(const char* snvme_control_path,
@@ -105,12 +95,6 @@ struct Controller
                 uint32_t ns_id,
                 const std::vector<QueueMemTarget>& queue_targets,
                 uint64_t queueDepth);
-
-    // Shared-resource constructor. Defined in libnvm/src/shared_ctrl.cu.
-    // Callers should use build_shared_controller() rather than invoking this
-    // directly -- the free function also sets up BAR0 mmap and the IPC
-    // imports referenced by each QueuePair.
-    explicit Controller(const struct SharedControllerSpec& spec);
 
     void print_reset_stats(void);
     int init_queues(uint32_t ns_id,  uint32_t cudaDevice,
@@ -461,19 +445,13 @@ inline Controller::~Controller()
      *      User QIDs go back into the kernel's pool.
      *
      *   2. Then drop d_qps (cudaFree on primary GPU) and h_qps
-     *      (each delete h_qps[i] runs the QueuePair dtor; in
-     *      legacy mode that drops the DmaPtr ring members which
-     *      then cudaFree the GPU buffers; in shared mode IPC
-     *      handles get cudaIpcCloseMemHandle'd).
+     *      (each delete h_qps[i] runs the QueuePair dtor, which drops
+     *      the DmaPtr ring members and cudaFree's the GPU buffers).
      *
-     *   3. is_shared short-circuits the rest -- daemon owns mount
-     *      and nvm_ctrl_t.
-     *
-     *   4. Standalone teardown: umount + nvm_ctrl_free (which
-     *      currently still cascades unbind+chrdev_remove; the
-     *      owner/client role split is Commit 4).
+     *   3. Standalone teardown: umount + nvm_ctrl_free (which still
+     *      cascades unbind+chrdev_remove on owner-built controllers).
      */
-    if (this->group_id != 0 && !is_shared && this->ctrl != nullptr) {
+    if (this->group_id != 0 && this->ctrl != nullptr) {
         int rc = nvm_destroy_group(this->ctrl, this->group_id);
         if (rc != 0) {
             // Logged but not fatal: the kernel falls back to the
@@ -495,13 +473,6 @@ inline Controller::~Controller()
         }
         free(h_qps);
         h_qps = nullptr;
-    }
-
-    if (is_shared) {
-        // Shared mode: the mount, nvm_ctrl_t, BAR0 mmap and IPC imports are
-        // managed by the external deleter in build_shared_controller().
-        // Nothing else to do here.
-        return;
     }
 
     int ret = Host_file_system_exit(dev_path);
