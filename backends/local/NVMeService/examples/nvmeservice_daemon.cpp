@@ -15,20 +15,33 @@
 #include <grpcpp/grpcpp.h>
 
 #include <atomic>
+#include <chrono>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <iostream>
 #include <memory>
 #include <string>
+#include <thread>
 
-static std::atomic<grpc::Server*> g_server{nullptr};
+/*
+ * Async-signal-safe shutdown handshake.
+ *
+ * Calling grpc::Server::Shutdown() (or anything that touches an
+ * absl::Mutex) directly from a signal handler is unsafe: the handler
+ * may interrupt the main thread mid-mutex-acquire, and abseil's
+ * RAW_CHECK then aborts with
+ *
+ *   RAW: Check ... failed: detected illegal recursion into Mutex code
+ *
+ * Instead we just flip an atomic flag in the handler -- write(2) to
+ * an atomic<int> is async-signal-safe -- and let the main thread
+ * poll it and run the actual Shutdown() / stop_reaper() teardown.
+ */
+static std::atomic<int> g_stop{0};
 
 static void on_signal(int /*sig*/) {
-    auto* s = g_server.load();
-    if (s != nullptr) {
-        s->Shutdown();
-    }
+    g_stop.store(1, std::memory_order_relaxed);
 }
 
 static void print_usage(const char* prog) {
@@ -107,7 +120,6 @@ int main(int argc, char** argv) {
             state->stop_reaper();
             return 1;
         }
-        g_server.store(server.get());
 
         std::signal(SIGINT,  on_signal);
         std::signal(SIGTERM, on_signal);
@@ -141,11 +153,20 @@ int main(int argc, char** argv) {
                 << " max=" << cfg.queue_pool.max_per_client << "\n";
         std::cout.flush();
 
-        server->Wait();
+        /* Poll the signal flag from the main thread and call
+         * Shutdown() here (NOT in the handler).  100 ms granularity
+         * is plenty for an interactive daemon; tighten if you care
+         * about SIGTERM-to-exit latency in tests. */
+        while (g_stop.load(std::memory_order_relaxed) == 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
 
         std::cout << "Shutting down...\n";
+        std::cout.flush();
+        server->Shutdown();
+        server->Wait();
+
         state->stop_reaper();
-        g_server.store(nullptr);
         std::cout << "Daemon exited cleanly.\n";
     }
 
