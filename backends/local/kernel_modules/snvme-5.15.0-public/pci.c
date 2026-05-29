@@ -3816,6 +3816,39 @@ struct snvm_dev_owner {
 	struct list_head	groups;       /* head of struct snvm_qgroup */
 	struct mutex		groups_lock;  /* serialises group list mutation */
 	unsigned int		nr_groups;    /* current count, for cap check   */
+
+	/*
+	 * Per-fd data-buffer maps (B6, NVM_MAP_KIND_DATA).
+	 *
+	 * Maps registered with map_kind == NVM_MAP_KIND_DATA hang off
+	 * THIS list, NOT off any snvm_qgroup.maps list.  That decouples
+	 * the data-buffer DMA pool's lifetime from any single queue
+	 * group's lifetime, which matches the common usage pattern:
+	 *
+	 *   open(/dev/ssnvme*)
+	 *   NVM_MAP_HOST_MEMORY(kind=DATA, big DMA pool)         <-- once
+	 *   loop:
+	 *     NVM_CREATE_QUEUE_GROUP
+	 *     NVM_MAP_HOST_MEMORY(kind=RING_SQ/RING_CQ, group=g)  <-- per group
+	 *     NVM_ADD_USER_QUEUE
+	 *     ... IO ...
+	 *     NVM_DESTROY_QUEUE_GROUP                             <-- destroys
+	 *                                                             rings; data
+	 *                                                             pool keeps
+	 *                                                             living
+	 *   close(fd)                                             <-- finally
+	 *                                                             releases the
+	 *                                                             data pool
+	 *
+	 * Locking order is the same as for groups_lock: outermost
+	 * lock on the fd, innermost lock everywhere else.  We never
+	 * hold both data_maps_lock and groups_lock at the same time
+	 * (the two lists hold disjoint maps so cross-list traversal
+	 * is not needed).
+	 */
+	struct list_head	data_maps;
+	struct mutex		data_maps_lock;
+	unsigned int		nr_data_maps;
 };
 
 /*
@@ -4257,26 +4290,48 @@ static long snvm_dev_map_ioctl(struct file* file, unsigned int cmd, unsigned lon
         case NVM_MAP_HOST_MEMORY: // 将用户态地址pin住并得到dma地址返回用户态
 		{
             /*
-             * Pin user pages, hand back DMA addrs.  Two modes coexist
-             * (see ioctl.h struct nvm_ioctl_map):
+             * Pin user pages, hand back DMA addrs.  Three routings
+             * coexist (see ioctl.h struct nvm_ioctl_map and enum
+             * nvm_map_kind):
              *
-             *   group_id == 0  legacy.  ioq_idx >= 0 counts the map
-             *                  against ctrl->ioq_num / ctrl->cq_num
-             *                  and tags it for the NVM_SET_IOQ_NUM
-             *                  bring-up.  Map is reachable only via
-             *                  the global host_list.
+             *   B6 map_kind == NVM_MAP_KIND_DATA
+             *                  fd-scoped data buffer.  Map is
+             *                  registered on own->data_maps; group_id
+             *                  is IGNORED for lifecycle.  Survives
+             *                  NVM_DESTROY_QUEUE_GROUP; reaped only
+             *                  on fd close (or by NVM_UNMAP_*).
              *
-             *   group_id != 0  new mode.  Map is registered on the
-             *                  per-fd group's maps list so destroy /
-             *                  cascade can drain it.  ioq_idx /
-             *                  is_cq are ignored.
+             *   B6 map_kind == NVM_MAP_KIND_RING_SQ / RING_CQ
+             *                  group-scoped ring buffer.  group_id
+             *                  MUST be non-zero.  Map is linked onto
+             *                  the per-fd group's maps list and is
+             *                  drained by NVM_DESTROY_QUEUE_GROUP /
+             *                  fd-close cascade.  NVM_ADD_USER_QUEUE
+             *                  enforces that pairs[i].sq_vaddr
+             *                  resolves to RING_SQ and pairs[i].
+             *                  cq_vaddr to RING_CQ.
+             *
+             *   map_kind == 0 (UNSPECIFIED)
+             *                  Pre-B6 caller.  Falls back to the B2
+             *                  semantics: group_id != 0 hangs the
+             *                  map on g->maps; group_id == 0 +
+             *                  ioq_idx >= 0 takes the legacy
+             *                  NVM_SET_IOQ_NUM accounting path.
              */
             if (copy_from_user(&request, (void __user*) arg, sizeof(request)))
             {
                 return -EFAULT;
             }
-            if (request.reserved != 0)
+            if (request.reserved0[0] != 0 ||
+                request.reserved0[1] != 0 ||
+                request.reserved0[2] != 0)
                 return -EINVAL;     /* MBZ; future compat */
+            if (request.map_kind > NVM_MAP_KIND_DATA)
+                return -EINVAL;     /* unknown kind */
+            if ((request.map_kind == NVM_MAP_KIND_RING_SQ ||
+                 request.map_kind == NVM_MAP_KIND_RING_CQ) &&
+                request.group_id == 0)
+                return -EINVAL;     /* RING_* requires a group */
 
             map = map_userspace(&host_list, ctrl, request.vaddr_start, request.n_pages);
             /*
@@ -4290,8 +4345,25 @@ static long snvm_dev_map_ioctl(struct file* file, unsigned int cmd, unsigned lon
                 return IS_ERR(map) ? PTR_ERR(map) : -ENOMEM;
             }
 
-            if (request.group_id != 0) {
-                /* New mode: attach to per-fd queue group. */
+            map->kind = request.map_kind;
+
+            if (request.map_kind == NVM_MAP_KIND_DATA) {
+                /* B6: fd-scoped data buffer.  Always link onto
+                 * own->data_maps; never onto g->maps.  group_id is
+                 * accepted but not used for lifecycle decisions.   */
+                struct snvm_dev_owner *own = file->private_data;
+
+                if (!own) {
+                    unmap_and_release(map);
+                    return -ENODEV;
+                }
+                mutex_lock(&own->data_maps_lock);
+                list_add_tail(&map->group_link, &own->data_maps);
+                own->nr_data_maps++;
+                mutex_unlock(&own->data_maps_lock);
+            } else if (request.group_id != 0) {
+                /* B2/B6: group-scoped attachment (ring or
+                 * UNSPECIFIED-with-group). */
                 struct snvm_dev_owner *own = file->private_data;
                 struct snvm_qgroup *g;
 
@@ -4333,12 +4405,21 @@ static long snvm_dev_map_ioctl(struct file* file, unsigned int cmd, unsigned lon
             {
                 /*
                  * Roll back every counter we bumped above AND release
-                 * the mapping.  For new-mode (group) maps,
-                 * unmap_and_release will list_del the group_link out
-                 * so g->nr_maps is the only thing to roll back
-                 * manually.
+                 * the mapping.  For new-mode (group or data_maps)
+                 * maps, unmap_and_release will list_del the
+                 * group_link out so the per-list counter is the only
+                 * thing to roll back manually.
                  */
-                if (request.group_id != 0) {
+                if (request.map_kind == NVM_MAP_KIND_DATA) {
+                    struct snvm_dev_owner *own = file->private_data;
+
+                    if (own) {
+                        mutex_lock(&own->data_maps_lock);
+                        if (own->nr_data_maps > 0)
+                            own->nr_data_maps--;
+                        mutex_unlock(&own->data_maps_lock);
+                    }
+                } else if (request.group_id != 0) {
                     struct snvm_dev_owner *own = file->private_data;
                     struct snvm_qgroup *g;
 
@@ -4380,7 +4461,15 @@ static long snvm_dev_map_ioctl(struct file* file, unsigned int cmd, unsigned lon
 			{
 				return -EFAULT;
 			}
-			if (request.reserved != 0)
+			if (request.reserved0[0] != 0 ||
+			    request.reserved0[1] != 0 ||
+			    request.reserved0[2] != 0)
+				return -EINVAL;
+			if (request.map_kind > NVM_MAP_KIND_DATA)
+				return -EINVAL;
+			if ((request.map_kind == NVM_MAP_KIND_RING_SQ ||
+			     request.map_kind == NVM_MAP_KIND_RING_CQ) &&
+			    request.group_id == 0)
 				return -EINVAL;
 
 			map = map_device_memory(&device_list, ctrl, request.vaddr_start, request.n_pages, &ctrl_list);
@@ -4389,7 +4478,22 @@ static long snvm_dev_map_ioctl(struct file* file, unsigned int cmd, unsigned lon
 				return IS_ERR(map) ? PTR_ERR(map) : -ENOMEM;
 			}
 
-			if (request.group_id != 0) {
+			map->kind = request.map_kind;
+
+			if (request.map_kind == NVM_MAP_KIND_DATA) {
+				/* B6: fd-scoped GPU data buffer.  Survives
+				 * NVM_DESTROY_QUEUE_GROUP; reaped on fd close.   */
+				struct snvm_dev_owner *own = file->private_data;
+
+				if (!own) {
+					unmap_and_release(map);
+					return -ENODEV;
+				}
+				mutex_lock(&own->data_maps_lock);
+				list_add_tail(&map->group_link, &own->data_maps);
+				own->nr_data_maps++;
+				mutex_unlock(&own->data_maps_lock);
+			} else if (request.group_id != 0) {
 				struct snvm_dev_owner *own = file->private_data;
 				struct snvm_qgroup *g;
 
@@ -4413,7 +4517,16 @@ static long snvm_dev_map_ioctl(struct file* file, unsigned int cmd, unsigned lon
 			if (copy_to_user((void __user*) request.ioaddrs, map->addrs,
 			                 map->n_addrs * sizeof(uint64_t)))
 			{
-				if (request.group_id != 0) {
+				if (request.map_kind == NVM_MAP_KIND_DATA) {
+					struct snvm_dev_owner *own = file->private_data;
+
+					if (own) {
+						mutex_lock(&own->data_maps_lock);
+						if (own->nr_data_maps > 0)
+							own->nr_data_maps--;
+						mutex_unlock(&own->data_maps_lock);
+					}
+				} else if (request.group_id != 0) {
 					struct snvm_dev_owner *own = file->private_data;
 					struct snvm_qgroup *g;
 
@@ -4487,15 +4600,60 @@ static long snvm_dev_map_ioctl(struct file* file, unsigned int cmd, unsigned lon
             map = map_find(&host_list, addr);
             if (map != NULL)
             {
+				/*
+				 * Three concurrent attachment modes need different
+				 * locking discipline before unmap_and_release runs
+				 * list_del on map->group_link (the link member is
+				 * shared between group_link-on-g->maps and
+				 * group_link-on-own->data_maps depending on
+				 * ->kind):
+				 *
+				 *   B6 NVM_MAP_KIND_DATA       own->data_maps_lock
+				 *   B2 group-attached map      own->groups_lock
+				 *   legacy / group_id == 0     no lock needed
+				 */
+				struct snvm_dev_owner *own = file->private_data;
+				bool is_data = (map->kind == NVM_MAP_KIND_DATA);
+				bool need_grp_lock =
+					(!is_data && map->group_id != 0 && own);
+				bool need_data_lock = (is_data && own);
+
+				if (need_grp_lock)
+					mutex_lock(&own->groups_lock);
+				if (need_data_lock)
+					mutex_lock(&own->data_maps_lock);
+
 				if(map->ioq_idx>=0)
 				{
-					// printk("unmap_userspace map map->ioq_idx is %d, map->is_cq is %d",map->ioq_idx,map->is_cq);
 					if(map->is_cq)
 						ctrl->cq_num--;
-
 					ctrl->ioq_map_num--;
 				}
+				if (need_data_lock) {
+					if (own->nr_data_maps > 0)
+						own->nr_data_maps--;
+				} else if (map->group_id != 0 && own) {
+					/*
+					 * Decrement nr_maps before unmap_and_release
+					 * (which list_dels group_link) so the count
+					 * stays consistent throughout.  find_qgroup
+					 * may return NULL if userspace destroyed the
+					 * group between the map insertion and now;
+					 * in that pathological case the map was
+					 * already drained by destroy_qgroup_locked
+					 * and we wouldn't be here.  Guard anyway.
+					 */
+					struct snvm_qgroup *g =
+						find_qgroup_locked(own, map->group_id);
+					if (g && g->nr_maps > 0)
+						g->nr_maps--;
+				}
                 unmap_and_release(map);
+
+				if (need_data_lock)
+					mutex_unlock(&own->data_maps_lock);
+				if (need_grp_lock)
+					mutex_unlock(&own->groups_lock);
                 ret = 0;
                 break;
             }
@@ -4513,7 +4671,32 @@ static long snvm_dev_map_ioctl(struct file* file, unsigned int cmd, unsigned lon
             map = map_find(&device_list, addr);
             if (map != NULL)
             {
+				struct snvm_dev_owner *own = file->private_data;
+				bool is_data = (map->kind == NVM_MAP_KIND_DATA);
+				bool need_grp_lock =
+					(!is_data && map->group_id != 0 && own);
+				bool need_data_lock = (is_data && own);
+
+				if (need_grp_lock)
+					mutex_lock(&own->groups_lock);
+				if (need_data_lock)
+					mutex_lock(&own->data_maps_lock);
+
+				if (need_data_lock) {
+					if (own->nr_data_maps > 0)
+						own->nr_data_maps--;
+				} else if (map->group_id != 0 && own) {
+					struct snvm_qgroup *g =
+						find_qgroup_locked(own, map->group_id);
+					if (g && g->nr_maps > 0)
+						g->nr_maps--;
+				}
                 unmap_and_release(map);
+
+				if (need_data_lock)
+					mutex_unlock(&own->data_maps_lock);
+				if (need_grp_lock)
+					mutex_unlock(&own->groups_lock);
 				ret = 0;
                 break;
             }
@@ -5080,9 +5263,28 @@ static long snvm_dev_map_ioctl(struct file* file, unsigned int cmd, unsigned lon
 					mask = ~((cursor->page_size ?
 						  (u64)cursor->page_size : (u64)PAGE_SIZE) - 1);
 
-					if (cursor->vaddr == (req->pairs[i].sq_vaddr & mask))
+					/* B6: when the candidate map carries an
+					 * explicit kind tag, only RING_SQ matches
+					 * sq_vaddr and only RING_CQ matches
+					 * cq_vaddr.  UNSPECIFIED (pre-B6 callers)
+					 * still matches either slot, preserving
+					 * back-compat for binaries that haven't
+					 * been recompiled.  A DATA map MUST NOT
+					 * match either slot -- accidentally using
+					 * a data-buffer vaddr where a ring vaddr
+					 * was meant would otherwise have the
+					 * controller execute Create I/O SQ on the
+					 * data buffer (silent corruption).      */
+					if (cursor->kind == NVM_MAP_KIND_DATA)
+						continue;
+
+					if (cursor->vaddr == (req->pairs[i].sq_vaddr & mask) &&
+					    (cursor->kind == 0 ||
+					     cursor->kind == NVM_MAP_KIND_RING_SQ))
 						m_sq = cursor;
-					if (cursor->vaddr == (req->pairs[i].cq_vaddr & mask))
+					if (cursor->vaddr == (req->pairs[i].cq_vaddr & mask) &&
+					    (cursor->kind == 0 ||
+					     cursor->kind == NVM_MAP_KIND_RING_CQ))
 						m_cq = cursor;
 					if (m_sq && m_cq)
 						break;
@@ -5301,6 +5503,9 @@ static int snvm_dev_open(struct inode *inode, struct file *file)
 	INIT_LIST_HEAD(&own->groups);
 	mutex_init(&own->groups_lock);
 	own->nr_groups = 0;
+	INIT_LIST_HEAD(&own->data_maps);
+	mutex_init(&own->data_maps_lock);
+	own->nr_data_maps = 0;
 	file->private_data = own;
 	return 0;
 }
@@ -5350,6 +5555,35 @@ static int snvm_dev_release(struct inode *inode, struct file *file)
 	if (n_groups)
 		pr_info("snvme: snvm_dev_release: cascade-destroyed %u orphan group(s) for pid=%d\n",
 			n_groups, owner ? owner->pid : -1);
+
+	/*
+	 * Pass 0.5: cascade-release any fd-scoped DATA maps the
+	 * owner registered with map_kind == NVM_MAP_KIND_DATA.  These
+	 * are NOT attached to any snvm_qgroup, so the queue-group
+	 * cascade above missed them; they live on own->data_maps and
+	 * have to be reaped here on fd close.  unmap_and_release
+	 * pulls each one off both the global list (host_list /
+	 * device_list / device_queue_list, via map->list) and the
+	 * data_maps list (via map->group_link, which we reuse for
+	 * fd-scoped attachment in the same way snvm_qgroup.maps does
+	 * for group-scoped attachment).
+	 */
+	{
+		unsigned int n_data = 0;
+		struct map *m, *tmp_m;
+
+		mutex_lock(&own->data_maps_lock);
+		list_for_each_entry_safe(m, tmp_m, &own->data_maps, group_link) {
+			unmap_and_release(m);
+			n_data++;
+		}
+		own->nr_data_maps = 0;
+		mutex_unlock(&own->data_maps_lock);
+
+		if (n_data)
+			pr_info("snvme: snvm_dev_release: cascade-released %u DATA map(s) for pid=%d\n",
+				n_data, owner ? owner->pid : -1);
+	}
 
 	/*
 	 * Pass 1: walk host_list + device_queue_list to compute the
@@ -5413,6 +5647,7 @@ static int snvm_dev_release(struct inode *inode, struct file *file)
 			owner ? owner->pid : -1);
 
 	mutex_destroy(&own->groups_lock);
+	mutex_destroy(&own->data_maps_lock);
 	kfree(own);
 	file->private_data = NULL;
 	return 0;

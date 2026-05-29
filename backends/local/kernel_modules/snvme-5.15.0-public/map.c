@@ -50,6 +50,15 @@ static struct map* create_descriptor(const struct ctrl* ctrl, u64 vaddr, unsigne
      */
     INIT_LIST_HEAD(&map->group_link);
     map->group_id = 0;
+    /*
+     * Default the B6 map-kind tag to UNSPECIFIED.  Pre-B6 callers
+     * (and every internal helper that builds a map without
+     * touching map_kind) keep their existing semantics this way.
+     * NVM_MAP_* dispatch in pci.c overrides ->kind based on the
+     * caller-supplied request.map_kind.
+     */
+    map->kind = 0; /* NVM_MAP_KIND_UNSPECIFIED */
+    memset(map->reserved_pad, 0, sizeof(map->reserved_pad));
 
     map->owner = current;
     map->vaddr = vaddr;

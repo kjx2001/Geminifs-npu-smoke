@@ -32,7 +32,7 @@ struct map
     void*               data;           /* Custom data */
     release             release;        /* Custom callback for unmapping and releasing memory */
     /*
-     * Per-fd queue-group attachment (B2).
+     * Per-fd queue-group attachment (B2) + map-kind tag (B6).
      *
      *   group_id == 0          legacy map; group_link is left as
      *                          an empty list head and the map is
@@ -43,12 +43,32 @@ struct map
      *                          is threaded into that group's
      *                          snvm_qgroup::maps list.
      *
+     *   kind                   B6 role tag.  See enum nvm_map_kind
+     *                          in libnvm/include/ioctl.h.
+     *                            UNSPECIFIED (0)  pre-B6 caller;
+     *                                             legacy semantics.
+     *                            RING_SQ / RING_CQ
+     *                                             group-scoped
+     *                                             ring; NVM_ADD_
+     *                                             USER_QUEUE
+     *                                             enforces match.
+     *                            DATA             fd-scoped data
+     *                                             buffer; lives on
+     *                                             snvm_dev_owner.
+     *                                             data_maps; NOT
+     *                                             on g->maps; not
+     *                                             cascaded by
+     *                                             NVM_DESTROY_QUEUE
+     *                                             _GROUP.
+     *
      * group_link is initialised in create_descriptor (LIST_HEAD-init),
      * so it is safe to list_del() / list_empty() unconditionally
      * regardless of mode.
      */
     struct list_head    group_link;
     uint32_t            group_id;
+    uint8_t             kind;           /* enum nvm_map_kind */
+    uint8_t             reserved_pad[7];
     unsigned long       n_addrs;        /* Number of mapped pages */
     uint64_t            addrs[1];       /* Bus addresses */
 };
