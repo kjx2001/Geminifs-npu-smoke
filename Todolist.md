@@ -98,65 +98,57 @@ third mode: "bind to fd, NOT to a queue group".
       gets a new trap entry "data map registered with
       `RING_SQ` kind silently passes ADD_USER_QUEUE".
 
-## NVMeService Rewrite — Remaining Work
+## NVMeService — DONE (L1 Commit 4b)
 
-Control-plane code, state, server, client, and `libnvm` shared-resource
-reconstruction are in place. Outstanding items to make it buildable
-and runnable end-to-end:
+The daemon was rewritten to act as a *session broker* on top of the
+B3/B6 kernel ABI, not a queue host or a quota ledger:
 
-- [x] daemon entry point, client smoke, root `sys_config.yaml`,
-      example CMakeLists, root CMakeLists protoc patch,
-      `BlockDeviceManager` shared-Controller ctor — all landed.
-- [ ] Verify CUDA IPC works for PRP memory; if not, wire client-side PRP
-      allocation fallback (the server already honours `has_prp=false`).
-- [ ] Verify `cudaHostRegister(BAR0, cudaHostRegisterIoMemory)` works in a
-      non-daemon process (same SNVMe device was already mmapped by daemon).
-- [ ] End-to-end smoke: daemon + one client, run a trivial read/write via
-      `BlockDeviceManager` built on the shared `Controller`.
+- `nvmeservice_state.h/.cu` no longer holds `std::shared_ptr<Controller>`
+  per device.  It holds an `nvm_ctrl_t*` brought up via
+  `nvm_controller_init_b3` (chrdev_create + cap + bind + probe).  The
+  daemon does **not** maintain any per-GPU queue ledger -- the kernel's
+  user QID pool is the single source of truth.
+- YAML schema collapsed to "what the daemon really needs":
+  `total_queues`, `queue_depth`, `queue_groups[].count`, the entire
+  `queue_setup` block all removed.  What remains: `kernel_ioq_cap`
+  (NVM_SET_KERNEL_IOQ_CAP hint), `allowed_gpus[]` (NUMA / PCIe-switch
+  ACL), `queue_pool.{default,max}_per_client` (daemon-side guidance
+  upper bound on Connect grants).
+- `nvmeservice.proto` simplified: `AllocateQueues` -> `Connect`,
+  `ReleaseQueues` -> `Disconnect`, all `cudaIpcMemHandle_t` /
+  `QueueSharedMem` plumbing removed.  `DeviceInfo.quotas[]` replaced
+  by `allowed_gpus[]` (cuda_device + GPU-view symlink path).
+  `ConnectResponse.queue_quota` renamed `granted_queues` (policy
+  guidance, no daemon-side accounting).
+- Client library is a thin gRPC session holder: `client.connect()`
+  returns a `Session` with the metadata; the caller drives libnvm
+  themselves (`nvm_ctrl_attach_client` -> `nvm_create_group` ->
+  ring/data maps -> `nvm_add_user_queue`).
+- Reaper just drops stale lease records on PID-dead detection.  No
+  kernel-side cleanup needed: the dead client's fd close already
+  cascades through `snvm_dev_release` (B6 fd-scoped DATA invariant).
+- `libnvm/src/shared_ctrl.cu` and `include/shared_ctrl.h` deleted.
+  `Controller::is_shared`, `QueuePair::is_shared` and the IPC import
+  ctor/dtor branches all removed.
+- Examples rewritten: `nvmeservice_daemon` brings up the chrdev
+  owner; `nvmeservice_client` (split into `.cpp` for gRPC and `.cu`
+  for the IO smoke to keep protobuf headers out of nvcc) does
+  Connect + attach_client + create_group + GPU IO + destroy_group +
+  free_client + Disconnect.
+- Legacy `examples/tests/*.sh` integration test scripts deleted; the
+  two binaries (`nvmeservice_daemon` + `nvmeservice_client`) now
+  cover the smoke surface end-to-end.
 
-### Reaper / dead-client policy (settled)
+### Open follow-ups
 
-When the reaper detects a dead client (PID gone, or PID reused via
-starttime mismatch), the daemon **destroys the dead client's entire
-queue group** via `NVM_DESTROY_QUEUE_GROUP`, not by recycling
-individual qids. This means:
+- [ ] `disk.ns_id` is still left at 0 by `NVM_GET_DEV_INFO`; daemon
+  currently propagates whatever YAML says. Long-term fix: extend the
+  kernel ioctl to ship the namespace id + use it everywhere.
+- [ ] `chrdev` minor reconstruction in `init_device` parses
+  `disk.disk_name` (e.g. "snvme0n1" -> "0"). When the
+  `pci_device_addr.domain` overload is fixed (entry below), pull the
+  minor through that explicit out-param instead.
 
-- `NVM_DESTROY_QUEUE_GROUP` cascades through `Delete I/O SQ` +
-  `Delete I/O CQ` + map purge for every queue / ring in the
-  group, on the controller side. There is no stale SQHD/SQT/CQH/
-  CQT/phase to inherit.
-- The next client's `allocate()` request goes through the normal
-  `NVM_CREATE_QUEUE_GROUP` + `NVM_ADD_USER_QUEUE` path and gets
-  freshly-allocated qids from the user QID pool. **Client B
-  never inherits client A's qids.**
-- The "share-mode queue recycle gap" / `NVM_RECYCLE_USER_QUEUE`
-  plan in earlier revisions of this file is therefore obsolete
-  and has been removed.
-
-Outstanding daemon work to realise this:
-
-- [ ] **Daemon owns one queue group per allocation.**
-      `ServiceState::allocate` should call
-      `NVM_CREATE_QUEUE_GROUP` + `NVM_ADD_USER_QUEUE` for the
-      requested QueuePair count, store the resulting `group_id`
-      on the `Allocation` record, and return the QID range +
-      doorbell offsets (or just the imported QueuePair handles)
-      to the client.
-- [ ] **`release_range` and reaper destroy the group.** Replace
-      the current `queue_allocated[i] = false` flip in
-      `ServiceState::release_range` with a
-      `NVM_DESTROY_QUEUE_GROUP(allocation.group_id)` call. The
-      `queue_allocated` bitmap stays as a soft accounting view
-      for the gRPC `list_devices` response, but the source of
-      truth becomes the kernel-side group + user QID pool.
-- [ ] **Pool-vs-group accounting.** Decide whether
-      `total_queues` in `DeviceState` reflects the pre-cap
-      controller MSI-X grant (current) or the dynamic
-      `start_cq_idx..max_user_qid` window reported by
-      `NVM_GET_DEV_INFO`. The latter is more accurate now that
-      groups can come and go at runtime; the schema in
-      `sys_config.yaml`'s `queue_setup` block already implies
-      this.
 
 ## SNVMe Queue-Budget Tuning — DONE
 
@@ -201,7 +193,7 @@ is documented as a §7.3.1 trap.
       (CAP.MQES + 1), so the failure is hypothetical, but the
       lack of a check makes that assumption invisible. Add an
       explicit `assert((qs & (qs - 1)) == 0)` on construction in
-      both `queue.h` and `shared_ctrl.cu`. No runtime change.
+      `queue.h`. No runtime change.
 
 - [ ] **`device.cpp` `cudaHostRegister(BAR0, ..., IoMemory)`
       should also pass `cudaHostRegisterPortable`.**

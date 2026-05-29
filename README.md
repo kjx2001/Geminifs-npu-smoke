@@ -236,38 +236,35 @@ is the canonical signing tool in all three workflows:
 
 ### Queue budget tuning
 
-The snvme kernel module splits each NVMe controller's I/O queue budget
-between the **kernel-side blk-mq path** (so the disk is still mountable
-and `read(2)`/`write(2)` works) and the **user-side share** that
-NVMeService hands to GPU clients via CUDA IPC. The split is operator-
-controlled through one block in [`sys_config.yaml`](sys_config.yaml):
+The snvme kernel module splits each NVMe controller's I/O queue
+budget between the **kernel-side blk-mq path** (so the disk is still
+mountable and `read(2)`/`write(2)` works) and the **user-side share**
+that GPU clients consume via libnvm.  The split is operator-controlled
+through one knob in [`sys_config.yaml`](sys_config.yaml):
 
 ```yaml
 nvmes:
   - pci_addr: "0000:50:00.0"
-    total_queues: 64                # NVMe IOQ budget the operator commits
-    queue_groups:
-      - { gpu_id: 0, count: 32 }    # user share (per-GPU partitions)
-    queue_setup:
-      kernel_ioq_cap: 32            # kernel-side cap (QueuePair units)
-      on_host: false
-      nr_write: 0
-      nr_poll: 0
+    mount_path: "/mnt/nvme0"
+    namespace_id: 1
+    kernel_ioq_cap: 32              # NVM_SET_KERNEL_IOQ_CAP, in QueuePair units
+    allowed_gpus: [0]               # NUMA / PCIe-switch ACL (optional)
 ```
 
-All counts are in **QueuePair units** (1 pair = 1 SQ + 1 CQ). The daemon
-enforces the local invariant
-`Σqueue_groups[].count + queue_setup.kernel_ioq_cap <= total_queues`
-at startup; the kernel additionally checks the result against the
-controller's actual `Identify Controller` IOQ ceiling at
-`NVM_SET_IOQ_NUM` time.
+The kernel takes `kernel_ioq_cap` as the upper bound on the blk-mq
+side; everything above that becomes the user-share QID pool exposed
+through `nvm_add_user_queue()`.  Daemon does not maintain a separate
+ledger -- the kernel's user QID pool is the single source of truth,
+and `NVM_GET_DEV_INFO` reports the resulting `start_cq_idx` /
+`max_user_qid` window.
 
-**When to set `kernel_ioq_cap` explicitly.** If the controller's MSI-X
-vector count is smaller than `num_possible_cpus()` on the host, the
-kernel's default ask (`nr_io_queues = num_possible_cpus()`) consumes
-every vector and leaves zero room for the user-allocated share. The
-GPU-direct path then silently falls back to `dma_alloc_coherent`, the
-smoke test reports `nr_user_q=0`, and dmesg carries the signature
+**When to set `kernel_ioq_cap` explicitly.** If the controller's
+MSI-X vector count is smaller than `num_possible_cpus()` on the host,
+the kernel's default ask (`nr_io_queues = num_possible_cpus()`)
+consumes every vector and leaves zero room for the user-allocated
+share.  The GPU-direct path then silently falls back to
+`dma_alloc_coherent`, smoke tests report `nr_user_q=0`, and dmesg
+carries the signature
 
 ```
 queue squeeze: kernel=N user=M (controller granted ...)
