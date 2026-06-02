@@ -158,7 +158,6 @@ set (CUDA_NVCC_FLAGS_RELEASE "${CMAKE_NVCC_FLAGS_RELEASE} -O2" CACHE INTERNAL ""
 set (CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xlinker -rpath=\\$ORIGIN -Xlinker -rpath=${CMAKE_BINARY_DIR}/lib -rdc=true --expt-relaxed-constexpr --expt-extended-lambda -lineinfo ${GPU_ARCHS}")
 set (CMAKE_CUDA_FLAGS_DEBUG "${CMAKE_CUDA_FLAGS_DEBUG} -G -DDEBUG" CACHE INTERNAL "" FORCE)
 set (CMAKE_CUDA_FLAGS_RELEASE "${CMAKE_CUDA_FLAGS_RELEASE} -O2" CACHE INTERNAL "" FORCE)
-set (CMAKE_CUDA_GEMINIFS_LIBS "${CMAKE_CUDA_GEMINIFS_LIBS} -L${PROJECT_BINARY_DIR}/libgeminifs -L${PROJECT_SOURCE_DIR}/filesystems/ext4/libgeminifs/include/geminifs -L${CMAKE_BINARY_DIR}/lib -lgeminifs -lnvm")
 
 if (no_cc)
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -D__NO_COHERENCE__")
@@ -167,8 +166,7 @@ if (no_cc)
 endif ()
 
 include_directories ("${PROJECT_SOURCE_DIR}/backends/local/nvme/libnvm/src"
-                     "${PROJECT_SOURCE_DIR}/backends/local/nvme/libnvm/include" 
-                     "${PROJECT_SOURCE_DIR}/filesystems/ext4/libgeminifs/include")
+                     "${PROJECT_SOURCE_DIR}/backends/local/nvme/libnvm/include")
 
 # Try to find Nvidia driver
 if (CUDA_FOUND AND NOT no_cuda)
@@ -337,54 +335,26 @@ set_target_properties (libnvm PROPERTIES BUILD_RPATH "$ORIGIN" INSTALL_RPATH "$O
 install (FILES ${libnvm_include} DESTINATION "include")
 install (TARGETS libnvm DESTINATION "lib")
 
-# libgeminifs
-set (libgeminifs_root "${PROJECT_SOURCE_DIR}/filesystems/ext4/libgeminifs")
-file (GLOB libgeminifs_cpp_source "${libgeminifs_root}/*.cpp")
-file (GLOB libgeminifs_cuda_source "${libgeminifs_root}/*.cu")
-file (GLOB libgeminifs_include "${libgeminifs_root}/include/geminifs/*.h" "${libgeminifs_root}/include/geminifs/*.cuh")
-
-message(STATUS "Configuring libgeminifs: ${libgeminifs_cuda_source} ${libgeminifs_cpp_source} ${libgeminifs_include}")
-
-add_library(libgeminifs ${libgeminifs_cuda_source} ${libgeminifs_cpp_source} ${libgeminifs_include})
-
-# Add Torch related configurations
-target_link_libraries(libgeminifs PRIVATE "${TORCH_LIBRARIES}")
-target_include_directories(libgeminifs PRIVATE "${TORCH_INCLUDE_DIRS}")
-
-target_link_libraries(libgeminifs PRIVATE rocksdb)
-
-target_include_directories(libgeminifs PRIVATE "${libgeminifs_root}")
-target_link_libraries(libgeminifs PRIVATE libnvm CUDA::cudart "${TORCH_LIBRARIES}")
-# target_include_directories(libgeminifs PRIVATE "${libgeminifs_root}")
-# target_link_libraries(libgeminifs ${CUDA_LIBRARIES} libnvm )
-target_link_libraries(libgeminifs
-    PRIVATE
-    unwind
-    unwind-x86_64
-    ${CMAKE_DL_LIBS}
-)
-
-set_target_properties(libgeminifs PROPERTIES OUTPUT_NAME "geminifs")
-set_target_properties(libgeminifs PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
-set_target_properties(libgeminifs PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)
-set_target_properties(libgeminifs PROPERTIES BUILD_RPATH "$ORIGIN" INSTALL_RPATH "$ORIGIN")
-install (FILES ${libgeminifs_include} DESTINATION "include/geminifs")
-install (TARGETS libgeminifs DESTINATION "lib")
-
 # ---------------------------------------------------------------------------
-# Refactored layers: device_manager + io_engine
+# Tutti core layers
 #
-# These are new canonical libraries extracted from libgeminifs during the
-# bottom-up refactor. libgeminifs is kept as-is during the transition and
-# acts as a utility provider (FileManager, host_refine_nvmeofst, debug macros).
+# Layered subdirectories (all under tutti:: namespace):
+#
+#   memory/          -- HostDeviceMemorySubsystem (libnvm DMA mapping +
+#                       cudaMalloc / malloc + register_external)
+#   device_manager/  -- LocalNvmeDirectRegistry (IN_PROCESS) +
+#                       NvmeServiceBackedRegistry (SERVICE_CLIENT)
 #
 # Layer dependency:
-#   io_engine  ->  device_manager  ->  libnvm
-#                          |
-#                          +--->  libgeminifs (utilities)
+#   memory          -> libnvm + CUDA::cudart
+#   device_manager  -> libnvm + nvmeservice (gRPC client)
 # ---------------------------------------------------------------------------
-add_subdirectory(device_manager)
-add_subdirectory(io_engine)
+add_subdirectory(memory)
+
+# legacy filesystems/ext4/libgeminifs/ is intentionally NOT added here.
+# The directory is preserved on disk as a logic-reference snapshot
+# during the L1 5b refactor and will be deleted once the new layers
+# fully replace it.
 
 # NVMeService
 set (nvmeservice_root "${PROJECT_SOURCE_DIR}/backends/local/NVMeService")
@@ -467,6 +437,10 @@ install (TARGETS nvmeservice DESTINATION "lib")
 
 # NVMeService example executables (daemon + client smoke test)
 add_subdirectory(backends/local/NVMeService/examples)
+
+# device_manager depends on nvmeservice (for the gRPC-backed registry),
+# so it must be added AFTER nvmeservice has been declared.
+add_subdirectory(device_manager)
 
 
 # Macro for creating sample target

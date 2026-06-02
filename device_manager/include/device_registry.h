@@ -33,6 +33,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <vector>
 
 namespace tutti {
 
@@ -61,6 +62,12 @@ public:
     /// Lookup by dense `device_id`. Returns nullptr if no device
     /// with that id is registered.
     virtual const Device* find_by_id(int32_t device_id) const = 0;
+
+    /// Snapshot of every device currently in the registry.  Order
+    /// matches `device_at(0..device_count())`.  Returned pointers
+    /// follow the same lifetime rules as `device_at()` -- valid for
+    /// the life of the registry, must not be deleted.
+    virtual std::vector<const Device*> list() const = 0;
 };
 
 } // namespace tutti
