@@ -18,8 +18,18 @@
 #include "rpc.h"
 #include "lib_ctrl.h"
 #include "lib_util.h"
-#include "dprintf.h"
+/*
+ * <atomic> MUST come before "dprintf.h": <atomic> transitively pulls in
+ * <stdio.h>, whose POSIX `int dprintf(int fd, const char *fmt, ...)`
+ * declaration would otherwise be macro-substituted by "dprintf.h"'s
+ *     #define dprintf(...) _nvm_dprintf(__func__, __VA_ARGS__)
+ * Result on gcc 11 + glibc 2.35: "declaration does not declare anything"
+ * + "expected unqualified-id" inside <stdio.h>.  Reversing the order keeps
+ * the macro shadow local to this TU's call sites without poisoning the
+ * system header.
+ */
 #include <atomic>
+#include "dprintf.h"
 
 
 /*
