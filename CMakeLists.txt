@@ -442,6 +442,9 @@ add_subdirectory(backends/local/NVMeService/examples)
 # so it must be added AFTER nvmeservice has been declared.
 add_subdirectory(device_manager)
 
+# nvme_storage depends on device_manager (for LocalNvmeDevice payload).
+add_subdirectory(nvme_storage)
+
 
 # Macro for creating sample target
 macro (make_sample target binary_name files)
