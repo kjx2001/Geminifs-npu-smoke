@@ -9,6 +9,7 @@
  */
 
 #include "local_nvme_direct_registry.h"
+#include "nvme_queue_group.h"   // R5b
 
 #include "../../io_engine/include/backend_type.h"
 
@@ -18,6 +19,7 @@
 #include <cstdio>
 #include <cstring>
 #include <utility>
+#include <vector>
 
 namespace tutti {
 
@@ -79,6 +81,10 @@ bool LocalNvmeDirectRegistry::open_one(const LocalNvmeDirectConfig& cfg,
         return false;
     }
 
+    // Persist `disk` so we can hand it to the C++ Controller below
+    // (its wrap ctor needs the GET_DEV_INFO data we just got).
+    struct disk d_for_wrap = d;
+
     // /dev/ssnvme<minor> -- nvm_controller_init_b3 doesn't surface
     // the minor explicitly today; in v0.1 we rely on disk_name like
     // "snvme0n1" to derive it (legacy convention).  Fallback to
@@ -136,6 +142,40 @@ bool LocalNvmeDirectRegistry::open_one(const LocalNvmeDirectConfig& cfg,
     caps.max_queue_count  = bp->max_queues_per_group;
     caps.page_size        = bp->page_size;
 
+    // R5b: optional NvmeQueueGroup so upper layers can reach
+    // d_qps[] for on-GPU NVMe submit kernels.  Skipped by default
+    // to avoid forcing every caller to allocate user queues / GPU
+    // queue rings; nvme_storage's GPU-side smoke flips this on.
+    if (cfg.build_queue_group) {
+        const uint32_t nq = cfg.num_user_queues > 0 ? cfg.num_user_queues : 4;
+        const uint32_t qd = cfg.queue_depth > 0 ? cfg.queue_depth
+                                                : bp->queue_depth;
+        if (qd == 0) {
+            std::fprintf(stderr,
+                "[direct-registry] build_queue_group: q_depth=0 (ctrl "
+                "didn't surface q_depth via GET_DEV_INFO?)\n");
+            nvm_ctrl_free(bp->ctrl);
+            bp->ctrl = nullptr;
+            return false;
+        }
+        try {
+            bp->queue_group = std::make_shared<NvmeQueueGroup>(
+                bp->ctrl,
+                d_for_wrap,
+                cfg.namespace_id,
+                (uint32_t)cfg.cuda_device,
+                nq,
+                qd);
+        } catch (const std::exception& ex) {
+            std::fprintf(stderr,
+                "[direct-registry] NvmeQueueGroup on pci=%s threw: %s\n",
+                bp->pci_addr.c_str(), ex.what());
+            nvm_ctrl_free(bp->ctrl);
+            bp->ctrl = nullptr;
+            return false;
+        }
+    }
+
     out.backend_private = std::move(bp);
     return true;
 }
@@ -150,9 +190,19 @@ void LocalNvmeDirectRegistry::close_locked() {
     for (auto it = slots_.rbegin(); it != slots_.rend(); ++it) {
         auto& slot = **it;
         auto& bp   = slot.backend_private;
-        if (bp && bp->ctrl != nullptr) {
-            nvm_ctrl_free(bp->ctrl);   // owner path: unbind + chrdev_remove
-            bp->ctrl = nullptr;
+        if (bp) {
+            // R5b: drop NvmeQueueGroup BEFORE nvm_ctrl_free.  The
+            // queue group's dtor cascades nvm_destroy_group +
+            // cudaFree on d_qps[]; those need the live ctrl handle.
+            // After .reset() returns, we own ctrl exclusively, so
+            // nvm_ctrl_free below still does the unbind+chrdev_remove
+            // cascade.
+            bp->queue_group.reset();
+
+            if (bp->ctrl != nullptr) {
+                nvm_ctrl_free(bp->ctrl);   // owner path: unbind + chrdev_remove
+                bp->ctrl = nullptr;
+            }
         }
     }
     slots_.clear();

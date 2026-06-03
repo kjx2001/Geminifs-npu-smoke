@@ -62,6 +62,37 @@ struct LocalNvmeDirectConfig {
     /// empty the registry synthesises something like
     /// "local_nvme @ 0000:08:00.0".
     std::string display_name;
+
+    /// R5b: build a NvmeQueueGroup around the brought-up ctrl so
+    /// upper layers can reach `d_qps[]` for on-GPU NVMe submit
+    /// kernels.
+    ///
+    /// When false, `LocalNvmeDevice::queue_group` stays null and
+    /// only the host-side blocking IO path through `nvme_storage`
+    /// is available.  Set to true when GPU-direct submit is needed.
+    bool        build_queue_group = false;
+
+    /// R5b: primary CUDA device for the queue group's d_qps /
+    /// per-queue ring allocations.  Ignored when
+    /// `build_queue_group=false`.
+    int32_t     cuda_device = 0;
+
+    /// R5b: number of user-queue pairs to allocate for this NVMe.
+    /// Each pair gives one extra concurrent IO slot for GPU
+    /// kernels.  Must be <= the user QID pool the kernel sized for
+    /// us (max_user_qid - start_cq_idx + 1) and <= max_queues_per_group.
+    /// Ignored when `build_queue_group=false`.
+    uint32_t    num_user_queues = 4;
+
+    /// R5b: SQ/CQ ring depth (power of 2).  0 means "use the
+    /// controller's reported max q_depth".
+    /// Ignored when `build_queue_group=false`.
+    uint32_t    queue_depth = 0;
+
+    /// R5b: namespace id used by user queue commands.  1 is the
+    /// usual default for single-namespace devices.
+    /// Ignored when `build_queue_group=false`.
+    uint32_t    namespace_id = 1;
 };
 
 class LocalNvmeDirectRegistry : public IDeviceRegistry {

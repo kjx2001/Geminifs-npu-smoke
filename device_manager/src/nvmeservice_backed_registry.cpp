@@ -10,6 +10,7 @@
  */
 
 #include "nvmeservice_backed_registry.h"
+#include "nvme_queue_group.h"            // R5b
 #include "../../io_engine/include/backend_type.h"
 
 #include <nvm_ctrl.h>
@@ -18,7 +19,10 @@
 #include "nvmeservice_client.h"   // backends/local/NVMeService/src/
 
 #include <cstdio>
+#include <cstring>
+#include <algorithm>
 #include <utility>
+#include <vector>
 
 namespace tutti {
 
@@ -137,6 +141,75 @@ bool NvmeServiceBackedRegistry::open_one(const NvmeServiceBackedRequest& req,
     caps.max_queue_count  = (size_t)bp->max_queues_per_group;
     caps.page_size        = bp->page_size;
 
+    // R5b: optional NvmeQueueGroup so upper layers can reach
+    // d_qps[] for on-GPU NVMe submit kernels.  In service mode the
+    // CLIENT itself runs nvm_create_group + nvm_add_user_queue
+    // against its own attach_client fd; the daemon does NOT share
+    // any GPU memory or queue handles -- it only handed out the
+    // chrdev/bind lease at Connect time.
+    if (req.build_queue_group) {
+        const uint32_t granted = (uint32_t)(sess->granted_queues > 0
+                                            ? sess->granted_queues
+                                            : (req.num_queues > 0 ? req.num_queues : 4));
+        const uint32_t nq = req.num_user_queues > 0
+                            ? std::min<uint32_t>(req.num_user_queues, granted)
+                            : granted;
+        const uint32_t qd = req.queue_depth > 0
+                            ? req.queue_depth
+                            : bp->queue_depth;
+        if (qd == 0) {
+            std::fprintf(stderr,
+                "[svc-registry] build_queue_group: q_depth=0 (attach_client "
+                "didn't surface q_depth?)\n");
+            nvm_ctrl_free_client(bp->ctrl);
+            bp->ctrl = nullptr;
+            return false;
+        }
+        if (nq == 0) {
+            std::fprintf(stderr,
+                "[svc-registry] build_queue_group: num_user_queues=0 "
+                "(daemon granted=%u, req.num_user_queues=%u)\n",
+                granted, req.num_user_queues);
+            nvm_ctrl_free_client(bp->ctrl);
+            bp->ctrl = nullptr;
+            return false;
+        }
+        const uint32_t ns_id = req.namespace_id > 0 ? req.namespace_id
+                                                    : bp->namespace_id;
+
+        // Synthesise a `disk` struct from the session payload.  The
+        // queue group only reads disk.{ns_id,block_size,disk_name,page_size}
+        // -- max_data_size is unused inside init.  disk_name is derived
+        // from the chrdev path ("/dev/ssnvme0" -> "snvme0n1") since
+        // attach_client never surfaced the block-device name.
+        struct disk d;
+        std::memset(&d, 0, sizeof(d));
+        d.page_size  = bp->page_size;
+        d.ns_id      = ns_id;
+        d.block_size = bp->blk_size;
+        const char* tail = bp->snvme_dev_path.c_str();
+        if (std::strncmp(tail, "/dev/s", 6) == 0) tail += 6;
+        std::snprintf(d.disk_name, sizeof(d.disk_name),
+                      "%sn%u", tail, ns_id);
+
+        try {
+            bp->queue_group = std::make_shared<NvmeQueueGroup>(
+                bp->ctrl,
+                d,
+                ns_id,
+                (uint32_t)req.cuda_device,
+                nq,
+                qd);
+        } catch (const std::exception& ex) {
+            std::fprintf(stderr,
+                "[svc-registry] NvmeQueueGroup on dev=%d threw: %s\n",
+                req.daemon_device_id, ex.what());
+            nvm_ctrl_free_client(bp->ctrl);
+            bp->ctrl = nullptr;
+            return false;
+        }
+    }
+
     out.backend_private = std::move(bp);
     return true;
 }
@@ -152,11 +225,18 @@ void NvmeServiceBackedRegistry::close_locked() {
         auto& slot = **it;
         auto& bp   = slot.backend_private;
 
-        if (bp && bp->ctrl != nullptr) {
-            // Client path: drop the libnvm attach (no unbind, no
-            // chrdev_remove -- that's the daemon's job).
-            nvm_ctrl_free_client(bp->ctrl);
-            bp->ctrl = nullptr;
+        if (bp) {
+            // R5b: drop NvmeQueueGroup BEFORE nvm_ctrl_free_client.
+            // The queue group's dtor cascades nvm_destroy_group +
+            // cudaFree on d_qps[]; those need the live ctrl handle.
+            bp->queue_group.reset();
+
+            if (bp->ctrl != nullptr) {
+                // Client path: drop the libnvm attach (no unbind, no
+                // chrdev_remove -- that's the daemon's job).
+                nvm_ctrl_free_client(bp->ctrl);
+                bp->ctrl = nullptr;
+            }
         }
         if (slot.session != nullptr) {
             // Session dtor sends Disconnect RPC to the daemon.

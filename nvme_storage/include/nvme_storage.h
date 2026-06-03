@@ -12,8 +12,8 @@
  *     of the snvme block device, but exposes only a flat "named
  *     file" API.  No filesystem-specific concept leaks out.
  *   - Provides host-side blocking IO (for bootstrap / metadata /
- *     tests) and -- in a follow-up R5b -- device-side submission
- *     primitives that io_engine kernels call inline.
+ *     tests) and -- as of R5b -- device-side submission primitives
+ *     that io_engine kernels call inline.
  *
  * Layer boundary:
  *   - This header MUST NOT pull in libnvm headers; we want callers
@@ -37,12 +37,15 @@
  * Threading:
  *   - Public methods are thread-safe; v0.1 uses a single std::mutex.
  *
- * Deferred to R5b:
- *   - acquire_queue_pair / release_queue_pair (host-side handle to
- *     a libnvm SQ/CQ pair the GPU kernel will write into).
- *   - __device__ submit_read_one / submit_write_one (device-side
- *     submit functions called inline from io_engine kernels).
- *   - NvmeFileDeviceHandle (GPU-resident mirror of NvmeFile).
+ * Deferred to R5b: (DONE)
+ *   - acquire_queue_pair / release_queue_pair: subsumed by giving
+ *     out NvmeFileDeviceHandle that already references the
+ *     controller's d_qps[] pool.  Host never touches a queue pair
+ *     by handle.
+ *   - __device__ submit_read_one / submit_write_one: in
+ *     `nvme_storage_device.cuh`, callable from any kernel.
+ *   - NvmeFileDeviceHandle: in `nvme_file_device_handle.h`,
+ *     produced by acquire_device_handle() below.
  */
 
 #include <cstddef>
@@ -56,6 +59,7 @@
 namespace tutti {
 
 struct Device;
+struct NvmeFileDeviceHandle;       // nvme_file_device_handle.h
 
 class INvmeStorage {
 public:
@@ -138,6 +142,47 @@ public:
     /// fsync the file (data + metadata).  Useful when callers want
     /// a flush point without closing.
     virtual bool    sync(NvmeFile* file) = 0;
+
+    // ------------------------------------------------------------------
+    // GPU device-side submit (R5b)
+    //
+    // These DO NOT open or create a file -- the file is already in the
+    // directory (created via `create_file` / re-opened via `open_file`
+    // above).  Acquire / release a GPU-side *view* (a small POD living
+    // in GPU memory) that lets a kernel submit reads/writes against
+    // the file's LBA extents through the NVMe queue group's d_qps.
+    // Naming intentionally avoids "open" so this isn't confused with
+    // the directory-level open_file.
+    //
+    // acquire_device_handle   cudaMalloc + cudaMemcpy a
+    //                         NvmeFileDeviceHandle onto the file's
+    //                         owning device's GPU.  The returned
+    //                         pointer lives in GPU memory; pass it to
+    //                         a kernel and call submit_read_one /
+    //                         submit_write_one on it (see
+    //                         nvme_storage_device.cuh).
+    //
+    //                         Returns nullptr if:
+    //                           - the device has no NvmeQueueGroup
+    //                             (its registry was opened with
+    //                             build_queue_group=false).
+    //                           - cudaMalloc / cudaMemcpy fails.
+    //
+    // release_device_handle   cudaFree the handle.  No-op on
+    //                         nullptr.  Idempotent.
+    //
+    // Lifetime: the handle is valid as long as the underlying
+    // NvmeFile is alive AND the device's queue_group is alive.  In
+    // practice that means: don't outlive the storage subsystem
+    // shutdown.
+    //
+    // R6 note: the unified "POSIX-style open that yields both host
+    // and GPU views" lives at the block_storage layer; this acquire
+    // pair is its building block.
+    // ------------------------------------------------------------------
+
+    virtual NvmeFileDeviceHandle* acquire_device_handle (NvmeFile* file)             = 0;
+    virtual void                  release_device_handle(NvmeFileDeviceHandle* dh)   = 0;
 };
 
 } // namespace tutti

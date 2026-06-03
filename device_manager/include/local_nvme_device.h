@@ -46,6 +46,8 @@ class NvmeServiceClient;          // src/nvmeservice_client.h
 
 namespace tutti {
 
+class NvmeQueueGroup;             // device_manager/include/nvme_queue_group.h
+
 /// Bring-up mode for a LocalNvmeDevice.  Mirrors RuntimeConfig's
 /// DeviceManagerMode but at the per-Device level so a future
 /// IDeviceRegistry could mix modes if it wanted to.
@@ -64,6 +66,28 @@ struct LocalNvmeDevice {
     // ---- libnvm handle ----
     nvm_ctrl_t*  ctrl = nullptr;
     LocalNvmeAttachMode attach_mode = LocalNvmeAttachMode::DIRECT;
+
+    // ---- libnvm C++ wrapper for GPU-side d_qps[] (R5b) ----
+    //
+    // When set, owns a NvmeQueueGroup that wraps `ctrl` above and
+    // exposes `d_qps()` -- the GPU-resident QueuePair[] kernels use
+    // for direct NVMe submit.
+    //
+    // Non-null only when:
+    //   - the registry that produced this device was opened with
+    //     `build_queue_group=true` in its config, AND
+    //   - `nvme_create_group` + `nvm_add_user_queue` succeeded on
+    //     this controller's fd.
+    //
+    // Works the same way under DIRECT mode (ctrl came from
+    // nvm_controller_init_b3) or SERVICE_CLIENT mode (ctrl came
+    // from nvm_ctrl_attach_client) -- the queue group is per-fd,
+    // not per-process.
+    //
+    // Lifetime: destroyed by the registry BEFORE freeing `ctrl`,
+    // so nvm_destroy_group + cudaFree d_qps run while ctrl is
+    // still alive.
+    std::shared_ptr<NvmeQueueGroup> queue_group;
 
     // ---- Disk metadata (NVM_GET_DEV_INFO) ----
     uint32_t     namespace_id = 1;

@@ -64,6 +64,35 @@ struct NvmeServiceBackedRequest {
 
     /// Optional label that surfaces as Device::display_name.
     std::string display_name;
+
+    /// R5b: build a NvmeQueueGroup around the attach_client'd ctrl
+    /// so upper layers can reach `d_qps[]` for on-GPU NVMe submit
+    /// kernels.  In service mode this means the *client* itself runs
+    /// nvm_create_group + nvm_add_user_queue against its own
+    /// attach_client fd; the daemon does NOT share any GPU memory
+    /// or queue handles -- it only handed out the chrdev/bind lease.
+    ///
+    /// When false, `LocalNvmeDevice::queue_group` stays null and only
+    /// host-side blocking IO through `nvme_storage` is available.
+    bool        build_queue_group = false;
+
+    /// R5b: number of user-queue pairs the client will create on
+    /// its own attach_client fd via nvm_add_user_queue.  MUST be
+    /// <= the daemon-granted lease quota (`num_queues` above) and
+    /// <= max_queues_per_group.  If 0, defaults to `num_queues`
+    /// (use the full quota).
+    /// Ignored when `build_queue_group=false`.
+    uint32_t    num_user_queues = 0;
+
+    /// R5b: SQ/CQ ring depth (power of 2).  0 means "use the
+    /// controller's reported max q_depth from attach_client".
+    /// Ignored when `build_queue_group=false`.
+    uint32_t    queue_depth = 0;
+
+    /// R5b: namespace id used by user queue commands.  0 means
+    /// "use whatever attach_client surfaced".
+    /// Ignored when `build_queue_group=false`.
+    uint32_t    namespace_id = 0;
 };
 
 class NvmeServiceBackedRegistry : public IDeviceRegistry {

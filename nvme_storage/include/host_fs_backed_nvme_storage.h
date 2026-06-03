@@ -102,6 +102,9 @@ public:
     ssize_t   write_blocking(NvmeFile*, uint64_t off, const void* src, size_t len) override;
     bool      sync(NvmeFile*) override;
 
+    NvmeFileDeviceHandle* acquire_device_handle (NvmeFile* file)            override;
+    void                  release_device_handle(NvmeFileDeviceHandle* dh)  override;
+
 private:
     struct PerDeviceState {
         const Device*                       device = nullptr;
