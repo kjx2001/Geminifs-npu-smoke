@@ -240,6 +240,59 @@ is documented as a §7.3.1 trap.
       `snvme_smoke_addq.c` / `snvme_smoke_gpu.cu` / `snvme_smoke_qgroup.c`,
       and PORTING.md §4.2 (chrdev minor allocation).
 
+## nvme_storage — Durability follow-ups
+
+`PersistentFileLog::persist()` is atomic per write (tmp → fsync →
+rename), and bootstrap runs a C0 reconcile pass that drops
+tombstone entries (log entry but no `<name>.bin`) and unlinks
+ghost `.bin` files (file but no log entry). That covers the
+practical user-visible damage from a crash mid-create / mid-delete.
+
+R5a.1 also added `create_file(persist_now, sync_now)` + a
+`flush_metadata(device)` API so bulk-init workloads (e.g. LMCache
+provisioning N=10^6 KV-shard files at startup) can collapse the
+otherwise-O(N²) total log write and per-file fsync down to one
+syncfs(2) + one log rewrite.  See
+`nvme_storage/test/nvme_storage_bulk_smoke.cu` for the
+"per-call durable vs deferred" wall-time comparison.
+
+What's still missing is genuine transactionality on the
+`(host_fs op ↔ log persist)` pair. The two follow-ups below close
+that hole at increasing levels of strictness; do them only when
+real workload pressure shows up (concurrent create+crash, or
+write-amp from rewrite-on-every-persist).
+
+- [ ] **C1: tombstone-style intent on the entry.** Extend
+      `OnDiskEntry` with a `status` byte:
+      `PENDING_CREATE` / `COMMITTED` / `PENDING_DELETE`. Reorder
+      `create_file` to log.add(PENDING_CREATE) + persist BEFORE
+      the host pwrite/fsync, then flip to COMMITTED and persist
+      again after fsync succeeds; reorder `delete_file`
+      symmetrically (PENDING_DELETE first, ::unlink, then
+      log.remove + persist). Reconcile then has authoritative
+      state to drive: `PENDING_CREATE` means "host fs not
+      committed, drop entry"; `PENDING_DELETE` means "complete the
+      ::unlink, then drop entry". One ABI bump
+      (`OnDiskHeader::version` 1 → 2 + a forward-compat reader for
+      v1). Estimated ~150 LoC + a recovery-mode smoke
+      (kill -9 mid-create / mid-delete, rerun bootstrap).
+
+- [ ] **C2: append-only write-ahead log (WAL).** Replace
+      `rewrite-on-every-persist` with a `<mount>/.tutti/file_log.wal`
+      append-only stream of `{op, file_id, name, extents}` records
+      plus periodic compaction into `file_log.bin`. Each `add` /
+      `remove` writes one record + fsync (constant-cost, no
+      O(N) rewrite); recovery replays WAL onto the snapshot.
+      Required if the directory ever gets large (thousands of
+      entries) and the rewrite cost shows up in create_file
+      latency. Carries the C1 status field semantics inside each
+      WAL record. Estimated ~400 LoC + replay smoke.
+
+Both items strictly subsume C0 — the bootstrap reconcile becomes
+unnecessary once the on-disk format is intent-logged. Until then,
+C0 is good enough to keep the user-visible directory clean across
+process crashes.
+
 ## Discussion Required Before Major Refactor
 
 - [x] Decide the future runtime/product name — `Tutti`, recorded in

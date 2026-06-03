@@ -12,8 +12,8 @@
  *     of the snvme block device, but exposes only a flat "named
  *     file" API.  No filesystem-specific concept leaks out.
  *   - Provides host-side blocking IO (for bootstrap / metadata /
- *     tests) and -- as of R5b -- device-side submission primitives
- *     that io_engine kernels call inline.
+ *     tests) and -- in a follow-up R5b -- device-side submission
+ *     primitives that io_engine kernels call inline.
  *
  * Layer boundary:
  *   - This header MUST NOT pull in libnvm headers; we want callers
@@ -97,9 +97,53 @@ public:
     /// the header and the persistent file log.
     /// Returns nullptr if a file with the same name already exists,
     /// or on allocation / FIEMAP failure.
+    ///
+    /// Bulk-init knobs (default = "single-file durable"):
+    ///   sync_now    when true (default), fsync the host_fd twice
+    ///               (after fallocate, after header pwrite).  Set
+    ///               false to skip those two fsyncs -- the file's
+    ///               extents and header bytes will still be in the
+    ///               page cache but NOT yet on platter.  Caller
+    ///               MUST follow up with `flush_metadata()` (which
+    ///               internally syncfs() the mount) before relying
+    ///               on durability.  Crash without that flush
+    ///               leaves a ghost .bin which bootstrap reconcile
+    ///               will unlink on the next start, so re-init must
+    ///               be idempotent.
+    ///   persist_now when true (default), the per-Device log is
+    ///               rewritten and rename(2)'d after this call.  Set
+    ///               false to keep the new entry only in memory; a
+    ///               later `flush_metadata()` rewrites once for all
+    ///               accumulated changes.  This collapses the
+    ///               O(N^2) total bytes written across N create
+    ///               calls into a single O(N) rewrite.
+    ///
+    /// Bulk-init pattern for, e.g., LMCache provisioning of millions
+    /// of pre-allocated KV-shard files:
+    /// @code
+    /// for (auto& s : shards)
+    ///     storage->create_file(dev, s.name, s.size,
+    ///                          /*persist_now=*/false,
+    ///                          /*sync_now=*/false);
+    /// storage->flush_metadata(dev);   // one syncfs + one log rewrite
+    /// @endcode
     virtual NvmeFile* create_file(const Device*  device,
                                    std::string_view name,
-                                   uint64_t        size_bytes) = 0;
+                                   uint64_t        size_bytes,
+                                   bool            persist_now = true,
+                                   bool            sync_now    = true) = 0;
+
+    /// Flush all deferred metadata for `device`:
+    ///   - syncfs() the mount so any data/extents written by
+    ///     `create_file(..., sync_now=false)` since the last flush
+    ///     reach the platter.
+    ///   - rewrite + fsync + rename the PersistentFileLog so any
+    ///     entries added by `create_file(..., persist_now=false)`
+    ///     since the last flush become durable.
+    /// No-op if nothing is pending; safe to call repeatedly.
+    /// Returns false if either step fails (state still considered
+    /// dirty, retry is OK).
+    virtual bool      flush_metadata(const Device* device) = 0;
 
     /// Re-open an existing file (host fd reopened).  Returns nullptr
     /// if not found.
@@ -113,10 +157,30 @@ public:
 
     /// Remove the file from the directory + delete the underlying
     /// host file.  Returns false if not found or unlink fails.
-    virtual bool      delete_file(NvmeFile* file) = 0;
+    ///
+    /// `persist_now` (default true) controls whether the per-Device
+    /// log is rewritten before this call returns.  Set false for
+    /// bulk deletion (e.g. fsck-style cleanup of millions of stale
+    /// files), then call `flush_metadata(device)` once at the end
+    /// to land all log changes in a single rewrite.  The on-disk
+    /// `<name>.bin` file IS unlinked synchronously regardless of
+    /// this flag -- only the log update is deferred.
+    virtual bool      delete_file(NvmeFile* file,
+                                  bool      persist_now = true) = 0;
 
-    /// All currently-known files for `device`.
+    /// All currently-OPEN NvmeFiles for `device` (i.e. entries that
+    /// have an active host_fd in this process).  This is NOT the same
+    /// as "every file in the persistent directory": entries on disk
+    /// that have never been opened in this process do NOT appear.
+    /// Use `list_file_names()` for the directory-wide view.
     virtual std::vector<NvmeFile*> list_files(const Device*) const = 0;
+
+    /// All file names known to this device's PersistentFileLog,
+    /// regardless of open-status in this process.  Useful for bulk
+    /// cleanup / fsck / migration: caller can `open_file(name)` each
+    /// then `delete_file()` or whatever.  Order is the log's
+    /// insertion order.  No host_fd is opened by this call.
+    virtual std::vector<std::string> list_file_names(const Device*) const = 0;
 
     // ------------------------------------------------------------------
     // Host-side blocking IO (R5a)

@@ -84,6 +84,34 @@ void prime_cuda(int cuda_dev) {
 
 constexpr uint64_t kSmokeFileBytes = 1024 * 1024;   // 1 MiB
 
+// Drop any "<prefix>*" stragglers from a previous aborted run on
+// every device so this run is idempotent.  Uses the bulk-delete
+// path (persist_now=false + flush_metadata) so a previous run that
+// died with N=20000 unsynced files in flight doesn't take minutes
+// to walk.
+void wipe_stragglers(tutti::HostFsBackedNvmeStorage& storage,
+                     const std::vector<const tutti::Device*>& devices,
+                     const std::string& prefix)
+{
+    std::size_t total = 0;
+    for (const auto* d : devices) {
+        std::size_t n_dev = 0;
+        for (const auto& nm : storage.list_file_names(d)) {
+            if (nm.rfind(prefix, 0) != 0) continue;
+            tutti::NvmeFile* f = storage.open_file(d, nm);
+            if (f == nullptr) continue;
+            if (storage.delete_file(f, /*persist_now=*/false)) ++n_dev;
+        }
+        if (n_dev > 0) (void)storage.flush_metadata(d);
+        total += n_dev;
+    }
+    if (total > 0) {
+        std::fprintf(stderr,
+            "[nvme_storage] pre-cleanup: removed %zu '%s*' straggler(s) "
+            "from previous run\n", total, prefix.c_str());
+    }
+}
+
 void fill_pattern(std::vector<uint8_t>& buf, uint64_t seed) {
     for (size_t i = 0; i < buf.size(); ++i) {
         buf[i] = (uint8_t)((seed + i) & 0xFFu);
@@ -129,6 +157,10 @@ int run(int cuda_dev, const std::vector<std::string>& pci_addrs,
     if (!storage.bootstrap(devices))
         STEP_FAIL("HostFsBackedNvmeStorage::bootstrap()");
     STEP_OK("HostFsBackedNvmeStorage bootstrap: mount_root=%s", mount_root.c_str());
+
+    // Idempotency: drop any "smoke_*" leftovers from a previous run
+    // that aborted before reaching delete_file.
+    wipe_stragglers(storage, devices, "smoke_");
 
     // [4] Capacity print.
     for (size_t i = 0; i < devices.size(); ++i) {

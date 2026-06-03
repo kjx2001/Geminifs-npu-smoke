@@ -100,9 +100,33 @@ set_target_properties(nvme_storage_gpu_smoke PROPERTIES
     INSTALL_RPATH "$ORIGIN/../lib"
 )
 
-install(TARGETS tutti_nvme_storage     DESTINATION "lib")
-install(TARGETS nvme_storage_smoke     DESTINATION "bin")
-install(TARGETS nvme_storage_gpu_smoke DESTINATION "bin")
+# ---------------------------------------------------------------------------
+# Smoke (R5a.1, bulk-init perf + recovery)
+# ---------------------------------------------------------------------------
+
+add_executable(nvme_storage_bulk_smoke
+    test/nvme_storage_bulk_smoke.cu
+)
+
+target_link_libraries(nvme_storage_bulk_smoke
+    PRIVATE
+        tutti_nvme_storage
+        tutti_device_manager
+        libnvm
+        CUDA::cudart
+)
+
+set_target_properties(nvme_storage_bulk_smoke PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+    BUILD_RPATH   "$ORIGIN/../lib"
+    INSTALL_RPATH "$ORIGIN/../lib"
+)
+
+install(TARGETS tutti_nvme_storage      DESTINATION "lib")
+install(TARGETS nvme_storage_smoke      DESTINATION "bin")
+install(TARGETS nvme_storage_gpu_smoke  DESTINATION "bin")
+install(TARGETS nvme_storage_bulk_smoke DESTINATION "bin")
 install(DIRECTORY include/ DESTINATION "include/tutti/nvme_storage"
         FILES_MATCHING PATTERN "*.h")
 install(DIRECTORY include/ DESTINATION "include/tutti/nvme_storage"

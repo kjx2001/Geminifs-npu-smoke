@@ -102,6 +102,38 @@ __global__ void submit_read_one_kernel(const tutti::NvmeFileDeviceHandle* dh,
 }
 
 // ----------------------------------------------------------------------------
+// Idempotency helper
+// ----------------------------------------------------------------------------
+//
+// Drop any "<prefix>*" stragglers from a previous aborted run so this
+// run can re-create the canonical names.  Uses the bulk-delete path
+// (persist_now=false + flush_metadata) so a previous run that died
+// with N >> 1 unsynced files in flight doesn't take minutes.
+static void wipe_stragglers(
+    tutti::HostFsBackedNvmeStorage& storage,
+    const std::vector<const tutti::Device*>& devices,
+    const std::string& prefix)
+{
+    std::size_t total = 0;
+    for (const auto* d : devices) {
+        std::size_t n_dev = 0;
+        for (const auto& nm : storage.list_file_names(d)) {
+            if (nm.rfind(prefix, 0) != 0) continue;
+            tutti::NvmeFile* f = storage.open_file(d, nm);
+            if (f == nullptr) continue;
+            if (storage.delete_file(f, /*persist_now=*/false)) ++n_dev;
+        }
+        if (n_dev > 0) (void)storage.flush_metadata(d);
+        total += n_dev;
+    }
+    if (total > 0) {
+        std::fprintf(stderr,
+            "[nvme_storage] pre-cleanup: removed %zu '%s*' straggler(s) "
+            "from previous run\n", total, prefix.c_str());
+    }
+}
+
+// ----------------------------------------------------------------------------
 // CLI parsing
 // ----------------------------------------------------------------------------
 static const char* arg_after(const char* a, const char* prefix) {
@@ -289,6 +321,10 @@ int main(int argc, char** argv) {
     auto storage = std::make_unique<tutti::HostFsBackedNvmeStorage>();
     if (!storage->bootstrap(devices)) STEP_FAIL("storage.bootstrap");
     STEP_OK("HostFsBackedNvmeStorage bootstrap");
+
+    // Idempotency: drop any "gpu_smoke_*" leftovers from a previous
+    // run that aborted before delete_file.
+    wipe_stragglers(*storage, devices, "gpu_smoke_");
 
     constexpr uint64_t kFileBytes = 1ull * 1024 * 1024;   // 1 MiB
     constexpr uint64_t kIoBytes   = 4096;                  // one NVMe block

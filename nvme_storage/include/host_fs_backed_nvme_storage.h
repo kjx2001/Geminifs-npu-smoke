@@ -91,12 +91,16 @@ public:
 
     NvmeFile* create_file(const Device*  device,
                           std::string_view name,
-                          uint64_t        size_bytes) override;
+                          uint64_t        size_bytes,
+                          bool            persist_now = true,
+                          bool            sync_now    = true) override;
+    bool      flush_metadata(const Device* device)  override;
     NvmeFile* open_file(const Device*    device,
                          std::string_view name) override;
     bool      close_file(NvmeFile* file) override;
-    bool      delete_file(NvmeFile* file) override;
-    std::vector<NvmeFile*> list_files(const Device*) const override;
+    bool      delete_file(NvmeFile* file, bool persist_now = true) override;
+    std::vector<NvmeFile*>   list_files     (const Device*) const override;
+    std::vector<std::string> list_file_names(const Device*) const override;
 
     ssize_t   read_blocking (NvmeFile*, uint64_t off, void*       dst, size_t len) override;
     ssize_t   write_blocking(NvmeFile*, uint64_t off, const void* src, size_t len) override;
@@ -116,6 +120,22 @@ private:
         // Did THIS bootstrap() perform the mount(2)?  Used to decide
         // whether shutdown() should umount(2).
         bool                                we_mounted = false;
+
+        // Bulk-init dirty flags (R5a.1):
+        //   dirty_unsynced_files   set whenever create_file(sync_now=false)
+        //                          accepted bytes/extents into the page
+        //                          cache without an fsync.  Cleared by a
+        //                          successful syncfs(2) inside
+        //                          flush_metadata().
+        //   dirty_unpersisted_log  set whenever create_file/delete_file
+        //                          mutated the log without a subsequent
+        //                          log.persist().  Cleared by a successful
+        //                          log.persist() inside flush_metadata().
+        // shutdown() also drains both flags (close_file fsyncs each
+        // host_fd individually, and the final s.log->persist() lands
+        // any deferred entries).
+        bool                                dirty_unsynced_files   = false;
+        bool                                dirty_unpersisted_log  = false;
     };
 
     PerDeviceState* find_state(const Device*);
@@ -128,7 +148,21 @@ private:
     bool create_file_locked(PerDeviceState& s,
                             std::string_view name,
                             uint64_t        size_bytes,
+                            bool            persist_now,
+                            bool            sync_now,
                             NvmeFile**      out);
+
+    // C0 reconcile (R5a.1): after PersistentFileLog::load_or_init,
+    // walk <mount>/.tutti/ to find:
+    //   - log entries whose <name>.bin is missing -> drop the entry
+    //     (tombstone left by a delete_file that crashed between
+    //      ::unlink and log.persist).
+    //   - <name>.bin files with no corresponding log entry -> unlink
+    //     them (ghost left by a create_file that crashed between
+    //      file pwrite/fsync and log.persist).
+    // If anything was changed, persist the log once.  Single-pass,
+    // best-effort; logs warnings but never fails bootstrap.
+    bool reconcile_locked_(PerDeviceState& s);
 
     // Helpers for snvme path conventions:  /dev/ssnvme<m> -> /dev/snvme<m>n1
     // and minor extraction for mount-point naming.

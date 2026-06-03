@@ -183,14 +183,23 @@ bool PersistentFileLog::add(Entry e) {
 }
 
 bool PersistentFileLog::remove(uint64_t file_id) {
+    // Linear scan to find the entry by file_id, then swap-and-pop
+    // to avoid the O(N) std::vector::erase + index rebuild that
+    // the original implementation incurred on every delete (which
+    // turned cleanup of N files into O(N^2) memory traffic).
+    //
+    // Stable insertion order is NOT a public invariant of this
+    // log -- on-disk recovery (load_or_init) and find_by_name
+    // both ignore order -- so swap-and-pop is safe here.
     for (std::size_t i = 0; i < entries_.size(); ++i) {
         if (entries_[i].file_id == file_id) {
             name_to_index_.erase(entries_[i].name);
-            entries_.erase(entries_.begin() + i);
-            // Rebuild index since we shifted everyone down.
-            for (std::size_t j = i; j < entries_.size(); ++j) {
-                name_to_index_[entries_[j].name] = j;
+            const std::size_t last = entries_.size() - 1;
+            if (i != last) {
+                entries_[i] = std::move(entries_[last]);
+                name_to_index_[entries_[i].name] = i;
             }
+            entries_.pop_back();
             return true;
         }
     }

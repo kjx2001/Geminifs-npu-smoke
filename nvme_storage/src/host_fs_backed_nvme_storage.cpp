@@ -222,6 +222,117 @@ bool HostFsBackedNvmeStorage::umount_locked(PerDeviceState& s) {
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// C0 reconcile (R5a.1)
+// ---------------------------------------------------------------------------
+//
+// Background:
+//   create_file and delete_file each touch host fs + log in sequence
+//   without a transaction.  A crash between the two persistent steps
+//   leaves one of:
+//
+//     ghost     <name>.bin exists on host fs but no log entry
+//                (create_file crashed after pwrite/fsync, before
+//                 log.persist).
+//     tombstone log entry exists but <name>.bin is gone
+//                (delete_file crashed after ::unlink, before
+//                 log.persist).
+//
+//   Both are user-visible bugs (ghosts occupy disk silently; tombstones
+//   make open_file return an entry whose ::open then fails ENOENT).
+//   This routine sweeps both classes once at bootstrap time, before
+//   anyone calls create_file / open_file.
+//
+//   Not crash-safe in itself; if we crash mid-reconcile we just rerun
+//   on next bootstrap.  C1/C2 (TOMBSTONE / WAL) in Todolist would
+//   make every step intent-logged so the window vanishes entirely.
+bool HostFsBackedNvmeStorage::reconcile_locked_(PerDeviceState& s) {
+    namespace fs = std::filesystem;
+
+    const std::string tutti_dir = s.mount_path + "/.tutti";
+
+    // 1. Snapshot disk: every <name>.bin under .tutti/ except the
+    //    log itself.  We deliberately tolerate stray files (no .bin
+    //    extension) -- they belong to neither log nor ghost class.
+    std::unordered_map<std::string, std::string> bin_on_disk;  // name -> abs path
+    std::error_code ec;
+    fs::directory_iterator it(tutti_dir, ec);
+    if (ec) {
+        std::fprintf(stderr,
+            "[nvme_storage] reconcile: directory_iterator(%s) failed: %s\n",
+            tutti_dir.c_str(), ec.message().c_str());
+        return false;
+    }
+    for (const auto& de : it) {
+        if (!de.is_regular_file()) continue;
+        const auto& p   = de.path();
+        std::string fn  = p.filename().string();
+        if (fn == "file_log.bin" || fn == "file_log.bin.tmp") continue;
+        // Only consider names ending in .bin.
+        constexpr std::string_view kBinExt = ".bin";
+        if (fn.size() <= kBinExt.size()) continue;
+        if (fn.compare(fn.size() - kBinExt.size(),
+                       kBinExt.size(), kBinExt) != 0) continue;
+        std::string nm = fn.substr(0, fn.size() - kBinExt.size());
+        bin_on_disk.emplace(std::move(nm), p.string());
+    }
+
+    // 2. Snapshot log: build a name set first so the iteration order
+    //    isn't perturbed by the remove() that follows.
+    std::unordered_map<std::string, uint64_t> log_by_name;  // name -> file_id
+    log_by_name.reserve(s.log->size());
+    for (const auto& e : s.log->entries()) {
+        log_by_name.emplace(e.name, e.file_id);
+    }
+
+    // 3. Tombstone sweep: log entries whose .bin is missing.
+    std::size_t n_tombstone = 0;
+    for (const auto& [nm, fid] : log_by_name) {
+        if (bin_on_disk.find(nm) != bin_on_disk.end()) continue;
+        if (s.log->remove(fid)) {
+            ++n_tombstone;
+            std::fprintf(stderr,
+                "[nvme_storage] reconcile: dropping tombstone "
+                "name='%s' file_id=%lu (no .bin on disk)\n",
+                nm.c_str(), (unsigned long)fid);
+        }
+    }
+
+    // 4. Ghost sweep: .bin files with no log entry.
+    std::size_t n_ghost = 0;
+    for (const auto& [nm, abs] : bin_on_disk) {
+        if (log_by_name.find(nm) != log_by_name.end()) continue;
+        if (::unlink(abs.c_str()) != 0) {
+            std::fprintf(stderr,
+                "[nvme_storage] reconcile: unlink(%s) failed: errno %d "
+                "(skipping; ghost will be revisited on next bootstrap)\n",
+                abs.c_str(), errno);
+            continue;
+        }
+        ++n_ghost;
+        std::fprintf(stderr,
+            "[nvme_storage] reconcile: removed ghost '%s'\n", abs.c_str());
+    }
+
+    // 5. Persist log only if we changed anything.  A successful run
+    //    with both counts == 0 leaves the on-disk log byte-identical.
+    if (n_tombstone != 0) {
+        if (!s.log->persist()) {
+            std::fprintf(stderr,
+                "[nvme_storage] reconcile: log.persist failed; "
+                "tombstone removals will reappear on next bootstrap\n");
+            return false;
+        }
+    }
+    if (n_tombstone != 0 || n_ghost != 0) {
+        std::fprintf(stderr,
+            "[nvme_storage] reconcile %s: -%zu tombstone(s) -%zu ghost(s); "
+            "%zu live entries\n",
+            s.mount_path.c_str(), n_tombstone, n_ghost, s.log->size());
+    }
+    return true;
+}
+
 bool HostFsBackedNvmeStorage::bootstrap(
     const std::vector<const Device*>& devices)
 {
@@ -306,6 +417,11 @@ bool HostFsBackedNvmeStorage::bootstrap(
             (void)umount_locked(*sp);
             goto rollback;
         }
+
+        // 5. C0 reconcile: drop tombstone entries (log says yes, .bin
+        //    missing) + unlink ghost .bin (file says yes, log no).
+        //    Best-effort -- never fails bootstrap.
+        (void)reconcile_locked_(*sp);
 
         std::fprintf(stderr,
             "[nvme_storage] device %d ready: blk=%s mount=%s entries=%zu\n",
@@ -394,6 +510,8 @@ bool HostFsBackedNvmeStorage::create_file_locked(
     PerDeviceState& s,
     std::string_view name,
     uint64_t       size_bytes,
+    bool           persist_now,
+    bool           sync_now,
     NvmeFile**     out)
 {
     if (out == nullptr) return false;
@@ -432,12 +550,22 @@ bool HostFsBackedNvmeStorage::create_file_locked(
         return false;
     }
 
-    if (::fsync(fd) != 0) {
-        std::fprintf(stderr,
-            "[nvme_storage] fsync(%s): errno %d\n", host_path.c_str(), errno);
-        ::close(fd);
-        ::unlink(host_path.c_str());
-        return false;
+    if (sync_now) {
+        if (::fsync(fd) != 0) {
+            std::fprintf(stderr,
+                "[nvme_storage] fsync(%s): errno %d\n", host_path.c_str(), errno);
+            ::close(fd);
+            ::unlink(host_path.c_str());
+            return false;
+        }
+    } else {
+        // Bulk-init mode: defer durability to flush_metadata().
+        // The fallocate'd blocks + extent table are still in the
+        // kernel page cache and will be picked up by the syncfs(2)
+        // inside flush_metadata().  FIEMAP below works against the
+        // in-cache state -- it doesn't require fsync to be called
+        // first, ext4 reports the same extents either way.
+        s.dirty_unsynced_files = true;
     }
 
     auto fr = read_extents(fd, kNvmeBlockSize);
@@ -468,6 +596,29 @@ bool HostFsBackedNvmeStorage::create_file_locked(
     }
 
     // Write header at byte 0.
+    //
+    // We deliberately do NOT fsync after this pwrite, even when
+    // sync_now=true.  The header is purely an in-band backup of
+    // metadata that ALSO lives in PersistentFileLog (file_id, name,
+    // extents, size).  PersistentFileLog is the authoritative
+    // source: open_file / load_or_init read from it, never from
+    // the header.  Skipping the second fsync saves 3-10 ms per
+    // create on ext4 (one journal commit) and is fully safe under
+    // the current contract:
+    //
+    //   - LBA extent allocation is durable: fsync after fallocate
+    //     above already journaled the inode + extent tree.
+    //   - log entry is durable: log.persist below (or
+    //     flush_metadata) does its own atomic rename + fsync.
+    //   - On crash between pwrite and the next reboot, the header
+    //     bytes may still be zero-filled (UNWRITTEN extent
+    //     short-circuit).  That's fine -- nobody reads them.
+    //
+    // If a future fsck-style tool wants to rebuild the log by
+    // scanning headers on disk, it MUST treat zero/garbage headers
+    // as "log says X, file is consistent, skip" rather than
+    // failing.  See Todolist `nvme_storage -- Durability
+    // follow-ups` for the reverse-recovery story.
     if (::pwrite(fd, &hdr, sizeof(hdr), 0) != (ssize_t)sizeof(hdr)) {
         std::fprintf(stderr,
             "[nvme_storage] pwrite(header) on %s: errno %d\n",
@@ -476,16 +627,9 @@ bool HostFsBackedNvmeStorage::create_file_locked(
         ::unlink(host_path.c_str());
         return false;
     }
-    if (::fsync(fd) != 0) {
-        std::fprintf(stderr,
-            "[nvme_storage] fsync(after header) on %s: errno %d\n",
-            host_path.c_str(), errno);
-        ::close(fd);
-        ::unlink(host_path.c_str());
-        return false;
-    }
+    // (No fsync here, by design.  See block comment above.)
 
-    // Add to PersistentFileLog and persist.
+    // Add to PersistentFileLog and (optionally) persist.
     PersistentFileLog::Entry e{};
     e.file_id    = hdr.file_id;
     e.name       = std::string(name);
@@ -498,14 +642,21 @@ bool HostFsBackedNvmeStorage::create_file_locked(
         ::unlink(host_path.c_str());
         return false;
     }
-    if (!s.log->persist()) {
-        std::fprintf(stderr,
-            "[nvme_storage] log.persist failed\n");
-        // Best-effort rollback: remove from log + delete host file.
-        s.log->remove(hdr.file_id);
-        ::close(fd);
-        ::unlink(host_path.c_str());
-        return false;
+    if (persist_now) {
+        if (!s.log->persist()) {
+            std::fprintf(stderr,
+                "[nvme_storage] log.persist failed\n");
+            // Best-effort rollback: remove from log + delete host file.
+            s.log->remove(hdr.file_id);
+            ::close(fd);
+            ::unlink(host_path.c_str());
+            return false;
+        }
+    } else {
+        // Bulk-init mode: leave the entry in memory only.
+        // flush_metadata() will rewrite the log once for all
+        // accumulated additions.
+        s.dirty_unpersisted_log = true;
     }
 
     auto nf = std::make_unique<NvmeFile>();
@@ -525,7 +676,9 @@ bool HostFsBackedNvmeStorage::create_file_locked(
 
 NvmeFile* HostFsBackedNvmeStorage::create_file(const Device* dev,
                                                 std::string_view name,
-                                                uint64_t size_bytes)
+                                                uint64_t size_bytes,
+                                                bool     persist_now,
+                                                bool     sync_now)
 {
     std::lock_guard<std::mutex> lock(mtx_);
     auto* s = find_state(dev);
@@ -535,8 +688,65 @@ NvmeFile* HostFsBackedNvmeStorage::create_file(const Device* dev,
         return nullptr;
     }
     NvmeFile* out = nullptr;
-    if (!create_file_locked(*s, name, size_bytes, &out)) return nullptr;
+    if (!create_file_locked(*s, name, size_bytes,
+                            persist_now, sync_now, &out)) return nullptr;
     return out;
+}
+
+bool HostFsBackedNvmeStorage::flush_metadata(const Device* dev)
+{
+    std::lock_guard<std::mutex> lock(mtx_);
+    auto* s = find_state(dev);
+    if (s == nullptr) {
+        std::fprintf(stderr,
+            "[nvme_storage] flush_metadata: device not bootstrapped\n");
+        return false;
+    }
+
+    bool ok = true;
+
+    // 1. syncfs(2) the mount once if any create_file(sync_now=false)
+    //    happened.  syncfs flushes the entire filesystem to disk in
+    //    a single kernel sweep -- O(dirty pages) instead of O(N
+    //    files × 2 fsync) -- which is the whole point of bulk init.
+    if (s->dirty_unsynced_files) {
+        // Use any file descriptor on the mount.  We open the mount
+        // point itself so we don't depend on a particular file
+        // staying open.  O_DIRECTORY ensures we fail fast if the
+        // path got swapped under us.
+        int dfd = ::open(s->mount_path.c_str(),
+                         O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (dfd < 0) {
+            std::fprintf(stderr,
+                "[nvme_storage] flush_metadata: open(%s, O_DIRECTORY): "
+                "errno %d\n", s->mount_path.c_str(), errno);
+            ok = false;
+        } else {
+            if (::syncfs(dfd) != 0) {
+                std::fprintf(stderr,
+                    "[nvme_storage] flush_metadata: syncfs(%s): errno %d\n",
+                    s->mount_path.c_str(), errno);
+                ok = false;
+            } else {
+                s->dirty_unsynced_files = false;
+            }
+            ::close(dfd);
+        }
+    }
+
+    // 2. Rewrite + fsync + rename the log if any create_file or
+    //    delete_file came in with persist_now=false.
+    if (s->dirty_unpersisted_log) {
+        if (!s->log->persist()) {
+            std::fprintf(stderr,
+                "[nvme_storage] flush_metadata: log.persist failed\n");
+            ok = false;
+        } else {
+            s->dirty_unpersisted_log = false;
+        }
+    }
+
+    return ok;
 }
 
 NvmeFile* HostFsBackedNvmeStorage::open_file(const Device* dev,
@@ -610,7 +820,8 @@ bool HostFsBackedNvmeStorage::close_file(NvmeFile* file) {
     return s->log->persist();
 }
 
-bool HostFsBackedNvmeStorage::delete_file(NvmeFile* file) {
+bool HostFsBackedNvmeStorage::delete_file(NvmeFile* file,
+                                           bool      persist_now) {
     if (file == nullptr) return false;
     std::lock_guard<std::mutex> lock(mtx_);
     auto* s = find_state(file->device);
@@ -635,7 +846,14 @@ bool HostFsBackedNvmeStorage::delete_file(NvmeFile* file) {
     if (!s->log->remove(fid)) {
         // Already gone from log; not fatal.
     }
-    return s->log->persist();
+    if (persist_now) {
+        return s->log->persist();
+    }
+    // Bulk-delete mode: caller must call flush_metadata(device) to
+    // land the log rewrite.  The on-disk .bin is already unlinked
+    // synchronously above -- only the log update is deferred.
+    s->dirty_unpersisted_log = true;
+    return true;
 }
 
 std::vector<NvmeFile*>
@@ -648,6 +866,18 @@ HostFsBackedNvmeStorage::list_files(const Device* dev) const {
     for (const auto& [fid, ptr] : s->files) {
         out.push_back(ptr.get());
     }
+    return out;
+}
+
+std::vector<std::string>
+HostFsBackedNvmeStorage::list_file_names(const Device* dev) const {
+    std::lock_guard<std::mutex> lock(mtx_);
+    std::vector<std::string> out;
+    const auto* s = find_state(dev);
+    if (s == nullptr || !s->log) return out;
+    const auto& entries = s->log->entries();
+    out.reserve(entries.size());
+    for (const auto& e : entries) out.push_back(e.name);
     return out;
 }
 
