@@ -29,7 +29,15 @@
 #include <linux/pci-p2pdma.h>
 #include <linux/device/driver.h>
 
-#include "asm/string_64.h"
+/*
+ * [SNVME-NPU 迁移修改 batch7] x86_64 专属头 → 架构中立头
+ * 原始 snvme 这里写的是 "asm/string_64.h"，那是 **x86_64 专属**头（提供
+ * memcpy/memset 等）。本机/原作者在 x86 上能编过；你的 NPU 服务器是 aarch64，
+ * 没有 string_64.h（fatal error: asm/string_64.h: No such file or directory）。
+ * 本文件实际只用到 memcpy/memset/strcmp 这些标准串操作，均由架构中立的
+ * <linux/string.h> 提供，故换成它——在 x86_64 和 aarch64 上都成立、与内核版本无关。
+ */
+#include <linux/string.h>
 #include "linux/device.h"
 #include "linux/idr.h"
 #include "linux/printk.h"
