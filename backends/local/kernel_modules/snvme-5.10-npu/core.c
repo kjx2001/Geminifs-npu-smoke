@@ -1987,7 +1987,13 @@ static int nvme_update_ns_info(struct nvme_ns *ns, struct nvme_id_ns *id)
 		nvme_mpath_revalidate_paths(ns);
 		blk_stack_limits(&ns->head->disk->queue->limits,
 				 &ns->queue->limits, 0);
+		/* [SNVME-NPU] 5.15→5.10：5.15 用 disk_update_readahead(disk)；
+		 * 5.10 是 blk_queue_update_readahead(queue)（参数是请求队列）。 */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5,15,0)
+		blk_queue_update_readahead(ns->head->disk->queue);
+#else
 		disk_update_readahead(ns->head->disk);
+#endif
 		blk_mq_unfreeze_queue(ns->head->disk->queue);
 	}
 	return 0;
