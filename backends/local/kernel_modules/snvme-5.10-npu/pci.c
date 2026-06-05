@@ -53,6 +53,33 @@
 #define DRIVER_NAME         "libsnvm helper"
 #define PCI_DRIVER_NAME		"snvme"
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5,15,0)
+/*
+ * [SNVME-NPU 迁移修改 batch8b] openEuler 5.10：device_driver_attach 的「隐式声明」
+ * --------------------------------------------------------------
+ * 报错：error: implicit declaration of function 'device_driver_attach'
+ *       （pci.c 第 ~5874 行，register_driver() 后把 snvme 绑到指定 PCI 设备的兜底）
+ *
+ * 性质：这是**编译期"缺原型声明"**，不是 modpost 的"符号未导出"。
+ *   device_driver_attach() 自内核 v5.5 起就存在、且是 EXPORT_SYMBOL_GPL，
+ *   openEuler 22.03-LTS(=5.10.0) 链接期一定有这个符号；只是它的**声明**在
+ *   openEuler 5.10 的头布局里没被 snvme 当前包含的头（<linux/device.h> /
+ *   <linux/device/driver.h>）带出来，于是编译器按 C 隐式规则报错。
+ *
+ * 为什么不换成 device_attach()：device_attach(dev) 会遍历总线上**所有**驱动找
+ *   最佳匹配来绑——而此刻系统自带的 stock `nvme` 驱动同样匹配 NVMe 设备，极可能
+ *   把设备**重新绑回 nvme**而不是 snvme，直接破坏 bring-up 的"接管"意图。所以
+ *   必须保留"绑**指定**驱动"的语义，即 device_driver_attach 本身。
+ *
+ * 修法：按它在内核里的权威原型，做一次**前置声明**补回原型即可（符号本身由内核
+ *   导出，链接期解析）。语义零改动、与 5.15 的 #else 完全一致。
+ *   —— 若 pull 重编后这条变成 modpost `"device_driver_attach" undefined!`，那才说明
+ *      openEuler 这台内核确实没导出它，届时再换"绑指定驱动"的等价实现；目前按
+ *      v5.5+ 通例它是导出的，先按"补声明"处理。
+ */
+extern int device_driver_attach(struct device_driver *drv, struct device *dev);
+#endif
+
 MODULE_IMPORT_NS(NVME_TARGET_PASSTHRU);
 
 static dev_t dev_first;
@@ -260,8 +287,30 @@ struct nvme_dev {
 
 static int io_queue_depth_set(const char *val, const struct kernel_param *kp)
 {
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5,15,0)
+	/*
+	 * [SNVME-NPU 迁移修改 batch8] openEuler 5.10 无 param_set_uint_minmax
+	 * --------------------------------------------------------------
+	 * 5.15 用 param_set_uint_minmax(val, kp, min, max) 一把校验 min/max。
+	 * openEuler 5.10 的内核**没有该导出符号**——依据：openEuler 自带的
+	 * drivers/nvme/host/pci.c 里 io_queue_depth_set 也**没用**它，而是手动
+	 * kstrtou32 校验后调 param_set_uint（见参照源）。所以这里照 5.10 的写法：
+	 * 自己 kstrtou32 解析 + 校验 [NVME_PCI_MIN_QUEUE_SIZE, NVME_PCI_MAX_QUEUE_SIZE]
+	 * （保持 snvme 原本的 min=2/max=4095 语义，openEuler 原版只校验 min，
+	 * 这里更严格地把 max 也校验上），再用通用的 param_set_uint 落值。
+	 */
+	int ret;
+	u32 n;
+
+	ret = kstrtou32(val, 10, &n);
+	if (ret != 0 || n < NVME_PCI_MIN_QUEUE_SIZE || n > NVME_PCI_MAX_QUEUE_SIZE)
+		return -EINVAL;
+
+	return param_set_uint(val, kp);
+#else
 	return param_set_uint_minmax(val, kp, NVME_PCI_MIN_QUEUE_SIZE,
 			NVME_PCI_MAX_QUEUE_SIZE);
+#endif
 }
 
 static inline unsigned int sq_idx(unsigned int qid, u32 stride)
