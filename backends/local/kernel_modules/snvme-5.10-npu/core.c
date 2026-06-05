@@ -12,6 +12,7 @@
 #include <linux/hdreg.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
+#include <linux/version.h>   /* [SNVME-NPU] LINUX_VERSION_CODE / KERNEL_VERSION：用于 5.10 与 5.15 的内核 API 差异条件编译 */
 #include <linux/backing-dev.h>
 #include <linux/slab.h>
 #include <linux/types.h>
@@ -135,7 +136,13 @@ static void nvme_set_queue_dying(struct nvme_ns *ns)
 	blk_set_queue_dying(ns->queue);
 	blk_mq_unquiesce_queue(ns->queue);
 
+	/* [SNVME-NPU] 5.15→5.10：set_capacity_and_notify() 是 5.12+ 才有的；
+	 * 5.10 用 set_capacity_revalidate_and_notify(disk, size, update_bdev)。 */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5,15,0)
+	set_capacity_revalidate_and_notify(ns->disk, 0, false);
+#else
 	set_capacity_and_notify(ns->disk, 0);
+#endif
 }
 
 void nvme_queue_scan(struct nvme_ctrl *ctrl)
@@ -390,7 +397,15 @@ EXPORT_SYMBOL_GPL(snvme_complete_rq);
 blk_status_t nvme_host_path_error(struct request *req)
 {
 	nvme_req(req)->status = NVME_SC_HOST_PATH_ERROR;
+	/* [SNVME-NPU] 5.15→5.10：blk_mq_set_request_complete() 是 5.13+ 才有的
+	 * 内联辅助，其实现就是把请求状态置为 MQ_RQ_COMPLETE。5.10 没有这个
+	 * 辅助，直接内联等价写法（req->state / MQ_RQ_COMPLETE 在 5.10 的
+	 * <linux/blk-mq.h> 里都是公开的）。 */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5,15,0)
+	WRITE_ONCE(req->state, MQ_RQ_COMPLETE);
+#else
 	blk_mq_set_request_complete(req);
+#endif
 	snvme_complete_rq(req);
 	return BLK_STS_OK;
 }
@@ -971,7 +986,15 @@ void snvme_cleanup_cmd(struct request *req)
 		if (req->special_vec.bv_page == ctrl->discard_page)
 			clear_bit_unlock(0, &ctrl->discard_page_busy);
 		else
+			/* [SNVME-NPU] 5.15→5.10：bvec_virt() 是 5.15 才引入的；
+			 * 5.10 手动算 page_address(bv_page)+bv_offset（与 openEuler
+			 * 5.10 nvme core.c 的 discard 释放写法一致）。 */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5,15,0)
+			kfree(page_address(req->special_vec.bv_page) +
+			      req->special_vec.bv_offset);
+#else
 			kfree(bvec_virt(&req->special_vec));
+#endif
 	}
 }
 EXPORT_SYMBOL_GPL(snvme_cleanup_cmd);
@@ -1045,6 +1068,18 @@ EXPORT_SYMBOL_GPL(snvme_setup_cmd);
 static int nvme_execute_rq(struct gendisk *disk, struct request *rq,
 		bool at_head)
 {
+	/* [SNVME-NPU] 5.15→5.10：5.15 的 blk_execute_rq(disk, rq, at_head)
+	 * 返回 blk_status_t；5.10 是 blk_execute_rq(q, disk, rq, at_head) 且
+	 * 返回 void——状态从 nvme_req(rq) 读（与 openEuler 5.10 __nvme_submit_
+	 * sync_cmd 的处理方式一致）。 */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5,15,0)
+	blk_execute_rq(rq->q, disk, rq, at_head);
+	if (nvme_req(rq)->flags & NVME_REQ_CANCELLED)
+		return -EINTR;
+	if (nvme_req(rq)->status)
+		return nvme_req(rq)->status;
+	return 0;
+#else
 	blk_status_t status;
 
 	status = blk_execute_rq(disk, rq, at_head);
@@ -1053,6 +1088,7 @@ static int nvme_execute_rq(struct gendisk *disk, struct request *rq,
 	if (nvme_req(rq)->status)
 		return nvme_req(rq)->status;
 	return blk_status_to_errno(status);
+#endif
 }
 
 /*
@@ -1274,7 +1310,13 @@ static void nvme_keep_alive_work(struct work_struct *work)
 
 	rq->timeout = ctrl->kato * HZ;
 	rq->end_io_data = ctrl;
+	/* [SNVME-NPU] 5.15→5.10：5.10 的 blk_execute_rq_nowait 多一个首参
+	 * request_queue*（签名 (q, disk, rq, at_head, done)）。 */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5,15,0)
+	blk_execute_rq_nowait(rq->q, NULL, rq, 0, nvme_keep_alive_end_io);
+#else
 	blk_execute_rq_nowait(NULL, rq, 0, nvme_keep_alive_end_io);
+#endif
 }
 
 static void nvme_start_keep_alive(struct nvme_ctrl *ctrl)
@@ -1844,11 +1886,23 @@ static void nvme_update_disk_info(struct gendisk *disk,
 			capacity = 0;
 	}
 
+	/* [SNVME-NPU] 5.15→5.10：set_capacity_and_notify → 5.10 的
+	 * set_capacity_revalidate_and_notify。 */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5,15,0)
+	set_capacity_revalidate_and_notify(disk, capacity, false);
+#else
 	set_capacity_and_notify(disk, capacity);
+#endif
 
 	nvme_config_discard(disk, ns);
+	/* [SNVME-NPU] 5.15→5.10：5.10 的 struct nvme_ctrl 没有 max_zeroes_sectors
+	 * 字段；smoke 读写测试不依赖 write-zeroes 上限，5.10 分支置 0 即可。 */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5,15,0)
+	blk_queue_max_write_zeroes_sectors(disk->queue, 0);
+#else
 	blk_queue_max_write_zeroes_sectors(disk->queue,
 					   ns->ctrl->max_zeroes_sectors);
+#endif
 
 	set_disk_ro(disk, (id->nsattr & NVME_NS_ATTR_RO) ||
 		test_bit(NVME_NS_FORCE_RO, &ns->flags));
@@ -1857,7 +1911,13 @@ static void nvme_update_disk_info(struct gendisk *disk,
 static inline bool nvme_first_scan(struct gendisk *disk)
 {
 	/* nvme_alloc_ns() scans the disk prior to adding it */
+	/* [SNVME-NPU] 5.15→5.10：disk_live() 是 5.15 才有的；5.10 直接判
+	 * GENHD_FL_UP 标志（与 openEuler 5.10 nvme core.c 一致）。 */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5,15,0)
+	return !(disk->flags & GENHD_FL_UP);
+#else
 	return !disk_live(disk);
+#endif
 }
 
 static void nvme_set_chunk_sectors(struct nvme_ns *ns, struct nvme_id_ns *id)
@@ -2805,6 +2865,25 @@ static inline u32 nvme_mps_to_sectors(struct nvme_ctrl *ctrl, u32 units)
 
 static int nvme_init_non_mdts_limits(struct nvme_ctrl *ctrl)
 {
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5,15,0)
+	/*
+	 * [SNVME-NPU] 5.15→5.10：
+	 *   (1) 5.10 内核 include/linux/nvme.h 没有 struct nvme_id_ctrl_nvm；
+	 *   (2) 5.10 的 struct nvme_ctrl 没有 max_zeroes_sectors 字段；
+	 *   (3) 5.10 mainline 本就不查 NVM 命令集 Identify(CNS=0x06) 取
+	 *       dmrl/dmrsl/wzsl。
+	 * 所以 5.10 分支只按 ONCS 设置 DSM(discard) 上限即可，跳过 CS_CTRL
+	 * identify。smoke 读写测试不依赖这些精细上限。
+	 */
+	if (ctrl->oncs & NVME_CTRL_ONCS_DSM) {
+		ctrl->max_discard_sectors = UINT_MAX;
+		ctrl->max_discard_segments = NVME_DSM_MAX_RANGES;
+	} else {
+		ctrl->max_discard_sectors = 0;
+		ctrl->max_discard_segments = 0;
+	}
+	return 0;
+#else
 	struct nvme_command c = { };
 	struct nvme_id_ctrl_nvm *id;
 	int ret;
@@ -2854,6 +2933,7 @@ static int nvme_init_non_mdts_limits(struct nvme_ctrl *ctrl)
 free_data:
 	kfree(id);
 	return ret;
+#endif
 }
 
 static int nvme_init_identify(struct nvme_ctrl *ctrl)
@@ -3814,8 +3894,18 @@ static void nvme_alloc_ns(struct nvme_ctrl *ctrl, unsigned nsid,
 	up_write(&ctrl->namespaces_rwsem);
 	nvme_get_ctrl(ctrl);
 
+	/* [SNVME-NPU] 5.15→5.10：5.15 的 device_add_disk() 返回 int（可判错）；
+	 * openEuler 5.10 的 device_add_disk() 返回 void（其带返回值的版本叫
+	 * device_add_disk_safe）。5.10 分支直接调用、不判返回值。 */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5,15,0)
+	device_add_disk(ctrl->device, ns->disk, nvme_ns_id_attr_groups);
+	if (0)	/* 5.10 device_add_disk 返回 void、不会失败；用 if(0) 保持
+		 * out_cleanup_ns_from_list 标签可达，避免 -Wunused-label。 */
+		goto out_cleanup_ns_from_list;
+#else
 	if (device_add_disk(ctrl->device, ns->disk, nvme_ns_id_attr_groups))
 		goto out_cleanup_ns_from_list;
+#endif
 
 	if (!nvme_ns_head_multipath(ns->head))
 		nvme_add_ns_cdev(ns);
@@ -4617,7 +4707,10 @@ static inline void _nvme_check_size(void)
 	BUILD_BUG_ON(sizeof(struct nvme_id_ns) != NVME_IDENTIFY_DATA_SIZE);
 	BUILD_BUG_ON(sizeof(struct nvme_id_ns_zns) != NVME_IDENTIFY_DATA_SIZE);
 	BUILD_BUG_ON(sizeof(struct nvme_id_ctrl_zns) != NVME_IDENTIFY_DATA_SIZE);
+	/* [SNVME-NPU] 5.10 内核头无 struct nvme_id_ctrl_nvm，仅在 5.15+ 校验 */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,15,0)
 	BUILD_BUG_ON(sizeof(struct nvme_id_ctrl_nvm) != NVME_IDENTIFY_DATA_SIZE);
+#endif
 	BUILD_BUG_ON(sizeof(struct nvme_lba_range_type) != 64);
 	BUILD_BUG_ON(sizeof(struct nvme_smart_log) != 512);
 	BUILD_BUG_ON(sizeof(struct nvme_dbbuf) != 64);

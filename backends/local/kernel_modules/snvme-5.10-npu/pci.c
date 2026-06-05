@@ -4,6 +4,7 @@
  */
 
 #include <linux/acpi.h>
+#include <linux/version.h>   /* [SNVME-NPU] 5.10/5.15 内核 API 差异条件编译 */
 #include <linux/aer.h>
 #include <linux/async.h>
 #include <linux/blkdev.h>
@@ -1482,7 +1483,12 @@ static enum blk_eh_timer_return nvme_timeout(struct request *req, bool reserved)
 	}
 
 	abort_req->end_io_data = NULL;
+	/* [SNVME-NPU] 5.15→5.10：blk_execute_rq_nowait 5.10 多一个首参 q。 */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5,15,0)
+	blk_execute_rq_nowait(abort_req->q, NULL, abort_req, 0, abort_endio);
+#else
 	blk_execute_rq_nowait(NULL, abort_req, 0, abort_endio);
+#endif
 
 	/*
 	 * The aborted req will be completed on receiving the abort req.
@@ -2707,9 +2713,16 @@ static int nvme_delete_queue(struct nvme_queue *nvmeq, u8 opcode)
 	req->end_io_data = nvmeq;
 
 	init_completion(&nvmeq->delete_done);
+	/* [SNVME-NPU] 5.15→5.10：blk_execute_rq_nowait 5.10 多一个首参 q。 */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5,15,0)
+	blk_execute_rq_nowait(req->q, NULL, req, false,
+			opcode == nvme_admin_delete_cq ?
+				nvme_del_cq_end : nvme_del_queue_end);
+#else
 	blk_execute_rq_nowait(NULL, req, false,
 			opcode == nvme_admin_delete_cq ?
 				nvme_del_cq_end : nvme_del_queue_end);
+#endif
 	return 0;
 }
 

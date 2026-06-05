@@ -3,6 +3,7 @@
  * Copyright (c) 2017-2018 Christoph Hellwig.
  */
 
+#include <linux/version.h>   /* [SNVME-NPU] 5.10/5.15 内核 API 差异条件编译 */
 #include <linux/backing-dev.h>
 #include <linux/moduleparam.h>
 #include <trace/events/block.h>
@@ -454,6 +455,52 @@ static void nvme_requeue_work(struct work_struct *work)
 
 int nvme_mpath_alloc_disk(struct nvme_ctrl *ctrl, struct nvme_ns_head *head)
 {
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5,15,0)
+	/*
+	 * [SNVME-NPU] 5.15→5.10：5.10 没有 blk_alloc_disk()（5.14 才引入，把
+	 * 建队列+建 gendisk 合并）。按 openEuler 5.10 nvme multipath.c 的写法：
+	 * blk_alloc_queue() 建队列 → alloc_disk(0) 建 gendisk → 手工挂 queue。
+	 * 同时保留 snvme 的磁盘命名 "snvme%dn%d"（与 in-tree nvme 隔离），并
+	 * 不设置 5.13 才有的 QUEUE_FLAG_NOWAIT。
+	 */
+	struct request_queue *q;
+	bool vwc = false;
+
+	mutex_init(&head->lock);
+	bio_list_init(&head->requeue_list);
+	spin_lock_init(&head->requeue_lock);
+	INIT_WORK(&head->requeue_work, nvme_requeue_work);
+
+	if (!(ctrl->subsys->cmic & NVME_CTRL_CMIC_MULTI_CTRL) || !multipath)
+		return 0;
+
+	q = blk_alloc_queue(ctrl->numa_node);
+	if (!q)
+		goto out;
+	blk_queue_flag_set(QUEUE_FLAG_NONROT, q);
+	/* set to a default value of 512 until the disk is validated */
+	blk_queue_logical_block_size(q, 512);
+	blk_set_stacking_limits(&q->limits);
+	if (ctrl->vwc & NVME_CTRL_VWC_PRESENT)
+		vwc = true;
+	blk_queue_write_cache(q, vwc, vwc);
+
+	head->disk = alloc_disk(0);
+	if (!head->disk)
+		goto out_cleanup_queue;
+	head->disk->fops = &nvme_ns_head_ops;
+	head->disk->private_data = head;
+	head->disk->queue = q;
+	head->disk->flags = GENHD_FL_EXT_DEVT;
+	sprintf(head->disk->disk_name, "snvme%dn%d",
+			ctrl->subsys->instance, head->instance);
+	return 0;
+
+out_cleanup_queue:
+	blk_cleanup_queue(q);
+out:
+	return -ENOMEM;
+#else
 	bool vwc = false;
 
 	mutex_init(&head->lock);
@@ -489,6 +536,7 @@ int nvme_mpath_alloc_disk(struct nvme_ctrl *ctrl, struct nvme_ns_head *head)
 		vwc = true;
 	blk_queue_write_cache(head->disk->queue, vwc, vwc);
 	return 0;
+#endif
 }
 
 static void nvme_mpath_set_live(struct nvme_ns *ns)
