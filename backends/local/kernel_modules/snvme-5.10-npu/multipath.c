@@ -87,7 +87,14 @@ void nvme_failover_req(struct request *req)
 
 	spin_lock_irqsave(&ns->head->requeue_lock, flags);
 	for (bio = req->bio; bio; bio = bio->bi_next)
+		/* [SNVME-NPU] 5.15→5.10：5.10 的 bio 用 bi_disk 关联磁盘
+		 * （5.14 才把 bi_disk/bi_partno 合并成 bi_bdev、引入 bio_set_dev），
+		 * 且 gendisk->part0 在 5.10 是内嵌 hd_struct（非 block_device*）。 */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5,15,0)
+		bio->bi_disk = ns->head->disk;
+#else
 		bio_set_dev(bio, ns->head->disk->part0);
+#endif
 	blk_steal_bios(&ns->head->requeue_list, req);
 	spin_unlock_irqrestore(&ns->head->requeue_lock, flags);
 
@@ -315,7 +322,12 @@ static bool nvme_available_path(struct nvme_ns_head *head)
 
 static blk_qc_t nvme_ns_head_submit_bio(struct bio *bio)
 {
+	/* [SNVME-NPU] 5.15→5.10：5.10 的 bio 没有 bi_bdev，用 bi_disk。 */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5,15,0)
+	struct nvme_ns_head *head = bio->bi_disk->private_data;
+#else
 	struct nvme_ns_head *head = bio->bi_bdev->bd_disk->private_data;
+#endif
 	struct device *dev = disk_to_dev(head->disk);
 	struct nvme_ns *ns;
 	blk_qc_t ret = BLK_QC_T_NONE;
@@ -331,10 +343,20 @@ static blk_qc_t nvme_ns_head_submit_bio(struct bio *bio)
 	srcu_idx = srcu_read_lock(&head->srcu);
 	ns = nvme_find_path(head);
 	if (likely(ns)) {
+		/* [SNVME-NPU] 5.15→5.10：bi_disk 关联磁盘；trace_block_bio_remap
+		 * 在 5.10 多一个首参 request_queue*。 */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5,15,0)
+		bio->bi_disk = ns->disk;
+		bio->bi_opf |= REQ_NVME_MPATH;
+		trace_block_bio_remap(bio->bi_disk->queue, bio,
+				      disk_devt(ns->head->disk),
+				      bio->bi_iter.bi_sector);
+#else
 		bio_set_dev(bio, ns->disk->part0);
 		bio->bi_opf |= REQ_NVME_MPATH;
 		trace_block_bio_remap(bio, disk_devt(ns->head->disk),
 				      bio->bi_iter.bi_sector);
+#endif
 		ret = submit_bio_noacct(bio);
 	} else if (nvme_available_path(head)) {
 		dev_warn_ratelimited(dev, "no usable path - requeuing I/O\n");
