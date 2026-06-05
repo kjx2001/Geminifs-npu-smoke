@@ -3,6 +3,7 @@
  * Copyright (c) 2011-2014, Intel Corporation.
  * Copyright (c) 2017-2021 Christoph Hellwig.
  */
+#include <linux/version.h>	/* [SNVME-NPU] 5.10/5.15 内核 API 差异条件编译 */
 #include <linux/ptrace.h>	/* for force_successful_syscall_return */
 #include <linux/nvme_ioctl.h>
 #include "nvme.h"
@@ -60,7 +61,15 @@ static int nvme_submit_user_cmd(struct request_queue *q,
 {
 	bool write = nvme_is_write(cmd);
 	struct nvme_ns *ns = q->queuedata;
+	/* [SNVME-NPU] 5.15→5.10：5.15 的 gendisk->part0 是 struct block_device*；
+	 * 5.10 的 gendisk->part0 是内嵌的 struct hd_struct（非指针），不能赋给
+	 * block_device*。5.10 改用 gendisk*，并通过 bio->bi_disk 关联 bio（5.14
+	 * 才把 bi_disk/bi_partno 合并成 bi_bdev、用 bio_set_dev）。 */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5,15,0)
+	struct gendisk *udisk = ns ? ns->disk : NULL;
+#else
 	struct block_device *bdev = ns ? ns->disk->part0 : NULL;
+#endif
 	struct request *req;
 	struct bio *bio = NULL;
 	void *meta = NULL;
@@ -80,9 +89,16 @@ static int nvme_submit_user_cmd(struct request_queue *q,
 		if (ret)
 			goto out;
 		bio = req->bio;
+		/* [SNVME-NPU] 5.15→5.10：bio 与磁盘的关联方式不同（见上方注释）。 */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5,15,0)
+		if (udisk)
+			bio->bi_disk = udisk;
+		if (udisk && meta_buffer && meta_len) {
+#else
 		if (bdev)
 			bio_set_dev(bio, bdev);
 		if (bdev && meta_buffer && meta_len) {
+#endif
 			meta = nvme_add_user_metadata(bio, meta_buffer, meta_len,
 					meta_seed, write);
 			if (IS_ERR(meta)) {
