@@ -53,33 +53,6 @@
 #define DRIVER_NAME         "libsnvm helper"
 #define PCI_DRIVER_NAME		"snvme"
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5,15,0)
-/*
- * [SNVME-NPU 迁移修改 batch8b] openEuler 5.10：device_driver_attach 的「隐式声明」
- * --------------------------------------------------------------
- * 报错：error: implicit declaration of function 'device_driver_attach'
- *       （pci.c 第 ~5874 行，register_driver() 后把 snvme 绑到指定 PCI 设备的兜底）
- *
- * 性质：这是**编译期"缺原型声明"**，不是 modpost 的"符号未导出"。
- *   device_driver_attach() 自内核 v5.5 起就存在、且是 EXPORT_SYMBOL_GPL，
- *   openEuler 22.03-LTS(=5.10.0) 链接期一定有这个符号；只是它的**声明**在
- *   openEuler 5.10 的头布局里没被 snvme 当前包含的头（<linux/device.h> /
- *   <linux/device/driver.h>）带出来，于是编译器按 C 隐式规则报错。
- *
- * 为什么不换成 device_attach()：device_attach(dev) 会遍历总线上**所有**驱动找
- *   最佳匹配来绑——而此刻系统自带的 stock `nvme` 驱动同样匹配 NVMe 设备，极可能
- *   把设备**重新绑回 nvme**而不是 snvme，直接破坏 bring-up 的"接管"意图。所以
- *   必须保留"绑**指定**驱动"的语义，即 device_driver_attach 本身。
- *
- * 修法：按它在内核里的权威原型，做一次**前置声明**补回原型即可（符号本身由内核
- *   导出，链接期解析）。语义零改动、与 5.15 的 #else 完全一致。
- *   —— 若 pull 重编后这条变成 modpost `"device_driver_attach" undefined!`，那才说明
- *      openEuler 这台内核确实没导出它，届时再换"绑指定驱动"的等价实现；目前按
- *      v5.5+ 通例它是导出的，先按"补声明"处理。
- */
-extern int device_driver_attach(struct device_driver *drv, struct device *dev);
-#endif
-
 MODULE_IMPORT_NS(NVME_TARGET_PASSTHRU);
 
 static dev_t dev_first;
@@ -5920,10 +5893,52 @@ static int snvm_rebind_driver(struct pci_device_addr dev_addr){
 		printk("device driver name: %s\n", dev_drv->name);
 	}
 	if (!dev_drv){
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5,15,0)
+		/*
+		 * [SNVME-NPU 迁移修改 batch8c] openEuler 5.10 未导出 device_driver_attach
+		 * --------------------------------------------------------------
+		 * batch8b 先按"缺原型"补了 extern，但 pull 重编后变成 modpost：
+		 *   ERROR: modpost: "device_driver_attach" [snvme.ko] undefined!
+		 * → 说明 openEuler 5.10 内核**根本没把这个符号导出**给模块（虽然 v5.5+
+		 *   mainline 是 EXPORT_SYMBOL_GPL，但 openEuler 这台裁掉了）。补声明能编
+		 *   不能链，此路不通。
+		 *
+		 * 目标不变：把**指定**的 snvme 驱动绑到这个已解绑的设备上，且**绝不能**
+		 *   误绑回系统自带、同样匹配 PCI_CLASS_STORAGE_EXPRESS 的 stock `nvme`。
+		 *   所以不能用 device_attach() 裸调（它会挑"任一"匹配驱动 → 可能绑回 nvme）。
+		 *
+		 * 改法：用 PCI 的 driver_override 机制——把 pdev->driver_override 钉成
+		 *   "snvme"，此后 PCI 总线匹配（pci_match_device）只认 name 等于该串的驱动、
+		 *   对其它驱动一律返回不匹配（连 stock nvme 也被排除）；再用**已导出**的
+		 *   device_attach() 触发一次匹配+probe，即只会绑上 snvme。
+		 *   - driver_override 是 struct pci_dev 自 v3.16 起就有的 char* 字段；
+		 *   - device_attach()/device_release_driver() 是成对的 EXPORT_SYMBOL_GPL，
+		 *     本文件解绑时已用 device_release_driver，故 device_attach 在 5.10 同样可链；
+		 *   - 钉住 override 还有附带好处：之后内核也不会再把该设备自动绑回 nvme，
+		 *     正合 bring-up"接管"意图（卸载时 pci_dev 释放会自动清掉它）。
+		 * device_attach 返回：1=已绑, 0=无匹配, <0=错误；这里规整成 0=成功。
+		 */
+		pdev->driver_override = kstrdup(PCI_DRIVER_NAME, GFP_KERNEL);
+		if (!pdev->driver_override){
+			ret = -ENOMEM;
+			printk("%s: driver_override kstrdup -ENOMEM\n", __func__);
+		}else{
+			ret = device_attach(&pdev->dev);
+			if (ret < 0){
+				printk("%s: device_attach %d\n", __func__, ret);
+			}else if (ret == 0){
+				printk("%s: device_attach found no matching driver\n", __func__);
+				ret = -ENODEV;
+			}else{
+				ret = 0; /* bound to snvme */
+			}
+		}
+#else
 		ret = device_driver_attach(&snvme_driver.driver, &pdev->dev);
 		if (ret){
 			printk("%s: device driver attach %d", __func__, ret);
 		}
+#endif
 	}
 	pci_dev_put(pdev);
 	return ret;
