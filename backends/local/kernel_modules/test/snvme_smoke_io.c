@@ -80,6 +80,33 @@
 /* templated and would drag in CUDA headers; the smoke is libc-only.   */
 /* ------------------------------------------------------------------ */
 
+/* ────────────────────────────────────────────────────────────
+ * 【结构体】struct nvme_sqe —— NVMe 提交队列条目（Submission Queue Entry）
+ * 【作用】用大白话说，这就是一条“硬盘命令单”。CPU 把要做的事（读/写哪个
+ *         LBA、数据放在哪块内存）按 NVMe 规范规定的二进制格式填进这 64 字节，
+ *         再拷进 SQ 环里，控制器（NVMe SSD 固件）就会读走并执行。
+ * 【字段】NVMe 把命令拆成 16 个 32 位“命令双字”CDW0..CDW15：
+ *   - opcode  ：操作码。0x01=Write，0x02=Read，0x00=Flush（见上方宏）。
+ *   - flags   ：CDW0 高位里的标志字节。本测试用它存 PSDT 位（数据指针类型，
+ *               PRP 还是 SGL，见下面 NVME_FLAG_PSDT_* 宏）。
+ *   - cid     ：command_id，命令编号。完成时控制器会在 CQE 里原样回显它，
+ *               让我们能把“哪条完成对应哪条提交”对上号。
+ *   - nsid    ：namespace id，命名空间编号（snvme 暴露的是 ns 1）。
+ *   - rsvd_2_3：CDW2-3 保留。
+ *   - metadata：元数据指针（本测试不用，置 0）。
+ *   - prp1    ：CDW6-7。数据缓冲指针 1。PRP 模式下是第一个数据页的 DMA 地址
+ *               （可带页内偏移）；SGL 模式下这里塞 SGL 描述符的低 64 位。
+ *   - prp2    ：CDW8-9。数据缓冲指针 2。PRP 模式下可能是第二个数据页的 DMA
+ *               地址、或一张“PRP List”页的地址、或 0（数据只占一页时）；
+ *               SGL 模式下塞 SGL 描述符的高 64 位。
+ *   - cdw10..cdw15：操作码相关。对 Read/Write：CDW10-11=SLBA（起始 LBA，
+ *               64 位），CDW12 低 16 位=NLB（块数，0 表示 1 块），其余是
+ *               保护信息/DSM 等本测试不用的字段。
+ * 【在测试中的角色】tq_submit_rw() 就是按这个布局手工填好一条 SQE 再发出去的。
+ * 【新手提示】PRP=Physical Region Page，NVMe 描述数据缓冲位置的方式，按物理
+ *   页一页一页地指。__attribute__((packed)) + 下面的 _Static_assert 保证它
+ *   恰好 64 字节、字段紧凑无填充，跟硬件期望的字节布局逐字节一致。
+ * ──────────────────────────────────────────────────────────── */
 struct nvme_sqe {
     /* CDW0 */
     uint8_t  opcode;
@@ -113,6 +140,30 @@ struct nvme_sqe {
 _Static_assert(sizeof(struct nvme_sqe) == NVME_SQE_SIZE,
                "nvme_sqe must be exactly 64 bytes");
 
+/* ────────────────────────────────────────────────────────────
+ * 【结构体】struct nvme_cqe —— NVMe 完成队列条目（Completion Queue Entry）
+ * 【作用】这是控制器执行完一条命令后写回给我们的“回执”，固定 16 字节。
+ *         控制器把它写进 CQ 环，我们在用户态轮询读取，从而知道命令做完了、
+ *         做成功没有、对应的是哪条命令。
+ * 【字段】
+ *   - result  ：DW0，命令相关的返回值（多数 Read/Write 用不到）。
+ *   - rsvd    ：DW1，保留。
+ *   - sq_head ：DW2 低 16 位。控制器告诉我们它已经消费到 SQ 的哪个位置
+ *               （SQ head 指针），用于流控（防止我们覆盖未读的 SQE）。
+ *   - sq_id   ：DW2 高 16 位。这条完成属于哪个提交队列。
+ *   - cid     ：DW3 低 16 位。原样回显当初 SQE 里的 command_id，我们用它
+ *               核对“提交—完成”配对是否正确。
+ *   - status  ：DW3 高 16 位。最关键的状态字：
+ *               * bit[0]   = phase bit（相位位），用来判断这一格是不是本圈
+ *                            刚写进来的“新”CQE（详见 struct test_queue）。
+ *               * bit[8:1] = SC（Status Code，状态码），0 表示成功。
+ *               * bit[11:9]= SCT（Status Code Type，状态码类型）。
+ * 【在测试中的角色】tq_poll_one() 轮询读它的 phase 位判断是否完成，format_status()
+ *   解析它的 SC/SCT 来报错，主流程比对它的 cid。
+ * 【新手提示】“轮询 CQ ring 的 phase bit”就是反复读 status 的 bit0，直到它
+ *   翻转成我们期待的值，说明控制器刚写了新回执——这是无中断模式下知道
+ *   IO 完成的标准手段。
+ * ──────────────────────────────────────────────────────────── */
 /* NVMe completion queue entry (NVMe 1.4 figure 39). */
 struct nvme_cqe {
     uint32_t result;        /* DW0: command-specific */
@@ -132,6 +183,15 @@ _Static_assert(sizeof(struct nvme_cqe) == NVME_CQE_SIZE,
 
 static int g_step = 0;
 
+/* ────────────────────────────────────────────────────────────
+ * 【函数】step_ok
+ * 【作用】打印一条“某个测试步骤通过”的日志（[ OK ] step=N ...），并把全局
+ *         步骤计数器 g_step 加 1。属于可变参数的格式化日志（像 printf）。
+ * 【参数】fmt + 后续可变参数：跟 printf 一样的格式串和实参，输出到 stderr。
+ * 【返回】无。
+ * 【在测试中的角色】每完成一个阶段就调一次，给人看进度；step 编号方便定位。
+ * 【新手提示】va_list/va_start/vfprintf 是 C 处理“…”可变参数的标准套路。
+ * ──────────────────────────────────────────────────────────── */
 static void step_ok(const char* fmt, ...) {
     va_list ap;
     g_step++;
@@ -142,6 +202,18 @@ static void step_ok(const char* fmt, ...) {
     fputc('\n', stderr);
 }
 
+/* ────────────────────────────────────────────────────────────
+ * 【函数】step_fail
+ * 【作用】打印一条“某步骤失败”的日志（[FAIL] step=N ...），附带 errno 和它
+ *         对应的文字说明，然后直接 exit(2) 终止整个测试程序。
+ * 【参数】
+ *   - err ：错误码（通常是失败时记下来的 errno；传 0 表示“无 errno”）。
+ *   - fmt + 可变参数：失败原因的格式化描述。
+ * 【返回】不返回——带 __attribute__((noreturn))，调用后进程就退出了。
+ * 【在测试中的角色】端到端测试的统一“失败即停”出口；任何一步对不上就在这里
+ *   报清楚是哪一步、什么 errno，退出码固定 2（见文件头说明）。
+ * 【新手提示】strerror(err) 把数字 errno 翻成人话（如 “Bad address”）。
+ * ──────────────────────────────────────────────────────────── */
 static void __attribute__((noreturn)) step_fail(int err, const char* fmt, ...) {
     va_list ap;
     g_step++;
@@ -153,11 +225,38 @@ static void __attribute__((noreturn)) step_fail(int err, const char* fmt, ...) {
     exit(2);
 }
 
+/* ────────────────────────────────────────────────────────────
+ * 【函数】parse_bdf
+ * 【作用】把命令行里形如 "0000:08:00.0" 的 PCI 地址字符串解析成结构体的四个
+ *         数字字段（domain:bus:slot.func，即 PCI 设备的“身份证号”BDF）。
+ * 【参数】
+ *   - s   ：输入字符串，格式 DDDD:BB:DD.F（十六进制）。
+ *   - out ：解析结果写到这里（domain/bus/slot/func 四个字段）。
+ * 【返回】0=成功解析出全部 4 段；-1=格式不对。
+ * 【在测试中的角色】main() 开头把用户给的 BDF 转成内核 ioctl 需要的结构体。
+ * 【新手提示】BDF = Bus:Device(Slot).Function，唯一标识一块 PCIe 设备；
+ *   sscanf 返回成功匹配的字段个数，这里要求正好 4 个。
+ * ──────────────────────────────────────────────────────────── */
 static int parse_bdf(const char* s, struct pci_device_addr* out) {
     return sscanf(s, "%x:%x:%x.%x",
                   &out->domain, &out->bus, &out->slot, &out->func) == 4 ? 0 : -1;
 }
 
+/* ────────────────────────────────────────────────────────────
+ * 【函数】do_ioctl
+ * 【作用】对 ioctl() 的一层薄封装：调用失败时自动打印“哪个 ioctl 失败 + 原因”，
+ *         并小心地把 errno 原样保留下来给调用方用。
+ * 【参数】
+ *   - fd   ：要操作的文件描述符（/dev/snvm_control 或 /dev/ssnvmeN）。
+ *   - req  ：ioctl 命令号（如 NVM_ADD_USER_QUEUE 等宏）。
+ *   - arg  ：指向命令参数结构体的指针，内核会读/写它。
+ *   - what ：人类可读的命令名字，仅用于出错时打日志。
+ * 【返回】透传 ioctl 的返回值：0/正数=成功，<0=失败（errno 已被保留）。
+ * 【在测试中的角色】贯穿全程，所有跟内核驱动打交道的 ioctl 都走它，省去
+ *   每处重复写错误打印。
+ * 【新手提示】ioctl 是用户态向设备驱动“下达带参数指令”的通用入口；fprintf
+ *   可能会改写 errno，所以这里先存 e、打完日志再 errno=e 还原。
+ * ──────────────────────────────────────────────────────────── */
 static int do_ioctl(int fd, unsigned long req, void* arg, const char* what) {
     int r = ioctl(fd, req, arg);
     if (r < 0) {
@@ -168,6 +267,16 @@ static int do_ioctl(int fd, unsigned long req, void* arg, const char* what) {
     return r;
 }
 
+/* ────────────────────────────────────────────────────────────
+ * 【函数】usage
+ * 【作用】打印命令行用法说明到 stderr，并强调这是“破坏性”操作（会真的往盘上
+ *         写数据），告知会写多少个 LBA、从哪个 LBA 起。
+ * 【参数】prog：程序名（argv[0]），用于拼出示例命令。
+ * 【返回】无。
+ * 【在测试中的角色】参数个数不对或用户加了 --help 时调用，提示正确用法。
+ * 【新手提示】LBA = Logical Block Address，硬盘上的逻辑块编号；本测试从
+ *   TEST_LBA_BASE（10 GiB 处）开始写，确认目标盘可随意覆盖才能跑。
+ * ──────────────────────────────────────────────────────────── */
 static void usage(const char* prog) {
     fprintf(stderr,
         "Usage: %s <PCI_BDF>\n"
@@ -180,6 +289,17 @@ static void usage(const char* prog) {
         (unsigned long long)TEST_LBA_BASE);
 }
 
+/* ────────────────────────────────────────────────────────────
+ * 【函数】round_up_pages
+ * 【作用】把字节数 n_bytes 向上取整到 page_size 的整数倍（向上对齐到整页）。
+ * 【参数】
+ *   - n_bytes  ：原始字节数。
+ *   - page_size：页大小（通常 4096 字节）。
+ * 【返回】对齐后的字节数（>= n_bytes 的最小整页倍数）。
+ * 【在测试中的角色】分配 SQ/CQ 环、数据缓冲前算实际要 mmap/对齐的大小；也用来
+ *   检查一个环是否会跨页（B3 单 PRP 限制要求环只占一页）。
+ * 【新手提示】公式 (n + p - 1) / p * p 是整数向上取整到 p 倍的经典写法。
+ * ──────────────────────────────────────────────────────────── */
 /*
  * Round n_bytes up to the nearest multiple of page_size.
  */
@@ -187,6 +307,19 @@ static size_t round_up_pages(size_t n_bytes, long page_size) {
     return ((n_bytes + page_size - 1) / page_size) * page_size;
 }
 
+/* ────────────────────────────────────────────────────────────
+ * 【函数】alloc_aligned
+ * 【作用】分配一块“按页对齐”的主机内存（首地址是 page_size 的整数倍），并清零。
+ *         适合当作 NVMe 的 SQ/CQ 环或数据页用。
+ * 【参数】
+ *   - bytes    ：需要的字节数（内部会先用 round_up_pages 向上取整到整页）。
+ *   - page_size：对齐粒度（页大小）。
+ * 【返回】成功返回对齐且清零的缓冲指针；失败返回 NULL。
+ * 【在测试中的角色】所有要交给控制器 DMA 的内存（环、wbuf/rbuf、PRP List 页）
+ *   都用它分配——必须页对齐，因为 PRP/环都是按物理页寻址的。
+ * 【新手提示】posix_memalign 保证返回地址按指定边界对齐；NVMe 的 PRP 要求数据
+ *   缓冲的 DMA 地址页对齐（PRP2 和 PRP List 尤其是低 12 位必须为 0）。
+ * ──────────────────────────────────────────────────────────── */
 /*
  * Allocate a page-aligned host buffer suitable for use as an NVMe
  * SQ/CQ ring or PRP1 data page.
@@ -207,6 +340,24 @@ static void* alloc_aligned(size_t bytes, long page_size) {
 /* the SQ ring before the controller sees the new tail.                */
 /* ------------------------------------------------------------------ */
 
+/* ────────────────────────────────────────────────────────────
+ * 【函数】mmio_writel
+ * 【作用】向一个 MMIO 地址（映射到 BAR0 的 doorbell 寄存器）写一个 32 位值，
+ *         写之前先插一道内存屏障。这就是“敲门铃（ring doorbell）”的动作。
+ * 【参数】
+ *   - addr ：volatile uint32_t* 指针，指向 mmap 进来的 BAR0 里某个 doorbell。
+ *   - value：要写入的值（SQ doorbell 写新的 tail；CQ doorbell 写新的 head）。
+ * 【返回】无。
+ * 【在测试中的角色】tq_submit_rw 写完 SQE 后用它敲 SQ doorbell 通知控制器“有
+ *   新命令了”；tq_poll_one 消费完 CQE 后用它敲 CQ doorbell 通知“我读到这了”。
+ * 【新手提示】
+ *   - doorbell（门铃）：BAR0 里的寄存器，CPU 写它来告诉控制器队列指针动了。
+ *   - MMIO：把设备寄存器映射进内存地址空间，用普通访存指令读写。BAR0 被
+ *     映射成不可缓存（noncached）的，所以一个 volatile 写就能直达设备。
+ *   - sfence：x86 的写屏障。先 sfence 再写 doorbell，保证我们刚拷进 SQ 环的
+ *     SQE 内容“先于”doorbell 对设备可见——否则控制器可能被门铃唤醒去读
+ *     一条还没写完的命令。非 x86 平台用 __atomic_thread_fence(RELEASE) 等效。
+ * ──────────────────────────────────────────────────────────── */
 static inline void mmio_writel(volatile uint32_t* addr, uint32_t value) {
 #if defined(__x86_64__) || defined(__i386__)
     __asm__ __volatile__ ("sfence" ::: "memory");
@@ -220,6 +371,34 @@ static inline void mmio_writel(volatile uint32_t* addr, uint32_t value) {
 /* Per-queue runtime state for the test driver.                       */
 /* ------------------------------------------------------------------ */
 
+/* ────────────────────────────────────────────────────────────
+ * 【结构体】struct test_queue —— 测试驱动里一对 SQ/CQ 队列的运行时状态
+ * 【作用】把“操作一对 NVMe IO 队列所需的全部信息”打包：环的地址、当前指针、
+ *         doorbell 地址、下一个命令号等。一个 test_queue 实例 = 一条可用队列。
+ * 【字段】
+ *   - qid     ：队列 ID（NVM_ADD_USER_QUEUE 建好后返回，如 37/38）。
+ *   - q_depth ：队列深度，即环里有多少个槽位；指针在 [0, q_depth) 间回绕。
+ *   - sq      ：SQ 环的主机虚拟地址。我们往这里写 SQE；控制器通过当初注册的
+ *               DMA 地址来读它。
+ *   - sq_tail ：SQ 尾指针。指向“下一条 SQE 要写入的槽位”。每提交一条就 +1
+ *               （模 q_depth），并把新值写进 SQ doorbell。
+ *   - cq      ：CQ 环的主机虚拟地址。控制器往这里写 CQE，我们轮询读。
+ *   - cq_head ：CQ 头指针。指向“下一条要读取的 CQE 槽位”。每消费一条就 +1
+ *               （模 q_depth），并把新值写进 CQ doorbell。
+ *   - cq_phase：我们当前“期待”的 phase bit 值（0 或 1）。CQ 环初始清零，
+ *               控制器第一圈把每格 phase 翻成 1；每当 cq_head 绕回 0（走完一
+ *               整圈），cq_phase 取反。读到的 CQE.status.phase == cq_phase
+ *               才算是本圈刚写入的新完成。这是无中断轮询判断“有没有新 CQE”
+ *               的核心机制。
+ *   - sq_db   ：SQ doorbell 寄存器指针，落在 mmap 进来的 BAR0 区域内。
+ *   - cq_db   ：CQ doorbell 寄存器指针，同样在 BAR0 内。
+ *   - next_cid：单调递增的命令号发号器，给每条新 SQE 分配 cid（不回收，
+ *               q_depth 足够大用不完）。
+ * 【在测试中的角色】tq_submit_rw / tq_poll_one 都围着它转：提交时动 sq_tail+敲
+ *   sq_db，完成时读 cq_phase/动 cq_head+敲 cq_db。
+ * 【新手提示】SQ tail（生产者写）与 CQ head（消费者读）是环形缓冲区的两个指针；
+ *   doorbell 就是把这两个指针的新值“告知”硬件的途径。
+ * ──────────────────────────────────────────────────────────── */
 struct test_queue {
     uint16_t            qid;
     uint16_t            q_depth;
@@ -243,6 +422,30 @@ struct test_queue {
     uint16_t            next_cid;
 };
 
+/* ────────────────────────────────────────────────────────────
+ * 【函数】tq_submit_rw
+ * 【作用】在指定队列上“提交”一条 Read 或 Write 命令。具体三步：①手工填好一条
+ *         nvme_sqe；②把它拷进 SQ 环的 sq_tail 槽位；③推进 sq_tail 并敲 SQ
+ *         doorbell 通知控制器。它是 CPU 亲手发 NVMe 命令的核心动作。
+ * 【参数】
+ *   - q             ：目标队列（提供环地址、sq_tail、sq_db、发号器）。
+ *   - opcode        ：0x01=Write / 0x02=Read。
+ *   - flags         ：CDW0 标志字节，主要承载 PSDT 位（PRP 还是 SGL）。
+ *   - nsid          ：namespace id（本测试恒为 1）。
+ *   - dptr0         ：填入 SQE.prp1 的值（PRP 模式=PRP1；SGL 模式=描述符低 64 位）。
+ *   - dptr1         ：填入 SQE.prp2 的值（PRP 模式=PRP2/PRP List 页地址/0；
+ *                     SGL 模式=描述符高 64 位）。调用方已按数据指针形式算好。
+ *   - slba          ：起始 LBA（拆进 CDW10/11）。
+ *   - nlb_zero_based：块数，0 表示 1 块（NVMe 的 NLB 是“个数减一”，填进 CDW12）。
+ *   - cid_out       ：若非 NULL，回传本次分配的 command_id，供完成时核对。
+ * 【返回】无（命令已写入环并敲过门铃；完成情况由 tq_poll_one 取）。
+ * 【在测试中的角色】Phase 5~7 每发一条 IO 都调它；通过传不同的 dptr0/dptr1/flags
+ *   覆盖 PRP1、PRP1+PRP2、PRP1+PRP List、SGL 各种数据指针形式。
+ * 【新手提示】
+ *   - “写 SQ 环”只是普通内存写；真正让控制器动起来的是随后的 doorbell。
+ *   - doorbell 写的是“新的 tail”，语义是“到这个位置之前的都是新命令，请取走”。
+ *   - mmio_writel 内含 sfence，确保 SQE 内容先于门铃对设备可见（顺序关键）。
+ * ──────────────────────────────────────────────────────────── */
 /*
  * Submit one Read/Write SQE on this queue.  Caller has already
  * computed the data pointer (PRP1/PRP2 or SGL1) and packed it into
@@ -311,6 +514,26 @@ static void tq_submit_rw(struct test_queue* q,
 #define NVME_SGL_DESC_BYTE15       (NVME_SGL_TYPE_DATA_BLOCK | \
                                     NVME_SGL_SUBTYPE_ADDR)
 
+/* ────────────────────────────────────────────────────────────
+ * 【函数】tq_poll_one
+ * 【作用】轮询等待这条队列上出现一条新的 CQE（即等一条命令完成）。读到后把它
+ *         拷出来、推进 cq_head（必要时翻转 cq_phase）、敲 CQ doorbell 告知控制器
+ *         “这一条我已消费”。
+ * 【参数】
+ *   - q          ：目标队列（提供 cq 环、cq_head、cq_phase、cq_db）。
+ *   - cqe_out    ：输出参数，成功时把读到的 CQE 整条拷进来。
+ *   - timeout_ms ：超时上限（毫秒），换算成内层自旋的最大迭代次数。
+ * 【返回】0=成功并已填好 *cqe_out；-ETIMEDOUT=超时内控制器一直没写新 CQE。
+ * 【在测试中的角色】每条 IO 提交后都调它等完成，是验证“CQE phase bit 正确、
+ *   command_id 回显正确、数据已落盘/取回”的同步点。
+ * 【新手提示】
+ *   - 判定“新 CQE”的办法：读当前 cq_head 槽位的 status，取 bit0=phase，若它
+ *     等于我们期待的 q->cq_phase，说明这格是本圈刚写入的新完成。
+ *   - cq_head 绕回 0（走完一圈）时 cq_phase 取反——因为环复用同一块内存，
+ *     靠 phase 翻转区分“上一圈的旧 CQE”和“这一圈的新 CQE”。
+ *   - 用 volatile 读 slot，防编译器把对设备会改写的内存读优化掉。
+ *   - 自旋时每 4096 次 sched_yield() 让出 CPU，避免空转独占一个核。
+ * ──────────────────────────────────────────────────────────── */
 /*
  * Wait for any CQE on this queue's CQ.  Returns 0 on success and fills
  * *cqe_out; returns -ETIMEDOUT if the controller never wrote one.
@@ -355,6 +578,19 @@ static int tq_poll_one(struct test_queue* q,
     }
 }
 
+/* ────────────────────────────────────────────────────────────
+ * 【函数】format_status
+ * 【作用】把 CQE 里的 16 位 status 状态字格式化成人类可读的字符串，拆出 SC
+ *         （状态码）和 SCT（状态码类型）方便排错。
+ * 【参数】
+ *   - status ：CQE.status 原始值。
+ *   - buf/cap：输出缓冲区及其容量。
+ * 【返回】无（结果写进 buf）。
+ * 【在测试中的角色】当某条 IO 返回非零 NVMe 状态（失败）时，用它生成可读信息
+ *   再交给 step_fail 打印。
+ * 【新手提示】先把 status 右移 1 位丢掉 bit0 的 phase 位（phase 在 tq_poll_one
+ *   里已用过），剩下低 8 位是 SC、再上 3 位是 SCT；SC=0 即表示命令成功。
+ * ──────────────────────────────────────────────────────────── */
 /* Pretty-print an NVMe status word.  Phase bit (bit 0) is masked out
  * since we already consumed it in tq_poll_one.                        */
 static void format_status(uint16_t status, char* buf, size_t cap) {
@@ -364,6 +600,47 @@ static void format_status(uint16_t status, char* buf, size_t cap) {
     snprintf(buf, cap, "0x%04x (SC=0x%02x SCT=0x%x)", status, sc, sct);
 }
 
+/* ────────────────────────────────────────────────────────────
+ * 【函数】main
+ * 【作用】整个端到端 NVMe IO 冒烟测试的总流程。从命令行拿一个 PCI BDF，把目标
+ *         NVMe 设备接管过来，在用户态建好 SQ/CQ 环和数据缓冲、建用户 IO 队列、
+ *         mmap BAR0 拿到 doorbell，然后亲手发一连串 Read/Write，校验数据往返
+ *         完整无误，最后干净拆除。任何一步不对就 step_fail 退出（码 2）。
+ * 【参数】argc/argv：argv[1] 是目标设备的 PCI 地址（DDDD:BB:DD.F）；--help 打用法。
+ * 【返回】0=全部步骤通过；1=用法错误；2=某步失败（由 step_fail 退出）。
+ * 【在测试中的角色】把下面所有函数/结构体串成完整剧本。各阶段：
+ *   - Phase 0：打开 /dev/snvm_control，建并打开字符设备 /dev/ssnvmeN（控制面）。
+ *   - Phase 1：建队列组（queue group）、设内核 IOQ 配额、绑定设备、取设备信息
+ *              （盘名、块大小、q_depth、doorbell 布局等），断言是 4KiB 块盘。
+ *   - Phase 2：分配并按页对齐 SQ/CQ 环 + wbuf/rbuf 数据页，全部用
+ *              NVM_MAP_HOST_MEMORY 注册（pin + 建立 DMA 映射）。数据缓冲特意用
+ *              map_kind=DATA + group_id=0 注册成“fd 作用域”，为 Phase 7(B6) 埋伏笔。
+ *   - Phase 3：NVM_ADD_USER_QUEUE 真正在控制器上建用户 IO 队列，并拿回每条队列
+ *              的 qid 与 SQ/CQ doorbell 在 BAR0 内的偏移。
+ *   - Phase 4：mmap BAR0，把 doorbell 偏移换算成可写指针，初始化各 test_queue
+ *              （cq_phase 初值=1，因为环已清零、控制器第一圈把 phase 翻成 1）。
+ *   - Phase 5：基础往返。写队列(Q0)逐个 LBA 写 1 块、读队列(Q1)读回同一 LBA 并
+ *              逐字节比对。验证 doorbell 可用、SQ/CQ 环放置正确、CQE phase 与
+ *              command_id 正确、PRP1 单页数据往返无损、两条队列互不串扰。
+ *   - Phase 5b：PRP1+PRP2 双 PRP，8KiB（2 页）IO。字节里混入页号，能抓到“控制器
+ *              把 page0 当成 PRP2”之类的页错位 bug。
+ *   - Phase 5c：PRP1 + PRP List，16KiB（4 页）IO。PRP2 指向一张页对齐的 PRP List
+ *              页，表内依次放数据页 1/2/3 的 DMA 地址。验证 >2 页时的 PRP List 形式。
+ *   - Phase 5d：SGL Data Block 描述符（PSDT=01b），仅当控制器在 Identify 里宣称
+ *              支持 SGL 时才跑，否则跳过。验证 SGL 这条数据指针路径也能往返。
+ *   - Phase 6：SQ tail 回绕压力测试。在 Q0 上连发 (q_depth+8) 条写，保证 sq_tail
+ *              至少绕过 q_depth-1 一整圈、CQ phase 翻转一次，验证回绕逻辑正确。
+ *   - Phase 7（B6）：销毁原队列组（应只回收 4 个 ring 映射，DATA 缓冲因挂在
+ *              own->data_maps 上而存活）；再新建组、新分配并注册全新环、重发
+ *              NVM_ADD_USER_QUEUE；用“跨组销毁后仍存活的同一对 wbuf/rbuf”做一次
+ *              4KiB 写读校验。验证 fd 作用域的数据缓冲跨 group 销毁依然有效可用。
+ *   - Phase 8：拆除。先 munmap BAR0（让 doorbell 指针失效，避免误写陈旧 tail），
+ *              再销毁（Phase 7 新建的）队列组，free 所有用户态内存，解绑设备、
+ *              关闭 fd、移除字符设备。剩余 DATA 映射在 close(fd_dev) 时统一回收。
+ * 【新手提示】整条链路：CPU 填 SQE → 写 SQ 环 → 敲 SQ doorbell → 控制器 DMA 读
+ *   SQE、按 PRP/SGL 搬数据、写 CQE → CPU 轮询 CQ 的 phase 位 → 敲 CQ doorbell。
+ *   这就是 NVMe 一来一回的完整生命周期，本测试把每个环节都验了一遍。
+ * ──────────────────────────────────────────────────────────── */
 int main(int argc, char** argv) {
     if (argc != 2 || strcmp(argv[1], "--help") == 0) {
         usage(argv[0]);

@@ -134,6 +134,29 @@ static constexpr size_t GPU_PAGE_SIZE = 1ULL << 16;     /* 64 KiB */
 /* fill the same struct that the controller will then read via DMA.   */
 /* ------------------------------------------------------------------ */
 
+/* ────────────────────────────────────────────────────────────
+ * 【结构体】struct nvme_sqe —— NVMe 提交队列条目（Submission Queue Entry）
+ * 【作用】描述一条要发给 NVMe 控制器的命令，固定 64 字节。GPU 核函数会
+ *         往 GPU 显存里的 SQ 环填这个结构，控制器再通过 DMA 把它读走执行。
+ * 【字段】
+ *   opcode    —— 命令操作码（0x01=写、0x02=读）。
+ *   flags     —— 命令标志位；高 2 位是 PSDT，决定用 PRP 还是 SGL 描述数据。
+ *   cid       —— Command ID，命令唯一编号；完成时 CQE 会带回同一个 cid 供匹配。
+ *   nsid      —— Namespace ID，目标命名空间（盘），本测试固定为 1。
+ *   rsvd_2_3  —— 保留字段。
+ *   metadata  —— 元数据指针（本测试不用）。
+ *   prp1/prp2 —— 数据缓冲的物理/IO 地址（PRP = Physical Region Page）。
+ *                Tier1 只用 prp1；Tier2 用 prp1+prp2；Tier3 prp2 指向 PRP_List。
+ *   cdw10..15 —— Command Dword 10~15，命令相关参数。读写命令里 cdw10/11 放
+ *                起始 LBA，cdw12 放“块数-1”(nlb_zero_based)。
+ * 【在测试中的角色】这是 GPU 与 NVMe 控制器之间的命令“信件格式”，必须和
+ *                 控制器约定的二进制布局严格一致，所以用 packed 且断言 64 字节。
+ * 【新手提示】NVMe 工作方式：主机把命令写进 SQ 环 → 敲门铃(doorbell)通知控制器
+ *           → 控制器执行 → 把结果写进 CQ 环。这里定义的就是“命令”那一半。
+ * 【NPU 迁移提示】结构体本身是 NVMe 协议规定的，与 GPU/NPU 无关，迁移时不用改；
+ *               但它会被 __device__/__global__ 核函数填写，那部分核函数迁移到
+ *               昇腾时要改成 Ascend C / AIV kernel（见 k_submit_rw）。
+ * ──────────────────────────────────────────────────────────── */
 struct nvme_sqe {
     uint8_t  opcode;
     uint8_t  flags;
@@ -154,6 +177,24 @@ struct nvme_sqe {
 static_assert(sizeof(nvme_sqe) == NVME_SQE_SIZE,
               "nvme_sqe must be exactly 64 bytes");
 
+/* ────────────────────────────────────────────────────────────
+ * 【结构体】struct nvme_cqe —— NVMe 完成队列条目（Completion Queue Entry）
+ * 【作用】控制器执行完一条命令后，往 GPU 显存里的 CQ 环写入这个结构，固定 16 字节。
+ *         GPU 轮询核函数读它来判断命令是否完成、成功还是失败。
+ * 【字段】
+ *   result  —— 命令特定返回值（读写命令一般为 0）。
+ *   rsvd    —— 保留字段。
+ *   sq_head —— 控制器已消费到的 SQ head 指针，用于回收 SQ 信用额度。
+ *   sq_id   —— 这条完成项对应哪个提交队列。
+ *   cid     —— 对应命令的 Command ID，与提交时的 cid 配对。
+ *   status  —— 状态字段。最低位是 phase bit（相位位），用于判断该槽是否是本轮新写入；
+ *              其余位是 SC(状态码)/SCT(状态码类型)，非 0 表示出错。
+ * 【在测试中的角色】这是命令完成的“回执”格式；k_poll_one 通过比对 phase bit
+ *                 判断有没有新回执，再用 status 判断成功失败。
+ * 【新手提示】phase bit 机制：CQ 是环形缓冲，每绕一圈期望相位翻转一次。控制器写新
+ *           条目时会把 phase 设成当前期望值，主机据此区分“新回执”和“上一圈的旧数据”。
+ * 【NPU 迁移提示】协议结构体，迁移昇腾时无需修改；读取它的轮询核函数才需要改写。
+ * ──────────────────────────────────────────────────────────── */
 struct nvme_cqe {
     uint32_t result;
     uint32_t rsvd;
@@ -172,6 +213,15 @@ static_assert(sizeof(nvme_cqe) == NVME_CQE_SIZE,
 
 static int g_step = 0;
 
+/* ────────────────────────────────────────────────────────────
+ * 【函数】step_ok
+ * 【作用】打印一条“[ OK ] step=N ...”的成功日志（带可变参数，像 printf）。
+ *         每调用一次全局步骤计数器 g_step 自增 1。
+ * 【参数】fmt + ... —— printf 风格的格式串和参数。
+ * 【返回】无。
+ * 【在测试中的角色】每完成一个验证步骤就调一次，给人看测试进度。
+ * 【新手提示】va_list/va_start/vfprintf 是 C 标准的可变参数转发写法。
+ * ──────────────────────────────────────────────────────────── */
 static void step_ok(const char* fmt, ...) {
     va_list ap;
     g_step++;
@@ -182,6 +232,17 @@ static void step_ok(const char* fmt, ...) {
     fputc('\n', stderr);
 }
 
+/* ────────────────────────────────────────────────────────────
+ * 【函数】step_fail
+ * 【作用】打印一条“[FAIL] step=N ...”的失败日志，附带 errno 解释，然后
+ *         直接 exit(2) 终止整个测试程序（noreturn，不会返回调用处）。
+ * 【参数】
+ *   err      —— errno 值；为 0 时打印 "n/a"，否则用 strerror 翻译成文字。
+ *   fmt + ... —— printf 风格的失败原因描述。
+ * 【返回】不返回（标记为 noreturn，进程退出码 2）。
+ * 【在测试中的角色】任何一步出错就调它，立即中止并报告是哪一步挂了。
+ * 【新手提示】退出码 2 在文件头注释里约定为“某个 smoke 步骤失败”。
+ * ──────────────────────────────────────────────────────────── */
 static void __attribute__((noreturn)) step_fail(int err, const char* fmt, ...) {
     va_list ap;
     g_step++;
@@ -201,11 +262,37 @@ static void __attribute__((noreturn)) step_fail(int err, const char* fmt, ...) {
         }                                                               \
     } while (0)
 
+/* ────────────────────────────────────────────────────────────
+ * 【函数】parse_bdf
+ * 【作用】把命令行里 "DDDD:BB:DD.F" 形式的 PCI 设备地址字符串解析成
+ *         struct pci_device_addr（域:总线:槽.功能）。
+ * 【参数】
+ *   s   —— 输入字符串，例如 "0000:08:00.0"。
+ *   out —— 输出结构体，填好 domain/bus/slot/func 四个字段。
+ * 【返回】0 表示解析成功（恰好填满 4 个字段），-1 表示格式不对。
+ * 【在测试中的角色】启动时把用户给的 BDF 转成内核 ioctl 需要的二进制地址。
+ * 【新手提示】BDF = Bus:Device.Function，是 PCI 设备在系统里的唯一定位编号。
+ * ──────────────────────────────────────────────────────────── */
 static int parse_bdf(const char* s, struct pci_device_addr* out) {
     return sscanf(s, "%x:%x:%x.%x",
                   &out->domain, &out->bus, &out->slot, &out->func) == 4 ? 0 : -1;
 }
 
+/* ────────────────────────────────────────────────────────────
+ * 【函数】do_ioctl
+ * 【作用】对内核字符设备发一个 ioctl 调用，并在失败时打印带名字的错误信息，
+ *         同时保留 errno 不被后续调用覆盖。
+ * 【参数】
+ *   fd   —— 已打开的设备文件描述符（/dev/snvm_control 或 /dev/ssnvmeN）。
+ *   req  —— ioctl 命令号（如 NVM_CREATE_QUEUE_GROUP 等）。
+ *   arg  —— 指向命令参数结构体的指针，内核会读/写它。
+ *   what —— 这次调用的可读名字，仅用于出错日志。
+ * 【返回】ioctl 的返回值；<0 表示失败（errno 已被设回原值）。
+ * 【在测试中的角色】所有和 snvme 内核模块的控制面交互都走它，是测试与驱动沟通的总入口。
+ * 【新手提示】ioctl 是 Linux 里“给设备下达特殊命令”的通用系统调用。
+ * 【NPU 迁移提示】这里的 ioctl 命令号来自 snvme 驱动（ioctl.h），迁移到昇腾平台时
+ *               需要换成华为对应的设备控制接口/驱动 ioctl 集合。
+ * ──────────────────────────────────────────────────────────── */
 static int do_ioctl(int fd, unsigned long req, void* arg, const char* what) {
     int r = ioctl(fd, req, arg);
     if (r < 0) {
@@ -216,6 +303,14 @@ static int do_ioctl(int fd, unsigned long req, void* arg, const char* what) {
     return r;
 }
 
+/* ────────────────────────────────────────────────────────────
+ * 【函数】usage
+ * 【作用】把命令行用法说明打到 stderr（参数格式、举例、危险性提示）。
+ * 【参数】prog —— 程序名（argv[0]），用于拼出示例命令。
+ * 【返回】无。
+ * 【在测试中的角色】参数解析出错或用户传 --help 时调用。
+ * 【新手提示】DESTRUCTIVE 提示：本测试会真往磁盘写数据，跑之前要确认 LBA 区间没数据。
+ * ──────────────────────────────────────────────────────────── */
 static void usage(const char* prog) {
     fprintf(stderr,
         "Usage: %s [--gpu N] [--rounds N] <PCI_BDF>\n"
@@ -228,6 +323,18 @@ static void usage(const char* prog) {
         prog, prog, TEST_DEFAULT_ROUNDS);
 }
 
+/* ────────────────────────────────────────────────────────────
+ * 【函数】format_status
+ * 【作用】把 CQE 的 16 位 status 字段拆解成人类可读字符串，分离出
+ *         SC(状态码) 和 SCT(状态码类型)，写进调用者给的 buf。
+ * 【参数】
+ *   status —— CQE.status 原始 16 位值（最低位是 phase，本函数右移 1 位丢掉它）。
+ *   buf    —— 输出缓冲区。
+ *   cap    —— buf 容量（用 snprintf 防越界）。
+ * 【返回】无（结果写进 buf）。
+ * 【在测试中的角色】命令失败时把状态码格式化出来，方便定位 NVMe 错误原因。
+ * 【新手提示】NVMe 状态字：bit0=phase；bits[8:1]=SC；bits[11:9]=SCT。SC/SCT 都为 0 表示成功。
+ * ──────────────────────────────────────────────────────────── */
 static void format_status(uint16_t status, char* buf, size_t cap) {
     uint16_t s   = status >> 1;
     uint8_t  sc  = s & 0xff;
@@ -242,6 +349,24 @@ static void format_status(uint16_t status, char* buf, size_t cap) {
 /* whole struct by value.                                             */
 /* ------------------------------------------------------------------ */
 
+/* ────────────────────────────────────────────────────────────
+ * 【结构体】struct test_queue_dev —— 单个 IO 队列的“设备侧”句柄
+ * 【作用】把一对 SQ/CQ 环加上它们的门铃地址、队列深度、队列号打包成一个
+ *         可按值传给 GPU 核函数的结构。核函数拿到它就能独立完成提交和轮询。
+ * 【字段】
+ *   sq      —— SQ 环在 GPU 显存里的设备虚拟地址（核函数往这里写 SQE）。
+ *   cq      —— CQ 环在 GPU 显存里的设备虚拟地址（核函数从这里读 CQE）。
+ *   sq_db   —— SQ 门铃寄存器的 GPU 可见地址（映射到 BAR0 内），写它=通知控制器有新命令。
+ *   cq_db   —— CQ 门铃寄存器的 GPU 可见地址，写它=告诉控制器“这些回执我收下了”。
+ *   q_depth —— 队列深度（环里有多少个槽），用于 tail/head 的取模回绕。
+ *   qid     —— 队列编号（控制器分配），用于日志和构造模式。
+ * 【在测试中的角色】run_one_round 填好它，再交给 k_submit_rw / k_poll_one 在 GPU 上跑。
+ * 【新手提示】门铃(doorbell)是 NVMe 控制器 BAR0 里的一个寄存器，主机写入“新的 tail/head”
+ *           索引来通知控制器，是 GPU 直接驱动 NVMe 的关键。
+ * 【NPU 迁移提示】sq/cq 指向 GPU 显存——昇腾上对应 device 内存（aclrtMalloc 得到的地址）；
+ *               sq_db/cq_db 指向被映射进 GPU 地址空间的 BAR0 寄存器——昇腾上需要把 NVMe
+ *               BAR0 注册成 AIV 可见地址后再取设备指针（替代 cudaHostRegister+GetDevicePointer）。
+ * ──────────────────────────────────────────────────────────── */
 struct test_queue_dev {
     nvme_sqe*           sq;             /* device VA */
     nvme_cqe*           cq;             /* device VA */
@@ -255,6 +380,29 @@ struct test_queue_dev {
 /* GPU kernels for SQE submit / CQE poll / data fill / data verify.   */
 /* ------------------------------------------------------------------ */
 
+/* ────────────────────────────────────────────────────────────
+ * 【函数】k_submit_rw（__global__ CUDA 核函数，单线程执行）
+ * 【作用】在 GPU 上把一条读/写命令填进 SQ 环的下一个空槽，做一次 system-scope
+ *         内存栅栏确保 SQE 对控制器 DMA 可见，然后写 SQ 门铃通知控制器、推进 tail。
+ * 【参数】
+ *   qd             —— 本队列的设备句柄（含 sq 环、sq_db 门铃、q_depth 等），按值传入。
+ *   sq_tail_io     —— 指向统一内存里的 SQ tail 计数器，函数读它定位空槽并写回新值。
+ *   cid            —— 本命令的 Command ID。
+ *   opcode/flags   —— 命令操作码、标志位（PRP 或 SGL）。
+ *   nsid           —— 命名空间 ID。
+ *   dptr0/dptr1    —— 填入 prp1/prp2 的数据缓冲 IO 地址。
+ *   slba           —— 起始 LBA（拆进 cdw10/cdw11）。
+ *   nlb_zero_based —— 块数减 1（填进 cdw12）。
+ * 【返回】无（结果体现在 SQ 环、门铃寄存器和 sq_tail_io 的更新上）。
+ * 【在测试中的角色】submit_and_poll 的“提交”一半，演示由 GPU 核而非 CPU 来构造并下发 NVMe 命令。
+ * 【新手提示】先清零 64 字节槽再填字段，避免残留旧数据；用 if(threadIdx==0&&blockIdx==0)
+ *           保证只有一个线程干活，因为提交是单点串行操作。
+ * 【NPU 迁移提示】
+ *   - __global__ 核函数 → 改写为 Ascend C / AIV kernel。
+ *   - __threadfence_system() → 换成 AIV 的 system-scope fence，保证 SQE 写入对 NVMe DMA 可见后才敲门铃。
+ *   - *qd.sq_db 这种直接从核里写 BAR0 门铃 → 依赖 BAR0 被映射成设备可见地址，
+ *     昇腾上需用华为 peer DMA / BAR 映射机制提供同等的“设备侧写 MMIO 寄存器”能力。
+ * ──────────────────────────────────────────────────────────── */
 __global__ void k_submit_rw(test_queue_dev qd,
                             uint16_t* sq_tail_io,
                             uint16_t cid,
@@ -295,6 +443,28 @@ __global__ void k_submit_rw(test_queue_dev qd,
     *sq_tail_io = new_tail;
 }
 
+/* ────────────────────────────────────────────────────────────
+ * 【函数】k_poll_one（__global__ CUDA 核函数，单线程执行）
+ * 【作用】在 GPU 上自旋轮询 CQ 环当前 head 槽的 phase bit；一旦出现期望相位
+ *         （表示有新回执），就把整条 16 字节 CQE 拷出来，推进 cq_head、必要时
+ *         翻转 phase，敲 CQ 门铃归还信用。超过 max_iters 仍无回执则报超时。
+ * 【参数】
+ *   qd          —— 本队列设备句柄（含 cq 环和 cq_db 门铃）。
+ *   cq_head_io  —— 统一内存里的 CQ head 指针，读+写回。
+ *   cq_phase_io —— 统一内存里的当前期望相位，绕环一圈翻转一次。
+ *   out_cqe     —— 输出：拷出的完整 CQE 给主机检查。
+ *   timed_out   —— 输出：1=超时未等到回执，0=成功。
+ *   max_iters   —— 自旋上限，防止控制器异常时核函数永久卡死。
+ * 【返回】无（结果写进 out_cqe / timed_out / 推进 head 与 phase）。
+ * 【在测试中的角色】submit_and_poll 的“轮询”一半，演示由 GPU 核直接收割 NVMe 完成项。
+ * 【新手提示】CQ 是环形的，靠 phase bit 区分新旧回执；head 绕回 0 时期望相位异或 1。
+ *           敲 CQ 门铃相当于告诉控制器“这些槽我读完了，可以复用”。
+ * 【NPU 迁移提示】
+ *   - __global__ 核 → Ascend C / AIV kernel。
+ *   - 用 volatile 读 CQ 槽 + __threadfence_system() → 昇腾上需 AIV system-scope fence
+ *     保证读到控制器经 DMA 写入显存的最新 CQE。
+ *   - *qd.cq_db 直接写 BAR0 门铃 → 同样依赖 BAR0 设备可见映射（华为 peer DMA/BAR 接口）。
+ * ──────────────────────────────────────────────────────────── */
 /* Polls until either a CQE with the expected phase bit appears, or
  * `max_iters` iterations elapse without one (reported as
  * timed_out=1).  On success, copies the CQE out, advances cq_head,
@@ -347,12 +517,43 @@ __global__ void k_poll_one(test_queue_dev qd,
 /* GPU helpers: fill a buffer with a per-byte pattern; verify ditto.  */
 /* ------------------------------------------------------------------ */
 
+/* ────────────────────────────────────────────────────────────
+ * 【函数】k_fill_pattern（__global__ CUDA 核函数，多线程并行）
+ * 【作用】用多线程并行把 GPU 写缓冲填满一个可预测的数据模式：
+ *         每字节 = pat ^ (字节偏移 >> 12)，即每 4 KiB 页换一个高位扰动。
+ * 【参数】
+ *   buf   —— 要填充的 GPU 缓冲区设备指针。
+ *   bytes —— 填充字节数（决定要启动多少线程）。
+ *   pat   —— 基准模式字节，由 (round,qid,ioidx) 算出，保证跨轮/跨队列唯一。
+ * 【返回】无。
+ * 【在测试中的角色】每次写命令之前先填好已知数据，写盘后再读回校验。
+ * 【新手提示】idx = blockIdx.x*blockDim.x + threadIdx.x 是 CUDA 里计算全局线程号的标准式子；
+ *           越界线程直接 return。
+ * 【NPU 迁移提示】__global__ 核 → Ascend C / AIV kernel；全局线程索引换成 AIV 的
+ *               block/thread 等价计算。这是普通显存填充，不涉及 BAR0/p2p，迁移最简单。
+ * ──────────────────────────────────────────────────────────── */
 __global__ void k_fill_pattern(uint8_t* buf, size_t bytes, uint8_t pat) {
     size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= bytes) return;
     buf[idx] = pat ^ (uint8_t)(idx >> 12);
 }
 
+/* ────────────────────────────────────────────────────────────
+ * 【函数】k_verify_pattern（__global__ CUDA 核函数，多线程并行）
+ * 【作用】在 GPU 上并行校验读回缓冲是否与当初 k_fill_pattern 写入的模式一致；
+ *         发现任一字节不符就用原子操作记录第一个失配的字节下标。
+ * 【参数】
+ *   buf          —— 读回数据的 GPU 缓冲区设备指针（const）。
+ *   bytes        —— 校验字节数。
+ *   pat          —— 当初填充用的基准模式字节（须与写入时相同）。
+ *   mismatch_idx —— 输出：统一内存里的失配下标；调用前置为 -1，仍为 -1 表示全部正确。
+ * 【返回】无（结果体现在 mismatch_idx）。
+ * 【在测试中的角色】读命令完成后比对数据，确认“写进去的”和“读出来的”一致，构成端到端正确性验证。
+ * 【新手提示】atomicCAS(mismatch_idx, -1, idx)：只有第一个发现错误的线程能成功写入，
+ *           保证多线程竞争下结果确定（“任一失配字节即可”）。
+ * 【NPU 迁移提示】__global__ 核 → Ascend C / AIV kernel；atomicCAS 换成 AIV 对应的原子比较交换。
+ *               同样是普通显存运算，不涉及 BAR0/p2p。
+ * ──────────────────────────────────────────────────────────── */
 __global__ void k_verify_pattern(const uint8_t* buf, size_t bytes,
                                  uint8_t pat, int* mismatch_idx) {
     size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -370,6 +571,25 @@ __global__ void k_verify_pattern(const uint8_t* buf, size_t bytes,
 /* Host helpers around the submit / poll kernels.                     */
 /* ------------------------------------------------------------------ */
 
+/* ────────────────────────────────────────────────────────────
+ * 【结构体】struct queue_state —— 单个队列的“主机侧”完整运行状态
+ * 【作用】在 test_queue_dev（设备句柄）之外，再挂上一组放在统一内存里的计数器，
+ *         让提交/轮询核函数能就地读写 tail/head/phase 而不必每次 IO 在主机和设备间来回拷贝。
+ * 【字段】
+ *   dev          —— 设备侧句柄（环、门铃、深度、qid），传给核函数用。
+ *   sq_tail_um   —— 统一内存里的 SQ tail 计数器（1 个元素）。
+ *   cq_head_um   —— 统一内存里的 CQ head 计数器。
+ *   cq_phase_um  —— 统一内存里的当前 CQ 期望相位。
+ *   out_cqe_um   —— 统一内存里存放轮询核拷出的 CQE。
+ *   timed_out_um —— 统一内存里的超时标志。
+ *   next_cid     —— 主机侧自增的下一个 Command ID。
+ * 【在测试中的角色】run_one_round 给每个队列建一个，submit_and_poll 反复用它驱动一次次 IO。
+ * 【新手提示】统一内存(Unified/Managed Memory)：一块 CPU 和 GPU 都能直接访问的内存，
+ *           省去显式拷贝，特别适合这种 CPU/GPU 都要读写的小计数器。
+ * 【NPU 迁移提示】*_um 字段依赖 CUDA Unified/Managed Memory（cudaMallocManaged）；
+ *               昇腾上若无统一内存等价物，需改成 host 内存 + 显式 device 拷贝，或用华为
+ *               的统一/共享内存接口。
+ * ──────────────────────────────────────────────────────────── */
 struct queue_state {
     test_queue_dev      dev;
     /* host-side counters; we keep these in unified-pinned memory so
@@ -382,6 +602,27 @@ struct queue_state {
     uint16_t            next_cid;
 };
 
+/* ────────────────────────────────────────────────────────────
+ * 【函数】submit_and_poll
+ * 【作用】完成一次完整的 NVMe IO：先启动 k_submit_rw 核在 GPU 上下发命令，
+ *         再启动 k_poll_one 核在 GPU 上等回执，最后同步并把结果返回主机。
+ * 【参数】
+ *   qs             —— 目标队列状态（含设备句柄和统一内存计数器），引用传入。
+ *   opcode/flags   —— 命令类型与 PRP/SGL 标志。
+ *   nsid           —— 命名空间 ID。
+ *   dptr0/dptr1    —— prp1/prp2 数据地址。
+ *   slba           —— 起始 LBA。
+ *   nlb_zero_based —— 块数减 1。
+ *   cqe_out        —— 输出：本次命令的完成项。
+ *   cid_out        —— 输出：本次分配的 Command ID（可为空）。
+ * 【返回】0 成功；-EIO 核启动失败；-ETIMEDOUT 轮询超时。
+ * 【在测试中的角色】各 Tier 测试反复调它，是“一次 IO”的主机侧封装；它把提交核和轮询核
+ *                 串到默认流上顺序执行，再用 cudaDeviceSynchronize 等两核都跑完。
+ * 【新手提示】两个核都丢到默认流（stream 0），默认流天然串行，所以提交一定先于轮询完成，
+ *           无需在两者之间额外同步。
+ * 【NPU 迁移提示】<<<1,1>>> 的核启动语法、cudaGetLastError、cudaDeviceSynchronize 都是
+ *               CUDA 专有 → 昇腾上换成 AIV kernel 的下发与流/事件同步接口（aclrtSynchronizeStream 等）。
+ * ──────────────────────────────────────────────────────────── */
 static int submit_and_poll(queue_state& qs,
                            uint8_t opcode, uint8_t flags,
                            uint32_t nsid,
@@ -428,6 +669,21 @@ static int submit_and_poll(queue_state& qs,
 /* below and span every round on this fd.                             */
 /* ------------------------------------------------------------------ */
 
+/* ────────────────────────────────────────────────────────────
+ * 【结构体】struct round_resources —— 单轮(round)专属的资源集合
+ * 【作用】把“每一轮都要重新创建、轮末又销毁”的东西打包：队列组 + 两对 SQ/CQ
+ *         GPU 环及其 IO 地址 + 两个队列的运行状态。用于反复申请/释放以验证回收路径。
+ * 【字段】
+ *   group_id            —— 本轮 NVM_CREATE_QUEUE_GROUP 得到的队列组 ID。
+ *   sq_dev[]/cq_dev[]   —— 每个队列的 SQ/CQ 环在 GPU 显存的地址（cudaMalloc 得到）。
+ *   sq_ioaddr[]/cq_ioaddr[] —— 上述环经 NVM_MAP_DEVICE_MEMORY 注册后给控制器用的 IO 地址。
+ *   QS[]                —— 每个队列的完整运行状态（queue_state）。
+ * 【在测试中的角色】run_one_round 把它填满，teardown_one_round 再清空，是“动态分配/释放循环”的载体。
+ * 【新手提示】数据缓冲不在这里——它们是跨轮持久的，放在 persistent_data_resources 里。
+ * 【NPU 迁移提示】sq_dev/cq_dev 来自 cudaMalloc → 昇腾换 aclrtMalloc；ioaddr 来自
+ *               NVM_MAP_DEVICE_MEMORY（依赖 nvidia_p2p_* 把显存暴露给 NVMe DMA）→ 昇腾需要
+ *               华为 peer DMA 接口把 device 内存注册成 NVMe 可访问的总线地址。
+ * ──────────────────────────────────────────────────────────── */
 struct round_resources {
     uint32_t    group_id;
     void*       sq_dev[TEST_NR_QUEUES];
@@ -444,6 +700,22 @@ struct round_resources {
 /* every NVM_DESTROY_QUEUE_GROUP cascade.  Released on close(fd_dev). */
 /* ------------------------------------------------------------------ */
 
+/* ────────────────────────────────────────────────────────────
+ * 【结构体】struct persistent_data_resources —— 跨轮持久的数据缓冲资源
+ * 【作用】打包“整个 fd 生命周期只申请一次、所有轮共用”的数据面缓冲：
+ *         写缓冲、读缓冲、两个 PRP_List 缓冲，及它们各自的 IO 地址。
+ * 【字段】
+ *   wbuf_dev / rbuf_dev               —— 写/读数据缓冲的 GPU 显存地址。
+ *   prp_list_w_dev / prp_list_r_dev   —— 写/读用的 PRP_List 缓冲 GPU 显存地址（Tier3 大 IO 用）。
+ *   *_ioaddr                          —— 上述各缓冲注册后给控制器 DMA 用的 IO 地址。
+ * 【在测试中的角色】在 main 的 Phase 2b 一次性分配并以 map_kind=DATA、group_id=0 注册，
+ *                 之后每轮 IO 都直接复用，不随队列组销毁而释放，直到 close(fd) 才回收。
+ * 【新手提示】PRP_List 是一张“地址表”：当一次 IO 跨多个页、prp1/prp2 装不下时，prp2 改指
+ *           向这张表，表里列出后续各页的物理地址。
+ * 【NPU 迁移提示】*_dev 来自 cudaMalloc → 昇腾 aclrtMalloc；*_ioaddr 来自
+ *               NVM_MAP_DEVICE_MEMORY（NVIDIA p2p get_pages）→ 昇腾需用华为 peer DMA 接口
+ *               注册 device 内存供 NVMe 直接读写。“注册一次、多组复用”的模式可保留。
+ * ──────────────────────────────────────────────────────────── */
 struct persistent_data_resources {
     void*       wbuf_dev;
     void*       rbuf_dev;
@@ -455,6 +727,38 @@ struct persistent_data_resources {
     uint64_t    prp_list_r_ioaddr;
 };
 
+/* ────────────────────────────────────────────────────────────
+ * 【函数】run_one_round
+ * 【作用】跑完一整轮的数据面：建队列组、分配并注册 GPU 环、创建用户 IO 队列、
+ *         构造每队列设备状态，然后做 Tier1~Tier4 + SQ 回绕压力测试的读写校验。
+ * 【参数】
+ *   fd_dev    —— 已绑定控制器的设备 fd。
+ *   info      —— 控制器信息（块大小、队列深度、SGL 支持等）。
+ *   bar0_gpu  —— BAR0 在 GPU 地址空间的基址，用于算出每队列门铃地址。
+ *   round_idx —— 当前轮号，决定本轮独占的 LBA 窗口和数据模式条带。
+ *   rr        —— 输出：本轮资源集合（调用方传入已清零的结构）。
+ *   pdata     —— 跨轮持久的数据缓冲（读/写/PRP_List），本函数只用不分配。
+ * 【返回】无（成功返回；任何一步失败直接 step_fail 退出进程）。
+ * 【在测试中的角色】整个测试的核心一轮，按以下阶段推进：
+ *   Phase R.1 创建队列组(NVM_CREATE_QUEUE_GROUP)；
+ *   Phase R.2 cudaMalloc 各队列 SQ/CQ GPU 环（数据缓冲复用 pdata）；
+ *   Phase R.3 NVM_MAP_DEVICE_MEMORY 注册环（RING_SQ/RING_CQ），拿到 IO 地址；
+ *   Phase R.4 NVM_ADD_USER_QUEUE 让控制器创建用户队列，拿回 qid 和门铃偏移，
+ *             组装 test_queue_dev 并分配统一内存计数器；
+ *   Phase R.5 Tier1：4 KiB，仅 PRP1，写+读回校验 16 次×2 队列；
+ *   Phase R.6 Tier2：8 KiB，PRP1+PRP2；
+ *   Phase R.7 Tier3：16 KiB，PRP1+PRP_List（先把后续页地址拷进 PRP_List 缓冲）；
+ *   Phase R.8 Tier4：SGL Data Block（控制器不支持 SGL 则跳过）；
+ *   Phase R.9 SQ-tail-wrap：连发 q_depth+8 个写，强制 SQ 环回绕、CQ 相位翻转。
+ * 【新手提示】每个 Tier 用更大的 IO 验证不同的数据描述方式（PRP1 / PRP1+PRP2 / PRP_List / SGL）；
+ *           每轮用不重叠的 LBA 窗口，使各轮校验互不干扰。
+ * 【NPU 迁移提示】本函数大量使用 CUDA 专有调用，迁移昇腾时需逐一替换：
+ *   - cudaMalloc/cudaMemset/cudaMallocManaged → aclrtMalloc / aclrtMemset / 昇腾统一内存接口；
+ *   - NVM_MAP_DEVICE_MEMORY（依赖 nvidia_p2p_get_pages 把显存暴露给 NVMe）→ 华为 peer DMA 注册接口；
+ *   - 门铃地址 = bar0_gpu + offset，依赖 BAR0 被映射成 AIV 可见地址；
+ *   - k_fill_pattern/k_verify_pattern/submit_and_poll 内部的核函数 → Ascend C / AIV kernel。
+ *   ioctl 命令号（CREATE_QUEUE_GROUP / MAP_DEVICE_MEMORY / ADD_USER_QUEUE）是 snvme 专有，需对接华为驱动。
+ * ──────────────────────────────────────────────────────────── */
 /* Run all the per-round IO phases (formerly Phase 2..10).  Caller
  * supplies a fresh `rr` (zeroed) and the controller-wide state
  * (fd_dev, info, bar0_gpu).  Returns 0 on success, exits on error.
@@ -910,6 +1214,26 @@ static void run_one_round(int fd_dev,
     }
 }
 
+/* ────────────────────────────────────────────────────────────
+ * 【函数】teardown_one_round
+ * 【作用】把 run_one_round 在本轮建立的东西全部拆掉，为下一轮重新分配做准备。
+ * 【参数】
+ *   fd_dev    —— 设备 fd。
+ *   round_idx —— 轮号（仅用于日志）。
+ *   rr        —— 本轮资源集合；函数末尾会整体清零。
+ * 【返回】无（失败时 step_fail 退出）。
+ * 【在测试中的角色】与 run_one_round 配对，按严格顺序回收（顺序很关键）：
+ *   Phase R.1（拆）先 cudaFree 每队列的统一内存计数器（sq_tail/cq_head/phase/out_cqe/timed_out）；
+ *   再发 NVM_DESTROY_QUEUE_GROUP，由它级联删除控制器侧的用户 IO 队列(Delete I/O SQ/CQ)
+ *   和 4 个环映射(NVM_MAP_DEVICE_MEMORY 描述符)；
+ *   最后 cudaFree 各 SQ/CQ GPU 环页；末尾 memset 清零 rr。
+ *   数据缓冲(pdata)不在此释放——它们跨轮存活，到 close(fd) 才回收。
+ * 【新手提示】先销毁队列组再释放显存：让控制器先停止访问这些环，避免它还在 DMA 时显存被回收。
+ * 【NPU 迁移提示】cudaFree → aclrtFree；NVM_DESTROY_QUEUE_GROUP 是 snvme 专有 ioctl，
+ *               迁移时需对接华为驱动的队列组销毁接口，且其内部必须正确调用 peer DMA 的
+ *               put_pages 释放对显存的引用（对应 NVIDIA 的 nvidia_p2p_put_pages 引用计数）。
+ *               这条释放路径正是“动态分配/释放循环”要验证的引用计数回收正确性所在。
+ * ──────────────────────────────────────────────────────────── */
 /* Tear down everything that run_one_round() built up.  In B6 this
  * is just the queue group + its 4 ring maps + the 2 user IO queues
  * the controller created.  Data buffers (wbuf / rbuf / prp_list_*)
@@ -951,6 +1275,40 @@ static void teardown_one_round(int fd_dev, unsigned round_idx,
 /* main                                                               */
 /* ------------------------------------------------------------------ */
 
+/* ────────────────────────────────────────────────────────────
+ * 【函数】main
+ * 【作用】整个 GPU 版端到端 NVMe IO smoke 测试的入口：解析参数、初始化 CUDA、
+ *         打开并绑定 snvme 控制器、映射 BAR0、分配持久数据缓冲，然后跑 N 轮
+ *         队列组的“建立—IO—销毁”循环，最后清理收尾。
+ * 【参数】
+ *   argc/argv —— 命令行参数：[--gpu N] [--rounds N] <PCI_BDF>。
+ * 【返回】0 全部通过；1 用法错误；2 某步骤失败（由 step_fail 触发）。
+ * 【在测试中的角色】按以下完整流程把各部件串起来：
+ *   解析参数 + parse_bdf；cudaSetDevice 选 GPU。
+ *   Phase 0 控制面：open(/dev/snvm_control)、SNVM_CHRDEV_CREATE 创建字符设备、open(/dev/ssnvmeN)。
+ *   Phase 1 绑定层：NVM_SET_KERNEL_IOQ_CAP 设内核 IOQ 上限、SNVM_DEVICE_BIND 绑定控制器、
+ *           NVM_GET_DEV_INFO 取设备信息（含 4 KiB 块大小、队列深度等前置校验）。
+ *   Phase 2 门铃：mmap BAR0 到 CPU，再 cudaHostRegister(IoMemory)+cudaHostGetDevicePointer
+ *           得到 GPU 可见的 BAR0 地址，让核函数能直接写门铃。
+ *   Phase 2b 持久数据缓冲：一次性 cudaMalloc 读/写/PRP_List 缓冲，以 map_kind=DATA、
+ *           group_id=0 注册，使其跨所有轮存活。
+ *   Phase 3+ rounds：循环 nr_rounds 次，每次 run_one_round + teardown_one_round。
+ *   收尾：cudaHostUnregister + munmap BAR0；SNVM_DEVICE_UNBIND；close(fd_dev)（触发
+ *        snvm_dev_release 释放 DATA 映射的 p2p 引用）；之后才 cudaFree 持久缓冲（顺序关键，
+ *        否则 fput 时显存仍被 snvme 引用即泄漏）；SNVM_CHRDEV_REMOVE；close(fd_ctl)。
+ * 【新手提示】前置条件（见文件头）：必须先加载 NVIDIA 驱动且 nvfs_nvidia_p2p_init() 成功，
+ *           否则 snvme 拒绝加载——因为 GPUDirect 路径依赖 NVIDIA p2p 把显存暴露给 NVMe。
+ *           本测试是破坏性的，会真往磁盘写数据。
+ * 【NPU 迁移提示】main 串起了 NVIDIA GPUDirect 全套，迁移昇腾时的主要替换点：
+ *   - cudaSetDevice/cudaGetDeviceProperties → aclrtSetDevice 等 ACL 设备初始化；
+ *   - mmap BAR0 + cudaHostRegister(cudaHostRegisterIoMemory) + cudaHostGetDevicePointer
+ *     → 把 NVMe BAR0 注册成 AIV 可见地址并取设备指针（这是让核函数写门铃的关键能力）；
+ *   - cudaMalloc 持久缓冲 + NVM_MAP_DEVICE_MEMORY（NVIDIA p2p get/put_pages）
+ *     → aclrtMalloc + 华为 peer DMA 注册/反注册接口；
+ *   - 释放顺序“先解除设备对显存的 DMA 引用，再 free 显存”这一原则在昇腾上同样必须遵守，
+ *     否则同样会泄漏（对应 NVIDIA nvidia_p2p_put_pages 引用计数）。
+ *   - 所有 SNVM_ / NVM_ 系列 ioctl 是 snvme 专有，需对接华为侧驱动的等价控制接口。
+ * ──────────────────────────────────────────────────────────── */
 int main(int argc, char** argv) {
     int cuda_device = 0;
     unsigned nr_rounds = TEST_DEFAULT_ROUNDS;

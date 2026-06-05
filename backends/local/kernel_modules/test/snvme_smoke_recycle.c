@@ -71,6 +71,19 @@
 
 static int g_step = 0;
 
+/* ────────────────────────────────────────────────────────────
+ * 【函数】step_ok(fmt, ...)
+ * 【作用】打印一条成功日志，形如 "[ OK ] step=N ..."，并把全局
+ *         步骤计数器 g_step 自增 1。用来标记测试流程走通了一步。
+ * 【参数】fmt 是 printf 风格的格式串；后面的 ... 是可变参数，
+ *         按 fmt 里的占位符填进去（和 printf 用法一样）。
+ * 【返回】无返回值（void）。只往 stderr 打日志，不会终止程序。
+ * 【在测试中的角色】每完成一个正常步骤就调一次，给人看进度。
+ * 【新手提示】va_list / va_start / va_end 是 C 处理"不定个数参数"
+ *         的标准套路；vfprintf 就是接收 va_list 版本的 fprintf。
+ *         stderr 是标准错误流，这里日志全走 stderr，方便和程序
+ *         真正的数据输出区分开。
+ * ──────────────────────────────────────────────────────────── */
 static void step_ok(const char* fmt, ...) {
     va_list ap;
     g_step++;
@@ -81,6 +94,19 @@ static void step_ok(const char* fmt, ...) {
     fputc('\n', stderr);
 }
 
+/* ────────────────────────────────────────────────────────────
+ * 【函数】step_warn(fmt, ...)
+ * 【作用】打印一条警告日志，形如 "[WARN] step=N ..."，同样把
+ *         g_step 自增 1。表示"这一步结果不完全符合预期，但不致命，
+ *         测试可以继续往下走"。
+ * 【参数】fmt + ... 同 step_ok，printf 风格的格式串和可变参数。
+ * 【返回】无返回值（void）。不终止程序，只是提个醒。
+ * 【在测试中的角色】出现"可容忍的偏差"时调用，例如某固件返回的
+ *         状态码和规范建议值不同，但透传链路本身仍然正常。
+ * 【新手提示】和 step_ok 唯一的区别就是标签是 [WARN]；逻辑完全
+ *         一样。把成功 / 警告 / 失败拆成三个函数，是为了让日志
+ *         一眼就能看出每步的性质。
+ * ──────────────────────────────────────────────────────────── */
 static void step_warn(const char* fmt, ...) {
     va_list ap;
     g_step++;
@@ -91,6 +117,22 @@ static void step_warn(const char* fmt, ...) {
     fputc('\n', stderr);
 }
 
+/* ────────────────────────────────────────────────────────────
+ * 【函数】step_fail(err, fmt, ...)
+ * 【作用】打印一条失败日志，形如 "[FAIL] step=N ... errno=E (描述)"，
+ *         然后直接 exit(2) 结束整个进程——这一步失败就不再往下测了。
+ * 【参数】err  是要打印的 errno 值（C 库的错误码）。传 0 表示
+ *              "这次失败不是系统调用错误"，会显示 "n/a"。
+ *         fmt + ... 同上，printf 风格的描述信息。
+ * 【返回】不返回！函数声明带 __attribute__((noreturn))，因为末尾
+ *         调用了 exit(2)，控制权永远不会回到调用处。
+ * 【在测试中的角色】任何"必须成功却失败了"的步骤都用它来终止，
+ *         退出码 2 约定为"某个冒烟步骤失败"（见文件头 Exit codes）。
+ * 【新手提示】errno 是 C 里全局的"最近一次出错原因"，strerror()
+ *         把它翻成人话（如 "No such device"）。noreturn 属性能让
+ *         编译器知道此后代码不可达，避免"函数可能没返回值"之类的
+ *         误报。
+ * ──────────────────────────────────────────────────────────── */
 static void __attribute__((noreturn)) step_fail(int err, const char* fmt, ...) {
     va_list ap;
     g_step++;
@@ -106,6 +148,21 @@ static void __attribute__((noreturn)) step_fail(int err, const char* fmt, ...) {
 /* BDF parser                                                         */
 /* ------------------------------------------------------------------ */
 
+/* ────────────────────────────────────────────────────────────
+ * 【函数】parse_bdf(s, out)
+ * 【作用】把命令行里的 PCI 地址字符串（形如 "0000:50:00.0"）解析成
+ *         结构体 pci_device_addr 的四个字段。
+ * 【参数】s   输入字符串，格式 "域:总线:设备.功能"（DDDD:BB:DD.F），
+ *             各段都是十六进制。
+ *         out 输出参数，解析出来的 domain/bus/slot/func 写到这里。
+ * 【返回】成功返回 0；格式不对（凑不齐 4 个字段）返回 -1。
+ * 【在测试中的角色】main() 启动时把用户给的 BDF 转成内核 ioctl
+ *         需要的结构体，是整条流程的第一步输入校验。
+ * 【新手提示】BDF = Bus/Device/Function，是 PCI 设备在系统里的
+ *         "门牌号"，加上 domain 一共四段，能唯一定位一块网卡 /
+ *         NVMe 盘。sscanf 的返回值是"成功匹配并赋值的字段个数"，
+ *         所以这里用 ==4 判断是否四段都解析到了。
+ * ──────────────────────────────────────────────────────────── */
 static int parse_bdf(const char* s, struct pci_device_addr* out) {
     return sscanf(s, "%x:%x:%x.%x",
                   &out->domain, &out->bus, &out->slot, &out->func) == 4 ? 0 : -1;
@@ -115,6 +172,24 @@ static int parse_bdf(const char* s, struct pci_device_addr* out) {
 /* ioctl wrapper                                                      */
 /* ------------------------------------------------------------------ */
 
+/* ────────────────────────────────────────────────────────────
+ * 【函数】do_ioctl(fd, req, arg, what)
+ * 【作用】对 ioctl() 系统调用的一层薄封装：调用 ioctl，如果失败就
+ *         打一条带原因的错误日志，并小心地把 errno 保住再返回。
+ * 【参数】fd   已打开的设备文件描述符（/dev/snvm_control 或
+ *              /dev/ssnvme<N>）。
+ *         req  ioctl 命令号（如 SNVM_DEVICE_BIND，定义在 ioctl.h）。
+ *         arg  指向命令参数结构体的指针，内核会读/写它。
+ *         what 这次调用的可读名字，仅用于出错时打日志。
+ * 【返回】透传 ioctl 的返回值：成功通常是 0，失败是 <0，且此时
+ *         errno 已被设置好（函数特意在打印 strerror 后又写回 errno，
+ *         防止 fprintf 把它覆盖）。
+ * 【在测试中的角色】所有走 /dev 节点的内核交互都经过它，统一了
+ *         错误打印格式，省去每处重复写 if/perror。
+ * 【新手提示】ioctl（I/O control）是用户态给设备驱动下发"自定义
+ *         命令"的通用入口；这里就是用户态测试程序和 snvme 内核
+ *         模块对话的方式。
+ * ──────────────────────────────────────────────────────────── */
 static int do_ioctl(int fd, unsigned long req, void* arg, const char* what) {
     int r = ioctl(fd, req, arg);
     if (r < 0) {
@@ -137,6 +212,26 @@ static int do_ioctl(int fd, unsigned long req, void* arg, const char* what) {
 #define NVME_ADMIN_OPC_IDENTIFY  0x06
 #define NVME_IDENTIFY_CNS_CTRL   0x01
 
+/* ────────────────────────────────────────────────────────────
+ * 【函数】build_identify_ctrl_sqe(out[64])
+ * 【作用】在 64 字节缓冲区里手工拼出一条 NVMe admin 命令——
+ *         "Identify Controller"（识别控制器），不带数据缓冲区。
+ * 【参数】out  调用方给的 64 字节数组，函数先清零再填关键字段。
+ *              这 64 字节就是一条 NVMe 提交队列条目（SQE）的原始内容。
+ * 【返回】无返回值；结果直接写在 out 里。
+ * 【在测试中的角色】用于步骤 [4] 和 [7a]，给 NVM_RAW_ADMIN_CMD
+ *         ioctl 喂一条"正向"命令，验证 SQE 能送进控制器、CQE 能
+ *         透传回来。
+ * 【新手提示】NVMe admin SQE 固定 64 字节，按 16 个 32 位双字
+ *         (DWORD/CDW0~CDW15) 编排，全部小端存放。本函数只动两处：
+ *           · CDW0 的字节 0（out[0]）= opcode 操作码，0x06 表示
+ *             Identify。opcode 永远在 CDW0 的最低字节。
+ *           · CDW10（占 out[40..43]）的字节 0 = CNS 字段，0x01 表示
+ *             "Identify Controller"。CDW10 起始字节 = 10*4 = 40，
+ *             所以 out[40] 就是 CNS。其余字节保持 0。
+ *         没填 PRP1（数据指针）是故意的：本测试只关心命令往返链路，
+ *         不搬运返回的 4096 字节控制器信息。
+ * ──────────────────────────────────────────────────────────── */
 /*
  * Build an Identify (Controller) admin SQE with no data buffer
  * pointer.  Controller is expected to reject with SC=0x02 "Invalid
@@ -158,6 +253,22 @@ static void build_identify_ctrl_sqe(uint8_t out[64]) {
     out[43] = 0;
 }
 
+/* ────────────────────────────────────────────────────────────
+ * 【函数】build_reserved_opcode_sqe(out[64])
+ * 【作用】在 64 字节缓冲区里拼一条"非法"的 admin SQE：操作码用
+ *         保留值 0xFF，其余字段全 0。控制器必须拒绝它。
+ * 【参数】out  64 字节数组，函数先清零，再把 out[0] 设为 0xFF。
+ * 【返回】无返回值；结果写在 out 里。
+ * 【在测试中的角色】用于步骤 [7b] 的"负向测试"：验证当命令本身
+ *         非法时，控制器返回的失败状态能被 ioctl 原样透传回用户态。
+ * 【新手提示】同样地，opcode（操作码）位于 SQE 的 CDW0 字节 0，
+ *         也就是 out[0]。0xFF 是 admin 命令里普遍保留 / 厂商自定义
+ *         的最高操作码，绝大多数控制器都没实现。按 NVMe 1.4 §5
+ *         (Figure 139) 规定，控制器遇到没实现的操作码，必须以
+ *         SCT=0x0（Generic）、SC=0x01（Invalid Command Opcode）拒绝。
+ *         相比"Identify 不给 PRP1"，用保留操作码是更可移植的
+ *         "保证被拒"用例（后者有些固件会容忍）。
+ * ──────────────────────────────────────────────────────────── */
 /*
  * Build an admin SQE with a reserved opcode (0xFF) and all other
  * fields zero.  Per NVMe 1.4 §5 (Admin Command Set, Figure 139), any
@@ -183,6 +294,18 @@ static void build_reserved_opcode_sqe(uint8_t out[64]) {
 /* Argument parsing                                                   */
 /* ------------------------------------------------------------------ */
 
+/* ────────────────────────────────────────────────────────────
+ * 【函数】usage(prog)
+ * 【作用】往 stderr 打印用法说明：怎么传 PCI BDF 参数，并警告本
+ *         测试是破坏性的（会把设备从内核自带 nvme 驱动手里抢过来）。
+ * 【参数】prog  程序自身的名字，一般传 argv[0]，填进提示文本里。
+ * 【返回】无返回值；只打印帮助文本。
+ * 【在测试中的角色】参数个数不对、或用户传 -h/--help 时调用，
+ *         告诉人正确的调用方式。
+ * 【新手提示】"绑定控制器"指让 snvme 接管这块 NVMe 盘，期间内核
+ *         自带的 nvme 驱动会失去它，所以原本挂载的盘会暂时不可用——
+ *         这就是注释里说的 destructive（破坏性）。
+ * ──────────────────────────────────────────────────────────── */
 static void usage(const char* prog) {
     fprintf(stderr,
         "Usage: %s <PCI_BDF>\n"
@@ -195,6 +318,42 @@ static void usage(const char* prog) {
         prog, prog);
 }
 
+/* ────────────────────────────────────────────────────────────
+ * 【函数】main(argc, argv)
+ * 【作用】整个冒烟测试的主流程：打开 snvme 设备节点，绑定控制器，
+ *         用 NVM_RAW_ADMIN_CMD 透传两条 admin 命令（一正一负）验证
+ *         透传链路，最后解绑并清理。
+ * 【参数】argc/argv  命令行参数；只接受一个参数——PCI BDF，
+ *         例如 "0000:50:00.0"。也支持 -h/--help。
+ * 【返回】0 全部步骤通过；1 用法错误；2 某个冒烟步骤失败
+ *         （失败时由 step_fail 内部 exit(2)，不会走到这里的 return）。
+ * 【在测试中的角色】把前面所有小函数串成完整流程。
+ *
+ *   流程分步：
+ *     [1] 打开 /dev/snvm_control 控制节点（总控入口）。
+ *     [2] SNVM_CHRDEV_CREATE：为该 BDF 创建一个字符设备，拿到 minor 号。
+ *     [3] 按 minor 打开 /dev/ssnvme<N> 这个具体设备节点。
+ *     [4] 【负向·未绑定】绑定前就调 NVM_RAW_ADMIN_CMD，期望返回
+ *         -ENODEV——验证内核在控制器未绑定时不会误解引用而崩溃。
+ *     [5] SNVM_DEVICE_BIND：把控制器绑定给 snvme，触发探测，让
+ *         admin queue 真正可用。
+ *     [6] 轮询 NVM_GET_DEV_INFO，直到异步探测完成（最多约 10 秒）。
+ *     [7a]【正向往返】透传 Identify Controller（无数据缓冲），期望
+ *         ioctl 返回 0，CQE 的 status/DW0/DW1 被透传回用户态。
+ *     [7b]【负向往返】透传保留操作码 0xFF，期望控制器以
+ *         SC=0x01（Invalid Command Opcode）拒绝，且该失败状态被原样
+ *         透传回来。
+ *     [8] SNVM_DEVICE_UNBIND：解绑控制器，把设备还给系统。
+ *     [F1] 收尾：close 掉 /dev/ssnvme<N>（按 fd 清理）。
+ *     [F2] 收尾：SNVM_CHRDEV_REMOVE 删除字符设备，再关掉控制节点。
+ *
+ * 【新手提示】SQE = Submission Queue Entry（提交队列条目，发给控制器
+ *         的命令）；CQE = Completion Queue Entry（完成队列条目，含
+ *         status/DW0/DW1 等执行结果）。本测试核心就是确认 snvme 能把
+ *         任意 admin SQE 送进控制器自有的 admin queue，并把 CQE 结果
+ *         如实带回——这是后续 per-queue recycle（删/建 I/O SQ/CQ）的
+ *         底层积木。
+ * ──────────────────────────────────────────────────────────── */
 int main(int argc, char** argv) {
     if (argc != 2) {
         usage(argv[0]);

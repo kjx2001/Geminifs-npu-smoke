@@ -85,6 +85,20 @@
 
 static int g_step = 0;
 
+/* ────────────────────────────────────────────────────────────
+ * 【函数】step_ok(const char* fmt, ...)
+ * 【作用】打印一条"这一步成功了"的日志，形如 "[ OK ] step=3 ..."。
+ *         它是个可变参数函数（像 printf 一样可以带格式串和参数）。
+ * 【参数】fmt 是 printf 风格的格式串，后面的 ... 是要填进去的值。
+ * 【返回】无返回值；只往 stderr（标准错误）打印一行。
+ * 【在测试中的角色】整个 smoke 测试由很多"步骤"组成，每做成一步就
+ *         调一次它，把全局计数器 g_step 加一并打印出来，让人能看到
+ *         测试走到了第几步、每一步在干什么。
+ * 【新手提示】va_list / va_start / vfprintf 是 C 处理"不定个数参数"的
+ *         标准套路：va_start 定位到第一个可变参数，vfprintf 把这些参数
+ *         按 fmt 格式写到 stderr，va_end 收尾。stderr 是程序的诊断输出
+ *         通道，和正常结果用的 stdout 分开，所以日志不会污染数据输出。
+ * ──────────────────────────────────────────────────────────── */
 static void step_ok(const char* fmt, ...) {
     va_list ap;
     g_step++;
@@ -95,6 +109,20 @@ static void step_ok(const char* fmt, ...) {
     fputc('\n', stderr);
 }
 
+/* ────────────────────────────────────────────────────────────
+ * 【函数】step_warn(const char* fmt, ...)
+ * 【作用】打印一条"警告"日志，形如 "[WARN] step=5 ..."。和 step_ok
+ *         几乎一样，区别只是标记是 [WARN] 而不是 [ OK ]。
+ * 【参数】fmt 加可变参数，printf 风格。
+ * 【返回】无；只打印一行到 stderr。注意它【不会终止程序】，测试继续往下走。
+ * 【在测试中的角色】用于那种"不算成功、也不算致命错误"的情况。最典型
+ *         的例子：读 CAP 寄存器读出全 0xFF，说明 NVMe 控制器可能处于
+ *         掉电/休眠状态——这不是 SNVMe 的 bug，所以只警告、不失败，
+ *         让后续不依赖控制器上电的 UAPI 检查继续跑完。
+ * 【新手提示】可变参数机制同 step_ok。把"警告"和"失败"分成两个函数，
+ *         是为了让测试既能严格（真错就停），又能容忍环境差异（比如设备
+ *         没被任何驱动唤醒过）。
+ * ──────────────────────────────────────────────────────────── */
 static void step_warn(const char* fmt, ...) {
     va_list ap;
     g_step++;
@@ -105,6 +133,22 @@ static void step_warn(const char* fmt, ...) {
     fputc('\n', stderr);
 }
 
+/* ────────────────────────────────────────────────────────────
+ * 【函数】step_fail(int err, const char* fmt, ...)
+ * 【作用】打印一条"失败"日志（形如 "[FAIL] step=2 ... errno=13 (...)"），
+ *         然后【立刻退出整个程序】，退出码为 2。
+ * 【参数】err 是失败时的 errno 值（系统调用失败后记录下来的错误码）；
+ *         fmt 加可变参数描述是哪一步、做什么时失败的。
+ * 【返回】不返回——函数带 __attribute__((noreturn))，因为内部调用了
+ *         exit(2)，永远走不到调用它之后的代码。
+ * 【在测试中的角色】这是"遇到真错误就立即停"的快速失败开关。smoke 测试
+ *         里几乎每个系统调用/ioctl 失败后都会调它，保证一旦某步出错就
+ *         马上停下并报清楚是哪一步、errno 是多少，方便定位问题。
+ * 【新手提示】errno 是 C 标准的全局错误号，系统调用返回 -1 时它被设置；
+ *         strerror(err) 把数字错误码翻译成人能读的英文描述（如
+ *         "Permission denied"）。noreturn 是给编译器的提示，告诉它这个
+ *         函数不会返回，从而避免"函数可能没返回值"之类的误报警告。
+ * ──────────────────────────────────────────────────────────── */
 static void __attribute__((noreturn)) step_fail(int err, const char* fmt, ...) {
     va_list ap;
     g_step++;
@@ -122,6 +166,22 @@ static void __attribute__((noreturn)) step_fail(int err, const char* fmt, ...) {
 
 #define NVME_REG_CAP    0x0000   /* 64-bit Controller Capabilities */
 
+/* ────────────────────────────────────────────────────────────
+ * 【函数】mmio_read64(volatile void* base, size_t off)
+ * 【作用】从一段已经 mmap 进来的设备内存里，按偏移读出一个 64 位的值。
+ *         本测试只用它来读 NVMe 的 CAP 寄存器。
+ * 【参数】base 是 BAR0 被 mmap 到用户空间后的起始地址；off 是要读的
+ *         寄存器相对 BAR0 起点的字节偏移（这里 CAP 的偏移是 0x0000）。
+ * 【返回】返回该偏移处的 64 位寄存器原始值。
+ * 【在测试中的角色】对应流程 [5]：把 BAR0 起点加上偏移得到寄存器地址，
+ *         直接解引用读出 CAP，用来验证"BAR0 确实映射到了真实的控制器
+ *         寄存器空间"，并顺便解码出队列深度等字段做合理性检查。
+ * 【新手提示】MMIO（Memory-Mapped I/O）指设备寄存器被映射成内存地址，
+ *         读写这块内存就等于读写硬件寄存器。BAR0 是 PCIe 设备的第 0 号
+ *         基址寄存器，NVMe 控制器的核心寄存器（CAP、版本、Admin 队列
+ *         门铃等）都在这里。volatile 关键字告诉编译器"这块内存随时可能
+ *         被硬件改变，不许优化掉读操作"，对设备寄存器是必须的。
+ * ──────────────────────────────────────────────────────────── */
 static uint64_t mmio_read64(volatile void* base, size_t off) {
     /*
      * x86 supports unaligned 64-bit MMIO loads; if you port this to
@@ -135,6 +195,21 @@ static uint64_t mmio_read64(volatile void* base, size_t off) {
 /* BDF parser                                                         */
 /* ------------------------------------------------------------------ */
 
+/* ────────────────────────────────────────────────────────────
+ * 【函数】parse_bdf(const char* s, struct pci_device_addr* out)
+ * 【作用】把命令行传进来的 PCI 地址字符串（如 "0000:50:00.0"）解析成
+ *         结构体里的四个数字字段。
+ * 【参数】s 是用户输入的地址字符串；out 是输出结构体，解析成功后它的
+ *         domain/bus/slot/func 四个字段会被填好。
+ * 【返回】成功返回 0，格式不对返回 -1。
+ * 【在测试中的角色】程序一开始就要把用户给的设备地址变成内核 ioctl 能
+ *         接受的二进制结构，之后所有"创建字符设备 / 绑定 / 解绑"的
+ *         ioctl 都靠这个结构来指明操作的是哪一块 NVMe 卡。
+ * 【新手提示】BDF 是 PCI 设备的标准定位法："域:总线:设备.功能"
+ *         （Domain:Bus:Device.Function），唯一标识一块插在 PCIe 上的卡。
+ *         代码里 slot 对应 Device 号。sscanf 用 "%x" 按十六进制读，正好
+ *         匹配 BDF 各段用十六进制书写的惯例；返回值 4 表示四段都读到了。
+ * ──────────────────────────────────────────────────────────── */
 static int parse_bdf(const char* s, struct pci_device_addr* out) {
     /* Accept the canonical "DDDD:BB:DD.F" form, e.g. "0000:50:00.0". */
     return sscanf(s, "%x:%x:%x.%x",
@@ -145,6 +220,22 @@ static int parse_bdf(const char* s, struct pci_device_addr* out) {
 /* Convenience: ioctl wrapper that turns -1 into errno-with-context.   */
 /* ------------------------------------------------------------------ */
 
+/* ────────────────────────────────────────────────────────────
+ * 【函数】do_ioctl(int fd, unsigned long req, void* arg, const char* what)
+ * 【作用】对 ioctl() 的一层薄封装：照常发出 ioctl，如果失败就打印一条
+ *         带名字和错误描述的日志，再把 errno 恢复好交还给调用者。
+ * 【参数】fd 是要操作的文件描述符（/dev/snvm_control 或 /dev/ssnvme<N>）；
+ *         req 是 ioctl 命令号（如 SNVM_CHRDEV_CREATE）；arg 是指向命令参数
+ *         结构体的指针；what 是给人看的命令名字符串，用于日志。
+ * 【返回】成功返回 ioctl 的返回值（通常 0），失败返回 -1 并保证 errno
+ *         仍是失败时的值（中途打印 strerror 不会把它冲掉）。
+ * 【在测试中的角色】本测试和内核交互几乎全靠 ioctl，这个包装让每个调用点
+ *         少写一遍"判负、取 errno、打印名字"的样板代码，失败信息也更统一。
+ * 【新手提示】ioctl（I/O control）是 Linux 里"对设备文件下达特殊命令"的
+ *         通用入口：普通 read/write 之外的设备专有操作都走它，命令号 + 参数
+ *         结构体由驱动自己定义。这里特意先把 errno 存进局部变量 e，是因为
+ *         fprintf/strerror 等调用可能顺手改动全局 errno，存一份再写回才稳妥。
+ * ──────────────────────────────────────────────────────────── */
 static int do_ioctl(int fd, unsigned long req, void* arg, const char* what) {
     int r = ioctl(fd, req, arg);
     if (r < 0) {
@@ -159,6 +250,19 @@ static int do_ioctl(int fd, unsigned long req, void* arg, const char* what) {
 /* Argument parsing                                                   */
 /* ------------------------------------------------------------------ */
 
+/* ────────────────────────────────────────────────────────────
+ * 【函数】usage(const char* prog)
+ * 【作用】把程序的用法说明打印到 stderr，包括两种运行模式的示例命令。
+ * 【参数】prog 是程序名（一般传 argv[0]），用来把示例命令里的程序名
+ *         替换成实际调用的名字。
+ * 【返回】无返回值；只打印。
+ * 【在测试中的角色】当用户没给设备地址、给了多余参数、或显式请求 --help
+ *         时被调用，告诉用户该怎么正确运行（安全的 UAPI-smoke 还是
+ *         破坏性的 --bind 全流程）。
+ * 【新手提示】argv[0] 是命令行里程序自己的名字，argc 是参数个数。把用法
+ *         打到 stderr 而不是 stdout，是 Unix 命令行工具的惯例，方便和
+ *         正常输出区分、也方便脚本重定向。
+ * ──────────────────────────────────────────────────────────── */
 static void usage(const char* prog) {
     fprintf(stderr,
         "Usage: %s [--bind] <PCI_BDF>\n"
@@ -167,6 +271,55 @@ static void usage(const char* prog) {
         prog, prog, prog);
 }
 
+/* ────────────────────────────────────────────────────────────
+ * 【函数】main(int argc, char** argv)
+ * 【作用】整个 smoke 测试的主体：按固定顺序把"用户态↔SNVMe 内核模块"
+ *         的每一个入口都走一遍，任何一步出错就立刻失败退出。
+ * 【参数】argc/argv 是命令行参数。识别两类输入：可选的 --bind 开关，
+ *         以及必填的 PCI 设备地址 BDF（如 0000:50:00.0）。--help/-h 打印用法。
+ * 【返回】全部步骤通过返回 0；用法错误返回 1；某步失败时由 step_fail 退出码 2。
+ *
+ * 【在测试中的角色 / 完整执行流程】
+ *   先解析参数、用 parse_bdf 把 BDF 变成结构体，然后分三段执行：
+ *
+ *   ── UAPI-smoke 段（默认总会跑，安全、不碰 NVMe 数据通路）──
+ *     [1] open /dev/snvm_control —— 打开"字符设备工厂"控制节点，
+ *         证明 SNVMe 核心模块已加载、控制入口存在。
+ *     [2] SNVM_CHRDEV_CREATE(BDF) —— 让内核为这块卡创建一个专属字符设备，
+ *         内核把分配到的 minor（次设备号）写回结构体的 domain 字段。
+ *     [3] open /dev/ssnvme<minor> —— 打开刚创建的 per-controller 字符设备，
+ *         证明它真的可用（注意前缀是 ssnvme，刻意和系统自带 nvme 区分开）。
+ *     [4] mmap(BAR0) —— 把控制器的 BAR0 寄存器空间映射进用户内存（8 KiB）。
+ *     [5] 读 CAP 寄存器 —— 用 mmio_read64 读出 CAP 并解码 mqes/dstrd；
+ *         全 0 说明 BAR0 没映射到真东西（真错，失败）；全 0xFF 说明控制器
+ *         可能掉电（只警告、继续）。
+ *     [6] NVM_SET_IOQ_NUM(2) —— 通过 struct nvm_ioctl_setup 告诉内核要用
+ *         1 个 SQ + 1 个 CQ，队列放在主机内存里，设置好内核侧状态。
+ *     [7] mmap 一页主机内存并 NVM_MAP_HOST_MEMORY 映射成 0 号队列的 SQ 环。
+ *     [8] 同样映射一页作为 0 号队列的 CQ 环（注意队列号是 0 起算的）。
+ *     [9] NVM_SET_SHARE_REG(1) —— 打开 use_sreg 门控，完成队列共享状态机配置。
+ *
+ *   ── --bind 段（只有给了 --bind 才跑，破坏性，会真正接管设备）──
+ *     [B1] SNVM_DEVICE_BIND(BDF) —— 真正触发内核 s_nvme_probe，让 SNVMe
+ *          接管控制器；之后轮询等待探测完成（最多约 10 秒）。
+ *     [B2] NVM_GET_DEV_INFO —— 取回磁盘名、用户队列数、块大小等信息。
+ *     [B3] open /dev/<disk_name> 并 pread 512 字节 —— 证明块设备真能读数据。
+ *     [B4] SNVM_DEVICE_UNBIND(BDF) —— 解绑，把设备还回去。
+ *
+ *   ── 清理段（总会跑，把前面占用的东西按相反顺序释放）──
+ *     [F1] NVM_UNMAP_HOST_MEMORY ×2 + NVM_CLEAR_IOQ_NUM —— 解映射 SQ/CQ 环、
+ *          清空队列数，验证内核状态机能干净复位。
+ *     [F2] munmap(BAR0) + close(/dev/ssnvme<N>) —— 释放 BAR0 映射、关字符设备。
+ *     [F3] SNVM_CHRDEV_REMOVE(BDF) —— 让内核回收那个 minor，最后关掉控制节点。
+ *
+ *   整体在验证：SNVMe 模块从"创建字符设备 → 映射寄存器 → 配置队列 →
+ *   （可选）真正驱动磁盘读数据 → 干净拆除"这一整条路径在当前内核上都正常。
+ *
+ * 【新手提示】minor（次设备号）是内核区分"同一类设备里的第几个实例"的编号；
+ *   mmap 把内核/设备的一段内存映射到用户进程地址空间，之后像普通指针一样
+ *   访问；SQ/CQ 是 NVMe 的提交队列/完成队列——主机把读写命令放进 SQ，
+ *   控制器把完成结果写进 CQ，是 NVMe 数据通路的核心环形缓冲区。
+ * ──────────────────────────────────────────────────────────── */
 int main(int argc, char** argv) {
     int do_bind = 0;
     const char* bdf_str = NULL;

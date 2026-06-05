@@ -63,6 +63,18 @@
 
 static int g_step = 0;
 
+/* ────────────────────────────────────────────────────────────
+ * 【函数】step_ok(fmt, ...)
+ * 【作用】打印一条 "[ OK ] step=N ..." 的成功日志，并把全局步骤
+ *         计数器 g_step 自增 1。是个像 printf 一样的变参函数。
+ * 【参数】fmt 是格式化字符串（同 printf）；后面跟可变参数，填进 fmt。
+ * 【返回】无返回值（void）。只往 stderr 写日志，不会让程序退出。
+ * 【在测试中的角色】每完成冒烟测试的一小步就调它一次，给操作员一条
+ *         带编号的可读记录，方便对照哪一步过了。
+ * 【新手提示】va_list / va_start / vfprintf 是 C 处理“参数个数不定”
+ *         函数（变参函数）的标准三件套；vfprintf 就是接收 va_list 版
+ *         的 fprintf。stderr 是标准错误流，这里所有日志都走它。
+ * ──────────────────────────────────────────────────────────── */
 static void step_ok(const char* fmt, ...) {
     va_list ap;
     g_step++;
@@ -73,6 +85,20 @@ static void step_ok(const char* fmt, ...) {
     fputc('\n', stderr);
 }
 
+/* ────────────────────────────────────────────────────────────
+ * 【函数】step_fail(err, fmt, ...)
+ * 【作用】打印一条 "[FAIL] step=N ... errno=E (描述)" 的失败日志，
+ *         然后直接 exit(2) 终止整个进程——这一步出错就不再继续了。
+ * 【参数】err 是要打印的 errno 值（0 表示“此处无 errno 可言”，会显示
+ *         n/a）；fmt + 可变参数同 printf，描述失败原因。
+ * 【返回】不返回。函数带 __attribute__((noreturn))，告诉编译器它绝不
+ *         会执行到结尾（因为里面会 exit(2)）。退出码 2 = 某步冒烟失败。
+ * 【在测试中的角色】测试里所有“断言失败 / ioctl 失败”的统一出口，
+ *         保证一旦出错立刻停下并给出清晰原因。
+ * 【新手提示】errno 是 C/Unix 里系统调用失败后设置的全局错误码；
+ *         strerror(errno) 把它翻成人话（如 "No such device"）。
+ *         noreturn 让编译器知道调用它之后的代码不可达，避免误报警告。
+ * ──────────────────────────────────────────────────────────── */
 static void __attribute__((noreturn)) step_fail(int err, const char* fmt, ...) {
     va_list ap;
     g_step++;
@@ -84,11 +110,39 @@ static void __attribute__((noreturn)) step_fail(int err, const char* fmt, ...) {
     exit(2);
 }
 
+/* ────────────────────────────────────────────────────────────
+ * 【函数】parse_bdf(s, out)
+ * 【作用】把命令行传进来的 PCI 地址字符串（形如 "0000:50:00.0"）
+ *         解析成结构体 pci_device_addr 的四个字段。
+ * 【参数】s   输入字符串，格式 DDDD:BB:DD.F（域:总线:槽.功能，十六进制）；
+ *         out 输出，解析出的 domain/bus/slot/func 写进它的四个成员。
+ * 【返回】成功（恰好读到 4 个字段）返回 0；否则返回 -1。
+ * 【在测试中的角色】程序启动时第一步，把用户给的 BDF 文本变成内核 ioctl
+ *         能用的二进制地址；解析失败就直接报“Bad BDF”退出。
+ * 【新手提示】BDF = Bus/Device(Slot)/Function，是 PCIe 设备在系统里的
+ *         唯一定位；前面再加一个 4 位 domain 段。sscanf 的 "%x" 表示按
+ *         十六进制读，返回值是“成功匹配并赋值的字段个数”，所以这里判 ==4。
+ * ──────────────────────────────────────────────────────────── */
 static int parse_bdf(const char* s, struct pci_device_addr* out) {
     return sscanf(s, "%x:%x:%x.%x",
                   &out->domain, &out->bus, &out->slot, &out->func) == 4 ? 0 : -1;
 }
 
+/* ────────────────────────────────────────────────────────────
+ * 【函数】do_ioctl(fd, req, arg, what)
+ * 【作用】对内核驱动发起一次 ioctl 系统调用的薄封装；如果失败，先把
+ *         出错的命令名打到 stderr，再把 errno 原样恢复后返回。
+ * 【参数】fd   已打开的设备文件描述符（如 /dev/ssnvmeN 或 /dev/snvm_control）；
+ *         req  ioctl 命令号（如 NVM_ADD_USER_QUEUE 这些宏）；
+ *         arg  指向与该命令配套的参数结构体的指针；
+ *         what 命令的可读名字，仅用于出错日志。
+ * 【返回】透传 ioctl 的返回值：成功通常为 0，失败为负数（同时 errno 有效）。
+ * 【在测试中的角色】几乎所有跟内核交互都走它，统一了“失败先打印再返回”
+ *         的行为，省去每个调用点都写一遍报错。
+ * 【新手提示】ioctl 是 Unix 里“给设备下达自定义控制命令”的通用入口；
+ *         它在内核态可能改写 errno，这里特意把 errno 暂存再恢复，避免
+ *         中间的 fprintf 把 errno 覆盖掉，保证调用方拿到真正的错误码。
+ * ──────────────────────────────────────────────────────────── */
 static int do_ioctl(int fd, unsigned long req, void* arg, const char* what) {
     int r = ioctl(fd, req, arg);
     if (r < 0) {
@@ -99,6 +153,16 @@ static int do_ioctl(int fd, unsigned long req, void* arg, const char* what) {
     return r;
 }
 
+/* ────────────────────────────────────────────────────────────
+ * 【函数】usage(prog)
+ * 【作用】把本程序的用法说明打到 stderr：怎么调、参数是什么、并警告
+ *         它会“绑定控制器（破坏性）”。
+ * 【参数】prog 程序自己的名字（一般传 argv[0]），用来拼出示例命令行。
+ * 【返回】无返回值。只打印帮助文本，不退出（退不退由 main 决定）。
+ * 【在测试中的角色】参数个数不对、或用户传 --help 时显示帮助。
+ * 【新手提示】“破坏性/destructive”指它会把目标 NVMe 控制器从原驱动夺过来
+ *         绑到本测试驱动上，因此不能在挂着文件系统、正在使用的盘上跑。
+ * ──────────────────────────────────────────────────────────── */
 static void usage(const char* prog) {
     fprintf(stderr,
         "Usage: %s <PCI_BDF>\n"
@@ -110,6 +174,21 @@ static void usage(const char* prog) {
         prog, prog);
 }
 
+/* ────────────────────────────────────────────────────────────
+ * 【函数】round_up_pages(n_bytes, page_size)
+ * 【作用】把字节数 n_bytes 向上取整到 page_size 的整数倍（“凑整到整页”）。
+ *         例如 page_size=4096 时，把 100 变成 4096，把 5000 变成 8192。
+ * 【参数】n_bytes   原始字节数；page_size 一页的字节数（通常 4096）。
+ * 【返回】>= n_bytes 的、能被 page_size 整除的最小值（字节数）。
+ * 【在测试中的角色】给 SQ/CQ 环算实际要申请的、对齐到整页的大小；也用来
+ *         算环占了几页（除以 page_size）。
+ * 【新手提示】为什么 NVMe 的 SQ/CQ 环必须页对齐？因为创建 I/O 队列时，
+ *         环的物理首地址通过 PRP1 这个字段交给控制器，而 PRP（物理区域页）
+ *         寻址要求地址按页对齐——即低 12 位（4096=2^12）必须为 0。只有
+ *         整页对齐、整页大小，控制器才能正确按页定位整个环。这里的取整就是
+ *         为后面 posix_memalign 申请整页内存做准备。
+ *         常用取整套路：(n + p - 1) / p * p。
+ * ──────────────────────────────────────────────────────────── */
 /*
  * Round n_bytes up to the nearest multiple of page_size.
  */
@@ -117,6 +196,23 @@ static size_t round_up_pages(size_t n_bytes, long page_size) {
     return ((n_bytes + page_size - 1) / page_size) * page_size;
 }
 
+/* ────────────────────────────────────────────────────────────
+ * 【函数】alloc_ring(bytes, page_size)
+ * 【作用】申请一块“页对齐 + 整页大小 + 已清零”的主机内存，专门用作
+ *         一个 NVMe SQ 或 CQ 环的缓冲区。
+ * 【参数】bytes     环需要的逻辑字节数（如 q_depth*64 或 q_depth*16）；
+ *         page_size 一页字节数，用作对齐边界，并把 bytes 取整到整页。
+ * 【返回】成功返回指向缓冲区的指针；失败（posix_memalign 出错）返回 NULL，
+ *         调用方据此 step_fail。
+ * 【在测试中的角色】Phase 4 给每个 SQ/CQ 环分配真实主机页，随后这块内存的
+ *         虚拟地址会注册给内核、最终作为 I/O 队列的环交给控制器。
+ * 【新手提示】为什么一定要 posix_memalign 而不能用普通 malloc？因为 NVMe
+ *         创建 I/O SQ/CQ 时，环的物理首地址要填进 PRP1，而 PRP1 要求地址
+ *         页对齐（低 12 位为 0）。malloc 不保证任何对齐，posix_memalign 能
+ *         保证按 page_size 对齐，恰好满足“低 12 位为 0”。另外缓冲区清零很
+ *         关键：CQ 环要靠 phase（相位）位判断条目是否是控制器新写的，首圈
+ *         必须从 0 开始；清零也避免调试早期读到假的 NVMe 状态码。
+ * ──────────────────────────────────────────────────────────── */
 /*
  * Allocate a page-aligned host buffer suitable for use as an NVMe
  * SQ/CQ ring.  We MUST use posix_memalign (or aligned mmap) because
@@ -136,6 +232,51 @@ static void* alloc_ring(size_t bytes, long page_size) {
     return p;
 }
 
+/* ────────────────────────────────────────────────────────────
+ * 【函数】main(argc, argv)
+ * 【作用】整个 B3 冒烟测试的主流程：从命令行拿到 PCI BDF，按 Phase 0~10
+ *         一步步把“建组 → 绑定 → 取设备信息 → 分配/注册环 → 建用户队列 →
+ *         做负面校验 → 销毁级联 → 解绑收尾”跑完一遍。中途任一步失败即
+ *         step_fail 退出（码 2）。
+ * 【参数】argc/argv：要求恰好一个参数，即目标控制器的 PCI BDF（如
+ *         "0000:50:00.0"）；传 --help 或参数个数不对则打印用法。
+ * 【返回】0=全部通过；1=用法错误；2=某步失败（由 step_fail 内部 exit）。
+ *
+ * 【完整流程（Phase 0~10）】
+ *   Phase 0  打开控制面 /dev/snvm_control，用 SNVM_CHRDEV_CREATE 为该 BDF
+ *            建出字符设备，再打开 /dev/ssnvmeN（N 是返回的 minor）。
+ *   Phase 1  绑定之前先 NVM_CREATE_QUEUE_GROUP 建一个队列组，证明“组的
+ *            生命周期与是否绑定无关”，并拿到 group_id。
+ *   [4]      绑定之前对该组发 NVM_ADD_USER_QUEUE，必须返回 -ENODEV（控制器
+ *            还没绑、没存活），验证内核的存活性检查在前。
+ *   [4b]     NVM_SET_KERNEL_IOQ_CAP 把内核侧 IOQ 数量上限压到 36，给用户
+ *            队列池留出足够的 QID，避免后面 Create I/O CQ 因 QID 用光而失败。
+ *   Phase 2  SNVM_DEVICE_BIND 真正绑定控制器（破坏性操作）。
+ *   Phase 3  轮询 NVM_GET_DEV_INFO 直到 probe 完成，读出 q_depth、bar0_size、
+ *            max_user_qid、max_queues_per_group 等并做合理性断言。
+ *   Phase 4  按 q_depth 算 SQ(=q_depth*64B)/CQ(=q_depth*16B) 大小，校验每个
+ *            环不超过一页（单 PRP 限制），用 alloc_ring 分配 2 对 SQ+CQ 环。
+ *   Phase 5  对每个环发 NVM_MAP_HOST_MEMORY，把它的虚拟地址登记到 group_id 下，
+ *            供后续按 (group, vaddr) 反查。
+ *   Phase 6  NVM_ADD_USER_QUEUE 批量提交 2 对 (sq_vaddr, cq_vaddr)，内核走
+ *            Create I/O CQ + Create I/O SQ admin 路径真正建队列，返回每队列的
+ *            qid 和 BAR0 上的 doorbell 偏移（断言非 0）。
+ *   Phase 7  负面：再加“超过本组 max_queues_per_group”的队列，必须被拒，
+ *            errno 为 EBUSY（超额）或 ENOENT（额度过了但 vaddr 查不到）。
+ *   Phase 8  NVM_DESTROY_QUEUE_GROUP 销毁组，内核级联 Delete I/O SQ + CQ、
+ *            释放 QID、清空所有 map。
+ *   Phase 9  负面：对已销毁的 group_id 再 NVM_ADD_USER_QUEUE，必须 -ENOENT。
+ *            随后 free 掉用户侧环内存（内核侧 map 已被销毁级联清掉）。
+ *   Phase 10 收尾：SNVM_DEVICE_UNBIND 解绑、close 设备、SNVM_CHRDEV_REMOVE
+ *            删字符设备、close 控制面，打印总通过数并返回 0。
+ *
+ * 【在测试中的角色】本文件的总驱动；本测试只验证“建/销用户队列”的控制路径，
+ *         全程不发 NVMe 读写 IO、不敲 doorbell。
+ * 【新手提示】doorbell（门铃）是 BAR0 寄存器空间里的一组寄存器，软件往里写
+ *         队列尾/头索引来“通知”控制器有新命令或已消费完成项；本测试只取回
+ *         偏移、不去写它。admin 路径指通过控制器的管理队列下发 Create/Delete
+ *         I/O Queue 这类管理命令。
+ * ──────────────────────────────────────────────────────────── */
 int main(int argc, char** argv) {
     if (argc != 2 || strcmp(argv[1], "--help") == 0) {
         usage(argv[0]);
