@@ -39,6 +39,37 @@
 #include <linux/types.h>
 
 /*
+ * [SNVME-NPU 迁移修改 batch5] 与「真实 NVIDIA nv-p2p.h」共存防护
+ * --------------------------------------------------------------
+ * 现象（服务器上 make 报错）：
+ *   error: redefinition of 'struct nvidia_p2p_page_table'
+ *   error: conflicting types for 'nvidia_p2p_page_table_t' / 'nvidia_p2p_dma_mapping_t'
+ *   →级联到 error: conflicting types for 'nvfs_nvidia_p2p_dma_unmap_pages'
+ *     （它的形参引用了上面这两个被重复定义、彼此不兼容的结构体）
+ *     以及 nvfs-p2p.c:147 那行调用的实参类型报错。
+ *
+ * 根因：本桩头的 include guard 是 SNVME_NPU_STUB_NV_P2P_H，而 NVIDIA 官方
+ *       nv-p2p.h 的 guard 是 _NV_P2P_H_，两者**不同**。一旦机器上装了
+ *       NVIDIA 驱动/GDS（其头位于 /usr/src/nvidia-<ver>/nvidia/nv-p2p.h 等），
+ *       且它出现在内核模块的 -I 搜索路径里，两份头会**同时**被预处理器展开
+ *       → 同名结构体 nvidia_p2p_page_table / nvidia_p2p_dma_mapping 被定义两次
+ *       （字段还不一样：真头有 version/page_size/pages/gpu_uuid… 桩头只有 entries），
+ *       于是 redefinition / conflicting types。本机 5.15 之所以不报，是因为
+ *       `#include "nv-p2p.h"` 的引号查找优先命中本目录桩头、真头不在内核构建
+ *       搜索路径里，纯属运气；换台装了 NVIDIA 头的机器（或路径不同）就会撞车。
+ *
+ * 修法（顺手 + 反向 双向防护，与 include 顺序无关）：
+ *   下面把类型定义再套一层 `_NV_P2P_H_` 守卫并主动 #define 它。
+ *   - 桩头先被包含：占用 _NV_P2P_H_ → 之后任何真头再被 #include 时整段被跳过，
+ *     不会重复定义（host-only 只需要这两个结构体，真头其余声明用不到）。
+ *   - 真头先被包含：_NV_P2P_H_ 已定义 → 跳过桩头的类型定义，直接用真头那份
+ *     （真结构体同样有 entries / dma_addresses 字段，snvme 读取兼容）。
+ * 两种顺序都只剩**一份**定义，彻底消除 redefinition / conflicting types。
+ */
+#ifndef _NV_P2P_H_
+#define _NV_P2P_H_
+
+/*
  * snvme 把它当句柄在 get_pages / put_pages / dma_map_pages 之间传递，
  * 并在 device 路径里读 ->entries（拿到的 GPU 页数）。真实 NVIDIA 结构体
  * 里还有 version/page_size/pages[] 等，host-only 用不到，省略。
@@ -59,4 +90,5 @@ struct nvidia_p2p_dma_mapping {
 };
 typedef struct nvidia_p2p_dma_mapping nvidia_p2p_dma_mapping_t;
 
+#endif /* _NV_P2P_H_  —— 与真实 NVIDIA nv-p2p.h 共存防护，见顶部 batch5 说明 */
 #endif /* SNVME_NPU_STUB_NV_P2P_H */
