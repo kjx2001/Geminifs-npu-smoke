@@ -5,9 +5,8 @@
 #include <asm/errno.h>
 #include <linux/compiler.h>
 
-
-
-void list_init(struct list* list)
+//  head 自环：head.prev = head.next = &head；初始化自旋锁
+void list_init(struct list *list)
 {
     list->head.list = list;
     list->head.prev = &list->head;
@@ -16,9 +15,8 @@ void list_init(struct list* list)
     spin_lock_init(&list->lock);
 }
 
-
-
-void list_remove(struct list_node* element)
+// 摘除：prev->next=next; next->prev=prev; 然后把 e 的指针清 NULL
+void list_remove(struct list_node *element)
 {
     if (likely(element != NULL && element->list != NULL && element != &element->list->head))
     {
@@ -33,11 +31,10 @@ void list_remove(struct list_node* element)
     }
 }
 
-
-
-void list_insert(struct list* list, struct list_node* element)
+// 尾插：插到 head.prev 之后（加 spinlock 保护）
+void list_insert(struct list *list, struct list_node *element)
 {
-    struct list_node* last = NULL;
+    struct list_node *last = NULL;
 
     spin_lock(&list->lock);
     last = list->head.prev;
@@ -51,4 +48,3 @@ void list_insert(struct list* list, struct list_node* element)
 
     spin_unlock(&list->lock);
 }
-

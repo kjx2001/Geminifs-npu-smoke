@@ -3,8 +3,8 @@
  * Copyright (c) 2011-2014, Intel Corporation.
  * Copyright (c) 2017-2021 Christoph Hellwig.
  */
-#include <linux/version.h>	/* [SNVME-NPU] 5.10/5.15 内核 API 差异条件编译 */
-#include <linux/ptrace.h>	/* for force_successful_syscall_return */
+#include <linux/version.h> /* [SNVME-NPU] 5.10/5.15 内核 API 差异条件编译 */
+#include <linux/ptrace.h>  /* for force_successful_syscall_return */
 #include <linux/nvme_ioctl.h>
 #include "nvme.h"
 
@@ -21,7 +21,7 @@ static void __user *nvme_to_user_ptr(uintptr_t ptrval)
 }
 
 static void *nvme_add_user_metadata(struct bio *bio, void __user *ubuf,
-		unsigned len, u32 seed, bool write)
+									unsigned len, u32 seed, bool write)
 {
 	struct bio_integrity_payload *bip;
 	int ret = -ENOMEM;
@@ -36,7 +36,8 @@ static void *nvme_add_user_metadata(struct bio *bio, void __user *ubuf,
 		goto out_free_meta;
 
 	bip = bio_integrity_alloc(bio, GFP_KERNEL, 1);
-	if (IS_ERR(bip)) {
+	if (IS_ERR(bip))
+	{
 		ret = PTR_ERR(bip);
 		goto out_free_meta;
 	}
@@ -44,7 +45,7 @@ static void *nvme_add_user_metadata(struct bio *bio, void __user *ubuf,
 	bip->bip_iter.bi_size = len;
 	bip->bip_iter.bi_sector = seed;
 	ret = bio_integrity_add_page(bio, virt_to_page(buf), len,
-			offset_in_page(buf));
+								 offset_in_page(buf));
 	if (ret == len)
 		return buf;
 	ret = -ENOMEM;
@@ -55,9 +56,9 @@ out:
 }
 
 static int nvme_submit_user_cmd(struct request_queue *q,
-		struct nvme_command *cmd, void __user *ubuffer,
-		unsigned bufflen, void __user *meta_buffer, unsigned meta_len,
-		u32 meta_seed, u64 *result, unsigned timeout)
+								struct nvme_command *cmd, void __user *ubuffer,
+								unsigned bufflen, void __user *meta_buffer, unsigned meta_len,
+								u32 meta_seed, u64 *result, unsigned timeout)
 {
 	bool write = nvme_is_write(cmd);
 	struct nvme_ns *ns = q->queuedata;
@@ -65,7 +66,7 @@ static int nvme_submit_user_cmd(struct request_queue *q,
 	 * 5.10 的 gendisk->part0 是内嵌的 struct hd_struct（非指针），不能赋给
 	 * block_device*。5.10 改用 gendisk*，并通过 bio->bi_disk 关联 bio（5.14
 	 * 才把 bi_disk/bi_partno 合并成 bi_bdev、用 bio_set_dev）。 */
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5,15,0)
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 15, 0)
 	struct gendisk *udisk = ns ? ns->disk : NULL;
 #else
 	struct block_device *bdev = ns ? ns->disk->part0 : NULL;
@@ -83,25 +84,29 @@ static int nvme_submit_user_cmd(struct request_queue *q,
 		req->timeout = timeout;
 	nvme_req(req)->flags |= NVME_REQ_USERCMD;
 
-	if (ubuffer && bufflen) {
+	if (ubuffer && bufflen)
+	{
 		ret = blk_rq_map_user(q, req, NULL, ubuffer, bufflen,
-				GFP_KERNEL);
+							  GFP_KERNEL);
 		if (ret)
 			goto out;
 		bio = req->bio;
 		/* [SNVME-NPU] 5.15→5.10：bio 与磁盘的关联方式不同（见上方注释）。 */
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5,15,0)
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 15, 0)
 		if (udisk)
 			bio->bi_disk = udisk;
-		if (udisk && meta_buffer && meta_len) {
+		if (udisk && meta_buffer && meta_len)
+		{
 #else
 		if (bdev)
 			bio_set_dev(bio, bdev);
-		if (bdev && meta_buffer && meta_len) {
+		if (bdev && meta_buffer && meta_len)
+		{
 #endif
 			meta = nvme_add_user_metadata(bio, meta_buffer, meta_len,
-					meta_seed, write);
-			if (IS_ERR(meta)) {
+										  meta_seed, write);
+			if (IS_ERR(meta))
+			{
 				ret = PTR_ERR(meta);
 				goto out_unmap;
 			}
@@ -112,20 +117,21 @@ static int nvme_submit_user_cmd(struct request_queue *q,
 	ret = nvme_execute_passthru_rq(req);
 	if (result)
 		*result = le64_to_cpu(nvme_req(req)->result.u64);
-	if (meta && !ret && !write) {
+	if (meta && !ret && !write)
+	{
 		if (copy_to_user(meta_buffer, meta, meta_len))
 			ret = -EFAULT;
 	}
 	kfree(meta);
- out_unmap:
+out_unmap:
 	if (bio)
 		blk_rq_unmap_user(bio);
- out:
+out:
 	blk_mq_free_request(req);
 	return ret;
 }
 
-
+// 提交一条简单读/写/compare。把用户的 `nvme_user_io` 组成 `rw` 命令下发
 static int nvme_submit_io(struct nvme_ns *ns, struct nvme_user_io __user *uio)
 {
 	struct nvme_user_io io;
@@ -138,7 +144,8 @@ static int nvme_submit_io(struct nvme_ns *ns, struct nvme_user_io __user *uio)
 	if (io.flags)
 		return -EINVAL;
 
-	switch (io.opcode) {
+	switch (io.opcode)
+	{
 	case nvme_cmd_write:
 	case nvme_cmd_read:
 	case nvme_cmd_compare:
@@ -150,7 +157,8 @@ static int nvme_submit_io(struct nvme_ns *ns, struct nvme_user_io __user *uio)
 	length = (io.nblocks + 1) << ns->lba_shift;
 
 	if ((io.control & NVME_RW_PRINFO_PRACT) &&
-	    ns->ms == sizeof(struct t10_pi_tuple)) {
+		ns->ms == sizeof(struct t10_pi_tuple))
+	{
 		/*
 		 * Protection information is stripped/inserted by the
 		 * controller.
@@ -159,15 +167,20 @@ static int nvme_submit_io(struct nvme_ns *ns, struct nvme_user_io __user *uio)
 			return -EINVAL;
 		meta_len = 0;
 		metadata = NULL;
-	} else {
+	}
+	else
+	{
 		meta_len = (io.nblocks + 1) * ns->ms;
 		metadata = nvme_to_user_ptr(io.metadata);
 	}
 
-	if (ns->features & NVME_NS_EXT_LBAS) {
+	if (ns->features & NVME_NS_EXT_LBAS)
+	{
 		length += meta_len;
 		meta_len = 0;
-	} else if (meta_len) {
+	}
+	else if (meta_len)
+	{
 		if ((io.metadata & 3) || !io.metadata)
 			return -EINVAL;
 	}
@@ -185,26 +198,28 @@ static int nvme_submit_io(struct nvme_ns *ns, struct nvme_user_io __user *uio)
 	c.rw.appmask = cpu_to_le16(io.appmask);
 
 	return nvme_submit_user_cmd(ns->queue, &c,
-			nvme_to_user_ptr(io.addr), length,
-			metadata, meta_len, lower_32_bits(io.slba), NULL, 0);
+								nvme_to_user_ptr(io.addr), length,
+								metadata, meta_len, lower_32_bits(io.slba), NULL, 0);
 }
 
 static bool nvme_validate_passthru_nsid(struct nvme_ctrl *ctrl,
-					struct nvme_ns *ns, __u32 nsid)
+										struct nvme_ns *ns, __u32 nsid)
 {
-	if (ns && nsid != ns->head->ns_id) {
+	if (ns && nsid != ns->head->ns_id)
+	{
 		dev_err(ctrl->device,
-			"%s: nsid (%u) in cmd does not match nsid (%u)"
-			"of namespace\n",
-			current->comm, nsid, ns->head->ns_id);
+				"%s: nsid (%u) in cmd does not match nsid (%u)"
+				"of namespace\n",
+				current->comm, nsid, ns->head->ns_id);
 		return false;
 	}
 
 	return true;
 }
 
+// **IO 命令透传**：用户给完整命令，在某个 ns 上执行
 static int nvme_user_cmd(struct nvme_ctrl *ctrl, struct nvme_ns *ns,
-			struct nvme_passthru_cmd __user *ucmd)
+						 struct nvme_passthru_cmd __user *ucmd)
 {
 	struct nvme_passthru_cmd cmd;
 	struct nvme_command c;
@@ -212,10 +227,14 @@ static int nvme_user_cmd(struct nvme_ctrl *ctrl, struct nvme_ns *ns,
 	u64 result;
 	int status;
 
+	// 权限检查：只有管理员（root）才能执行这个 ioctl
 	if (!capable(CAP_SYS_ADMIN))
 		return -EACCES;
+		
+	// copy_from_user 拷入 nvme_passthru_cmd 结构体
 	if (copy_from_user(&cmd, ucmd, sizeof(cmd)))
 		return -EFAULT;
+		
 	if (cmd.flags)
 		return -EINVAL;
 	if (!nvme_validate_passthru_nsid(ctrl, ns, cmd.nsid))
@@ -238,11 +257,12 @@ static int nvme_user_cmd(struct nvme_ctrl *ctrl, struct nvme_ns *ns,
 		timeout = msecs_to_jiffies(cmd.timeout_ms);
 
 	status = nvme_submit_user_cmd(ns ? ns->queue : ctrl->admin_q, &c,
-			nvme_to_user_ptr(cmd.addr), cmd.data_len,
-			nvme_to_user_ptr(cmd.metadata), cmd.metadata_len,
-			0, &result, timeout);
+								  nvme_to_user_ptr(cmd.addr), cmd.data_len,
+								  nvme_to_user_ptr(cmd.metadata), cmd.metadata_len,
+								  0, &result, timeout);
 
-	if (status >= 0) {
+	if (status >= 0)
+	{
 		if (put_user(result, &ucmd->result))
 			return -EFAULT;
 	}
@@ -250,8 +270,9 @@ static int nvme_user_cmd(struct nvme_ctrl *ctrl, struct nvme_ns *ns,
 	return status;
 }
 
+// 同上，64 位 result 版本
 static int nvme_user_cmd64(struct nvme_ctrl *ctrl, struct nvme_ns *ns,
-			struct nvme_passthru_cmd64 __user *ucmd)
+						   struct nvme_passthru_cmd64 __user *ucmd)
 {
 	struct nvme_passthru_cmd64 cmd;
 	struct nvme_command c;
@@ -284,11 +305,12 @@ static int nvme_user_cmd64(struct nvme_ctrl *ctrl, struct nvme_ns *ns,
 		timeout = msecs_to_jiffies(cmd.timeout_ms);
 
 	status = nvme_submit_user_cmd(ns ? ns->queue : ctrl->admin_q, &c,
-			nvme_to_user_ptr(cmd.addr), cmd.data_len,
-			nvme_to_user_ptr(cmd.metadata), cmd.metadata_len,
-			0, &cmd.result, timeout);
+								  nvme_to_user_ptr(cmd.addr), cmd.data_len,
+								  nvme_to_user_ptr(cmd.metadata), cmd.metadata_len,
+								  0, &cmd.result, timeout);
 
-	if (status >= 0) {
+	if (status >= 0)
+	{
 		if (put_user(cmd.result, &ucmd->result))
 			return -EFAULT;
 	}
@@ -306,9 +328,10 @@ static bool is_ctrl_ioctl(unsigned int cmd)
 }
 
 static int nvme_ctrl_ioctl(struct nvme_ctrl *ctrl, unsigned int cmd,
-		void __user *argp)
+						   void __user *argp)
 {
-	switch (cmd) {
+	switch (cmd)
+	{
 	case NVME_IOCTL_ADMIN_CMD:
 		return nvme_user_cmd(ctrl, NULL, argp);
 	case NVME_IOCTL_ADMIN64_CMD:
@@ -319,37 +342,40 @@ static int nvme_ctrl_ioctl(struct nvme_ctrl *ctrl, unsigned int cmd,
 }
 
 #ifdef COMPAT_FOR_U64_ALIGNMENT
-struct nvme_user_io32 {
-	__u8	opcode;
-	__u8	flags;
-	__u16	control;
-	__u16	nblocks;
-	__u16	rsvd;
-	__u64	metadata;
-	__u64	addr;
-	__u64	slba;
-	__u32	dsmgmt;
-	__u32	reftag;
-	__u16	apptag;
-	__u16	appmask;
+struct nvme_user_io32
+{
+	__u8 opcode;
+	__u8 flags;
+	__u16 control;
+	__u16 nblocks;
+	__u16 rsvd;
+	__u64 metadata;
+	__u64 addr;
+	__u64 slba;
+	__u32 dsmgmt;
+	__u32 reftag;
+	__u16 apptag;
+	__u16 appmask;
 } __attribute__((__packed__));
-#define NVME_IOCTL_SUBMIT_IO32	_IOW('N', 0x42, struct nvme_user_io32)
+#define NVME_IOCTL_SUBMIT_IO32 _IOW('N', 0x42, struct nvme_user_io32)
 #endif /* COMPAT_FOR_U64_ALIGNMENT */
 
+// `直接返回该 namespace 的 ns_id（最简单的查询）
 static int nvme_ns_ioctl(struct nvme_ns *ns, unsigned int cmd,
-		void __user *argp)
+						 void __user *argp)
 {
-	switch (cmd) {
+	switch (cmd)
+	{
 	case NVME_IOCTL_ID:
 		force_successful_syscall_return();
 		return ns->head->ns_id;
 	case NVME_IOCTL_IO_CMD:
 		return nvme_user_cmd(ns->ctrl, ns, argp);
-	/*
-	 * struct nvme_user_io can have different padding on some 32-bit ABIs.
-	 * Just accept the compat version as all fields that are used are the
-	 * same size and at the same offset.
-	 */
+		/*
+		 * struct nvme_user_io can have different padding on some 32-bit ABIs.
+		 * Just accept the compat version as all fields that are used are the
+		 * same size and at the same offset.
+		 */
 #ifdef COMPAT_FOR_U64_ALIGNMENT
 	case NVME_IOCTL_SUBMIT_IO32:
 #endif
@@ -364,13 +390,13 @@ static int nvme_ns_ioctl(struct nvme_ns *ns, unsigned int cmd,
 
 static int __nvme_ioctl(struct nvme_ns *ns, unsigned int cmd, void __user *arg)
 {
-       if (is_ctrl_ioctl(cmd))
-               return nvme_ctrl_ioctl(ns->ctrl, cmd, arg);
-       return nvme_ns_ioctl(ns, cmd, arg);
+	if (is_ctrl_ioctl(cmd))
+		return nvme_ctrl_ioctl(ns->ctrl, cmd, arg);
+	return nvme_ns_ioctl(ns, cmd, arg);
 }
 
 int nvme_ioctl(struct block_device *bdev, fmode_t mode,
-		unsigned int cmd, unsigned long arg)
+			   unsigned int cmd, unsigned long arg)
 {
 	struct nvme_ns *ns = bdev->bd_disk->private_data;
 
@@ -387,7 +413,7 @@ long nvme_ns_chr_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 
 #ifdef CONFIG_NVME_MULTIPATH
 static int nvme_ns_head_ctrl_ioctl(struct nvme_ns *ns, unsigned int cmd,
-		void __user *argp, struct nvme_ns_head *head, int srcu_idx)
+								   void __user *argp, struct nvme_ns_head *head, int srcu_idx)
 	__releases(&head->srcu)
 {
 	struct nvme_ctrl *ctrl = ns->ctrl;
@@ -402,7 +428,7 @@ static int nvme_ns_head_ctrl_ioctl(struct nvme_ns *ns, unsigned int cmd,
 }
 
 int nvme_ns_head_ioctl(struct block_device *bdev, fmode_t mode,
-		unsigned int cmd, unsigned long arg)
+					   unsigned int cmd, unsigned long arg)
 {
 	struct nvme_ns_head *head = bdev->bd_disk->private_data;
 	void __user *argp = (void __user *)arg;
@@ -429,7 +455,7 @@ out_unlock:
 }
 
 long nvme_ns_head_chr_ioctl(struct file *file, unsigned int cmd,
-		unsigned long arg)
+							unsigned long arg)
 {
 	struct cdev *cdev = file_inode(file)->i_cdev;
 	struct nvme_ns_head *head =
@@ -459,21 +485,23 @@ static int nvme_dev_user_cmd(struct nvme_ctrl *ctrl, void __user *argp)
 	int ret;
 
 	down_read(&ctrl->namespaces_rwsem);
-	if (list_empty(&ctrl->namespaces)) {
+	if (list_empty(&ctrl->namespaces))
+	{
 		ret = -ENOTTY;
 		goto out_unlock;
 	}
 
 	ns = list_first_entry(&ctrl->namespaces, struct nvme_ns, list);
-	if (ns != list_last_entry(&ctrl->namespaces, struct nvme_ns, list)) {
+	if (ns != list_last_entry(&ctrl->namespaces, struct nvme_ns, list))
+	{
 		dev_warn(ctrl->device,
-			"NVME_IOCTL_IO_CMD not supported when multiple namespaces present!\n");
+				 "NVME_IOCTL_IO_CMD not supported when multiple namespaces present!\n");
 		ret = -EINVAL;
 		goto out_unlock;
 	}
 
 	dev_warn(ctrl->device,
-		"using deprecated NVME_IOCTL_IO_CMD ioctl on the char device!\n");
+			 "using deprecated NVME_IOCTL_IO_CMD ioctl on the char device!\n");
 	kref_get(&ns->kref);
 	up_read(&ctrl->namespaces_rwsem);
 
@@ -487,12 +515,13 @@ out_unlock:
 }
 
 long nvme_dev_ioctl(struct file *file, unsigned int cmd,
-		unsigned long arg)
+					unsigned long arg)
 {
 	struct nvme_ctrl *ctrl = file->private_data;
 	void __user *argp = (void __user *)arg;
 
-	switch (cmd) {
+	switch (cmd)
+	{
 	case NVME_IOCTL_ADMIN_CMD:
 		return nvme_user_cmd(ctrl, NULL, argp);
 	case NVME_IOCTL_ADMIN64_CMD:

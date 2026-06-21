@@ -3,34 +3,31 @@
 
 #include "list.h"
 #include <linux/types.h>
-#include <linux/list.h>           /* struct list_head for group_link  */
+#include <linux/list.h> /* struct list_head for group_link  */
 #include <linux/mm_types.h>
-
 
 /* Forward declaration */
 struct ctrl;
 struct map;
 
-
-typedef void (*release)(struct map*);
-
+typedef void (*release)(struct map *);
 
 /*
  * Describes a range of mapped memory.
  */
 struct map
 {
-    struct list_node    list;           /* Linked list header (global) */
-    struct task_struct* owner;          /* Owner of mapping */
-    u64                 vaddr;          /* Starting virtual address */
-    struct list*        ctrl_list;
-    int                 is_cq;
-    int                 ioq_idx;
-    int                 n_entries;
-    struct pci_dev*     pdev;           /* Reference to physical PCI device */
-    unsigned long       page_size;      /* Logical page size */
-    void*               data;           /* Custom data */
-    release             release;        /* Custom callback for unmapping and releasing memory */
+    struct list_node list;     /* Linked list header (global) 挂全局表(host_list/...)*/
+    struct task_struct *owner; /* Owner of mapping current，崩溃清理按它回收*/
+    u64 vaddr;                 /* Starting virtual address 起始用户虚拟地址(已对齐)*/
+    struct list *ctrl_list;
+    int is_cq;
+    int ioq_idx;
+    int n_entries;
+    struct pci_dev *pdev;    /* Reference to physical PCI device 针对哪块 NVMe 盘做的映射*/
+    unsigned long page_size; /* Logical page size PAGE_SIZE(4K) 或 GPU_PAGE_SIZE(64K)*/
+    void *data;              /* Custom data  host 路径=pages[]数组；GPU 路径=gpu_region*/
+    release release;         /* Custom callback for unmapping and releasing memory 回调：release_user_pages / release_gpu_**/
     /*
      * Per-fd queue-group attachment (B2) + map-kind tag (B6).
      *
@@ -65,44 +62,37 @@ struct map
      * so it is safe to list_del() / list_empty() unconditionally
      * regardless of mode.
      */
-    struct list_head    group_link;
-    uint32_t            group_id;
-    uint8_t             kind;           /* enum nvm_map_kind */
-    uint8_t             reserved_pad[7];
-    unsigned long       n_addrs;        /* Number of mapped pages */
-    uint64_t            addrs[1];       /* Bus addresses */
+    struct list_head group_link; // 挂 per-fd 队列组 或 data_maps
+    // 归属/类型路由
+    uint32_t group_id;
+    uint8_t kind; /* enum nvm_map_kind */
+    uint8_t reserved_pad[7];
+    unsigned long n_addrs; /* Number of mapped pages 页数*/
+    uint64_t addrs[1];     /* Bus addresses */
 };
-
-
 
 /*
  * Lock and map userspace pages for DMA.
  */
-struct map* map_userspace(struct list* list, const struct ctrl* ctrl, u64 vaddr, unsigned long n_pages);
-
-
+struct map *map_userspace(struct list *list, const struct ctrl *ctrl, u64 vaddr, unsigned long n_pages);
 
 /*
  * Unmap and release memory.
  */
-void unmap_and_release(struct map* map);
-
-
-
+void unmap_and_release(struct map *map);
 
 /*
  * Lock and map GPU device memory.
  */
-struct map* map_device_memory(struct list* list, const struct ctrl* ctrl, u64 vaddr, unsigned long n_pages, struct list* ctrl_list);
+struct map *map_device_memory(struct list *list, const struct ctrl *ctrl, u64 vaddr, unsigned long n_pages, struct list *ctrl_list);
 
-struct map* map_device_ioqueue_memory(struct list* list, const struct ctrl* ctrl, u64 vaddr, unsigned long n_pages);
-
+struct map *map_device_ioqueue_memory(struct list *list, const struct ctrl *ctrl, u64 vaddr, unsigned long n_pages);
 
 /*
  * Find memory mapping from vaddr and current task
  */
-struct map* map_find(const struct list* list, u64 vaddr);
-struct map* map_find_by_pci_dev_and_idx(const struct list* list, const struct pci_dev* pdev, int idx, int is_cq);
+struct map *map_find(const struct list *list, u64 vaddr);
+struct map *map_find_by_pci_dev_and_idx(const struct list *list, const struct pci_dev *pdev, int idx, int is_cq);
 
 /*
  * snvme: purge every map whose ->owner matches the given task.
@@ -120,6 +110,6 @@ struct map* map_find_by_pci_dev_and_idx(const struct list* list, const struct pc
  * The release hook in pci.c walks the list twice for that reason:
  * first to compute the rollback deltas, then to free.
  */
-unsigned long map_purge_by_owner(struct list* list, struct task_struct* owner);
+unsigned long map_purge_by_owner(struct list *list, struct task_struct *owner);
 
 #endif /* __LIBNVM_HELPER_MAP_H__ */

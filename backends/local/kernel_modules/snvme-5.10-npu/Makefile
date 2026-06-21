@@ -33,14 +33,29 @@ snvme-core-$(CONFIG_NVME_MULTIPATH)  += multipath.o
 snvme-core-$(CONFIG_BLK_DEV_ZONED)   += zns.o
 snvme-core-$(CONFIG_NVME_HWMON)      += hwmon.o
 
-snvme-objs := nvfs-pci.o nvfs-p2p.o list.o ctrl.o map.o pci.o
+# ---------------------------------------------------------------------------
+# [SNVME-NPU 替换] GPU/NPU 显存 P2P 后端的编译期开关
+#   make             -> 默认 NVIDIA 路线，链接 nvfs-p2p.o（nv-p2p 私有 API）
+#   make SNVME_NPU=1 -> NPU 路线，-DSNVME_NPU，改链接 npu-p2p.o（内核 dma-buf 实现）
+# 两份 wrapper 提供完全相同的 nvfs_nvidia_p2p_* 函数名/签名，map.c/pci.c 二选一链接、零改动。
+# 详见 kjx/0620/02替换NPU代码分析.md。
+# ---------------------------------------------------------------------------
+ifeq ($(SNVME_NPU),1)
+P2P_OBJ   := npu-p2p.o
+ccflags-y += -DSNVME_NPU
+else
+P2P_OBJ   := nvfs-p2p.o
+endif
+
+snvme-objs := nvfs-pci.o $(P2P_OBJ) list.o ctrl.o map.o pci.o
 
 # -I$(UAPI_INC): 让 pci.c/ioctl.c/core.c 能找到 "ioctl.h"（UAPI）
 # -I$(src):      让各文件能找到本目录的 nv-p2p.h 桩头和 *.h
 ccflags-y += -I$(UAPI_INC) -I$(src)
 
+# 把 SNVME_NPU 显式透传给 kbuild 子 make（命令行变量虽会自动下传，显式更稳妥）。
 all:
-	$(MAKE) -C $(KDIR) M=$(CURDIR) modules
+	$(MAKE) -C $(KDIR) M=$(CURDIR) SNVME_NPU=$(SNVME_NPU) modules
 
 clean:
 	$(MAKE) -C $(KDIR) M=$(CURDIR) clean

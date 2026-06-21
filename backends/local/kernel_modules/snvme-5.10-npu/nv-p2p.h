@@ -69,6 +69,40 @@
 #ifndef _NV_P2P_H_
 #define _NV_P2P_H_
 
+#ifdef SNVME_NPU
+/*
+ * ============================ NPU（dma-buf）后端的结构体定义 ============================
+ * [SNVME-NPU 替换 #2，见 kjx/0620/02替换NPU代码分析.md 第三/六节]
+ *
+ * 开启 SNVME_NPU 时，map.c 仍只读 page_table->entries 与 dma_mapping->dma_addresses[]，
+ * 但这两个结构体额外承载 dma-buf 的状态，供 npu-p2p.c 的 wrapper 在 pin/map/unmap/unpin
+ * 之间传递（语义对应见 02 文档映射表）：
+ *   - nvidia_p2p_page_table  ←→ pin 阶段拿到的 dma_buf 引用（dma_buf_get 的产物）
+ *   - nvidia_p2p_dma_mapping ←→ map 阶段对某块 NVMe 的 attach + sg_table
+ *
+ * 这里用前置声明而非 #include <linux/dma-buf.h>，避免本桩头被多处包含时拖入重头；
+ * 真正用到完整类型的是 npu-p2p.c（它会包含 <linux/dma-buf.h>）。
+ */
+struct dma_buf;
+struct dma_buf_attachment;
+struct sg_table;
+
+struct nvidia_p2p_page_table {
+	u32 entries;            /* map.c 读取：GPU/NPU 页数（按 GPU_PAGE_SIZE 计） */
+	struct dma_buf *dmabuf; /* dma_buf_get(fd) 的产物；put_pages/free_page_table 释放 */
+};
+typedef struct nvidia_p2p_page_table nvidia_p2p_page_table_t;
+
+struct nvidia_p2p_dma_mapping {
+	u64 *dma_addresses;                 /* map.c 读取：逐页 NVMe 可 DMA 总线地址 */
+	struct dma_buf_attachment *attach;  /* dma_buf_attach(dmabuf, &nvme_pdev->dev) */
+	struct sg_table *sgt;               /* dma_buf_map_attachment 的产物 */
+	unsigned int n_addrs;               /* dma_addresses[] 的长度（释放时用） */
+};
+typedef struct nvidia_p2p_dma_mapping nvidia_p2p_dma_mapping_t;
+
+#else  /* !SNVME_NPU —— 原 NVIDIA host-only 桩 */
+
 /*
  * snvme 把它当句柄在 get_pages / put_pages / dma_map_pages 之间传递，
  * 并在 device 路径里读 ->entries（拿到的 GPU 页数）。真实 NVIDIA 结构体
@@ -89,6 +123,8 @@ struct nvidia_p2p_dma_mapping {
 	u64 *dma_addresses;
 };
 typedef struct nvidia_p2p_dma_mapping nvidia_p2p_dma_mapping_t;
+
+#endif /* SNVME_NPU */
 
 #endif /* _NV_P2P_H_  —— 与真实 NVIDIA nv-p2p.h 共存防护，见顶部 batch5 说明 */
 #endif /* SNVME_NPU_STUB_NV_P2P_H */
